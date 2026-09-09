@@ -1,0 +1,203 @@
+# rusty_rtos_kernel — hardening audit
+
+**Standard**: Kairos (Remade With Rust) recursive hardening process — see the skill's `STANDARD.md`
+**Registry**: 41 gates / 12 phases (`use-protection-please` v1)
+**Unit**: `rusty_rtos_kernel` — package (facade + `no_std` core)
+**Tier**: critical-path — an RTOS component: the kernel is the trusted computing base of every firmware above it, and every library here parses bytes from a wire, a store or a bus
+**Mirrors**: none — the crate README is the only face until the first public flip; the crates.io page becomes a mirror then
+**Compliance**: none — no compliance framework in scope for an embedded kernel component; revisit at 1.0.0
+**Architect**: [Tim Almond](https://github.com/Ttimmahlax) — accountable for this unit's security design; rendered
+at the foot of the block in every README and mirror
+**Audit depth**: survey
+**Audited**: 2026-09-09 by kairos (scaffold pass) · **Next review**: the first milestone with a kill test
+
+> Source of truth for this unit's hardening status. The README's status table is
+> **generated from this file** — edit here, then run:
+> `kairos harden --plan docs/plans/use-protection-please.md --readme README.md`
+> (the Rust renderer in the umbrella's `tools/kairos`; `kairos check --harden`
+> refuses a stale table).
+
+**Status tokens**: `Completed` (evidenced pass) · `Scheduled` (owner + date in Target) ·
+`Incomplete` (not done, or not evidenced) · `N/A` (out of tier — reason required in
+Evidence; excluded from the totals).
+
+---
+
+## Threat sketch
+
+*Assets* — scheduling integrity (the right task runs, priorities and timeouts hold as the C kernel's do); memory safety of every firmware above the kernel; availability (no panic reachable from an API call or a parsed byte); the integrity of the published crates.
+*Adversaries* — a buggy or hostile task in the same firmware (a wrong handle, a stale handle, an ISR variant called from a task); crafted bytes on a wire, a store or a bus reaching a parser; a supply-chain actor substituting a dependency; a debugger-less field device that cannot report a fault.
+*Highest-value attack path* — a parser or an API path that panics on untrusted input, taking the whole firmware down (the C kernel's `configASSERT` class), or a handle that outlives its object.
+*Full model* — `docs/threat-model.md` (to be written with the first milestone; the family model is the mission plan's §2.10)
+
+---
+
+## Checklist
+
+`★` = v1.0.0-blocking. Full probe and pass criteria per gate: the skill's `CHECKLIST.md`.
+
+### Phase 0 — Threat modeling
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-01 | ★ Threat model documented and linked from README | Incomplete | the sketch above; `docs/threat-model.md` is the first milestone's deliverable | |
+| H-02 | Threat model revisited after last major change | Incomplete | no major change yet | |
+
+### Phase 1 — Toolchain
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | `rust-toolchain.toml`: channel 1.98.0, clippy + rustfmt, the four bare-metal targets | |
+| H-04 | Committed `.cargo/config.toml` hardening defaults | Incomplete | `.cargo/config.toml` is the gitignored sibling-patch seam (`kairos patches`); linker hardening belongs to each firmware's own config | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Completed | `Cargo.toml` `[profile.release]`: `overflow-checks = true`, `lto = "thin"`, `codegen-units = 1`; libraries stay unwind-safe, firmware binaries choose `panic = "abort"` | |
+| H-06 | Security toolchain available to CI and developers | Incomplete | CI installs cargo-deny (`taiki-e/install-action`); audit / vet / geiger / miri / fuzz are on the developer box, not yet in CI | |
+
+### Phase 2 — Supply chain
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-07 | ★ `Cargo.lock` committed | Completed | `Cargo.lock` tracked in the first commit (`git ls-files Cargo.lock`) | |
+| H-08 | ★ `deny.toml` policy present and enforced | Incomplete | `deny.toml` present (licenses, bans incl. `*-sys`, sources); `cargo deny check` runs in CI; the first run's verdict goes here | |
+| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Incomplete | not yet run | |
+| H-10 | ★ `cargo vet` coverage complete | Incomplete | no `supply-chain/` yet | |
+| H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | `UNSAFE.md` says zero; `cargo geiger` not yet archived | |
+| H-12 | ★ SBOM generated and published with releases | Incomplete | no release yet | |
+| H-13 | Git deps pinned; no unknown registries or sources | Completed | every sibling git dep carries a `version`; `deny.toml` `[sources]` denies unknown registries and git, `allow-git` names the siblings | |
+| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | no update bot yet | |
+
+### Phase 3 — Code level
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-15 | ★ Workspace lint policy set and clean | Completed | `[workspace.lints]`: `unsafe_code = deny`, `undocumented_unsafe_blocks`, `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented` = deny, `indexing_slicing` + `arithmetic_side_effects` = warn; `cargo clippy --workspace --all-targets -- -D warnings` clean at scaffold | |
+| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | `forbid(unsafe_code)` in every crate; `UNSAFE.md` lists none | |
+| H-17 | Arithmetic safety explicit | Incomplete | `arithmetic_side_effects = warn` under `-D warnings`; no arithmetic yet to audit | |
+| H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | `unwrap_used`, `expect_used`, `panic` = deny at the workspace; tests opt out per file | |
+| H-19 | Input validation — external bytes treated as hostile | Incomplete | no parser yet; the no-panic gate arrives with the first one | |
+| H-20 | ★ Secrets zeroized; never logged | Incomplete | no secret enters this crate by design; state it in the threat model | |
+| H-21 | Concurrency discipline | Incomplete | no shared mutable state yet | |
+
+### Phase 4 — Static analysis
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-22 | Static analysis beyond the default linter runs on every PR | Incomplete | | |
+
+### Phase 5 — Dynamic analysis
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-23 | ★ Tests pass under Miri | Incomplete | not yet run | |
+| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | | |
+| H-25 | `cargo careful test` green | Incomplete | | |
+
+### Phase 6 — Fuzzing and properties
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Incomplete | no parser yet | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | | |
+| H-28 | Property tests cover the documented invariants | Incomplete | | |
+| H-29 | Mutation and/or differential testing on critical modules | Incomplete | the C oracle differential arrives with K1 | |
+
+### Phase 7 — Formal verification
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-30 | Proof of panic-freedom / UB-freedom per `unsafe` module | Incomplete | no unsafe module; Kani harnesses for the CBMC proof list arrive with K2 | |
+
+### Phase 8 — Build and binary
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-31 | ★ Binary hardening applied and verified | N/A | a library; the firmware binaries carry this gate | |
+| H-32 | Build is reproducible or fully auditable | Incomplete | | |
+
+### Phase 9 — Runtime privilege
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-33 | Least privilege documented and tested | N/A | a library on bare metal; the MPU package (K8) is the privilege story | |
+
+### Phase 10 — Cryptography
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-34 | Vetted crypto only; no bespoke primitives | N/A | no cryptography in this crate | |
+| H-35 | Side-channel discipline (constant-time, no secret branches) | N/A | no secret in this crate | |
+| H-36 | Post-quantum migration plan for long-lived keys | N/A | no key in this crate | |
+
+### Phase 11 — CI/CD, release, and operations
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| H-37 | CI runs the hardening gate on every PR | Incomplete | fmt + clippy + test + deny per push; audit / vet / Miri / fuzz not yet; the hardening-table check runs in the fleet gate (`kairos check --harden`), not in CI | |
+| H-38 | Releases signed, attested, and changelogged for security | Incomplete | no release yet | |
+| H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | `SECURITY.md`: contact, 5-day acknowledgement, 14-day updates, 90-day disclosure | |
+| H-40 | Advisory monitoring and scheduled re-audit | Incomplete | | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | the register below is empty until the first milestone | |
+
+### Phase 12 — Compliance controls
+
+Only in play when a framework is declared in scope above. With none in scope, every row is
+`N/A` — reason: "no compliance framework in scope". Mapping: the skill's `COMPLIANCE.md`.
+
+| ID | Gate | Status | Evidence | Target |
+|---|---|---|---|---|
+| C-01 | Data inventory — personal/health/card data touched | N/A | no compliance framework in scope | |
+| C-02 | Data-flow map including third-party egress | N/A | no compliance framework in scope | |
+| C-03 | Encryption in transit for all egress | N/A | no compliance framework in scope | |
+| C-04 | Encryption at rest for stored sensitive data | N/A | no compliance framework in scope | |
+| C-05 | Key management — generation, storage, rotation, destruction | N/A | no compliance framework in scope | |
+| C-06 | Retention limits and honoured deletion | N/A | no compliance framework in scope | |
+| C-07 | Audit logging of security-relevant events | N/A | no compliance framework in scope | |
+| C-08 | Log hygiene — no PII, secrets, or card data in logs | N/A | no compliance framework in scope | |
+| C-09 | Least-privilege access to sensitive data | N/A | no compliance framework in scope | |
+| C-10 | Subprocessor and third-party inventory | N/A | no compliance framework in scope | |
+| C-11 | Incident response and breach notification path | N/A | no compliance framework in scope | |
+| C-12 | Change management — reviewed, approved, traceable | N/A | no compliance framework in scope | |
+| C-13 | Availability commitments and their evidence | N/A | no compliance framework in scope | |
+| C-14 | Machine-readable SBOM + provenance for regulators | N/A | no compliance framework in scope | |
+
+---
+
+## Scheduled work
+
+In execution order. Cheapest-first is usually correct: configuration gates clear in
+minutes and unblock the outcome gates behind them.
+
+| # | Gates | Work | Owner | Target | Notes |
+|---|---|---|---|---|---|
+| 1 | H-08, H-09 | run `cargo deny check` and `cargo audit` and record the verdicts | | | minutes |
+| 2 | H-01 | write `docs/threat-model.md` from the sketch above | | | with the first milestone |
+| 3 | H-23 | `cargo +nightly miri test` on the core | | | with the first tests |
+
+---
+
+## Residual risk register
+
+Every open risk carries an owner, an acceptance, and a review date (H-41).
+
+| ID | Risk | Likelihood | Impact | Mitigation status | Accepted by | Review date |
+|---|---|---|---|---|---|---|
+| R-001 | | | | | | |
+
+---
+
+## Waivers
+
+Time-bounded only. An expired waiver is an `Incomplete` gate, not a `Completed` one.
+
+| Gate | Reason | Granted by | Expires |
+|---|---|---|---|
+| | | | |
+
+---
+
+## Audit log
+
+Append one line per pass; never rewrite history. The trend is the point.
+
+| Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
+|---|---|---|---|---|---|
+| 2026-09-09 | survey | kairos (scaffold pass) | 7 / 0 / 28 | 5 | first pass, at stamp time; every Completed row names a file that exists |

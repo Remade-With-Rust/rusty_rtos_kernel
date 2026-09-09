@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Per-chip firmware examples are their own cargo projects: each needs its own
+# target, linker script and (for Xtensa) toolchain. They are never workspace
+# members. See firmware/README.md.
+exclude = ["firmware/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_rtos_kernel"
+homepage = "https://www.mata.network/"
+authors = ["Remade With Rust"]
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# The hardening policy (use-protection-please H-15 / H-16 / H-17 / H-18): no
+# undocumented unsafe, no unwrap/expect/panic on any path, arithmetic and
+# indexing made explicit. Tests opt out per file with `#![allow(...)]`.
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+
+[workspace.dependencies]
+# Internal crates carry BOTH path and version so the set publishes to crates.io
+# in lockstep (the rusty_time pattern).
+rusty_rtos_kernel-core = { path = "crates/rusty_rtos_kernel-core", version = "0.1.0", default-features = false }
+
+# Siblings in the Kairos family are consumed BY GIT URL, with a version beside
+# it (a bare git dep is a `*` wildcard to cargo-deny), so this repo deploys on
+# its own. Inside the Kairos umbrella folder `kairos patches` writes a
+# `.cargo/config.toml` that patches the URL to the sibling checkout, so local
+# edits are visible without a push.
+rusty_rtos_core = { version = "0.1.0", git = "https://github.com/Remade-With-Rust/rusty_rtos_core", default-features = false }
+
+[profile.release]
+# use-protection-please H-05: overflow checks stay on in release; LTO and
+# codegen-units are set deliberately. Libraries stay unwind-safe; a firmware
+# binary chooses `panic = "abort"` in its own profile.
+overflow-checks = true
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,25 @@
+[package]
+name = "rusty_rtos_kernel"
+description = "FreeRTOS-Kernel remade in Rust: the fixed-priority preemptive scheduler, task notifications, queues, semaphores, mutexes with priority inheritance, queue sets, software timers, event groups, stream and message buffers — a pure state machine over the Port seam, forbid(unsafe), traced against the C kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/rusty_rtos_kernel"
+keywords = ["rtos", "freertos", "embedded", "no-std", "remade-with-rust"]
+categories = ["embedded", "no-std", "os"]
+
+[features]
+default = ["std"]
+std = ["rusty_rtos_kernel-core/std"]
+alloc = ["rusty_rtos_kernel-core/alloc"]
+
+[dependencies]
+rusty_rtos_kernel-core = { workspace = true }
+
+[lints]
+workspace = true

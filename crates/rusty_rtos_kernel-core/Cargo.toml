@@ -1,0 +1,27 @@
+[package]
+name = "rusty_rtos_kernel-core"
+description = "The pure no_std core of rusty_rtos_kernel: types, traits and algorithms with no CPU, no allocator and no operating system. forbid(unsafe)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rusty_rtos_kernel-core"
+keywords = ["rtos", "freertos", "embedded", "no-std", "remade-with-rust"]
+categories = ["embedded", "no-std", "no-std::no-alloc", "os"]
+
+[features]
+default = ["std"]
+# The feature ladder is the rusty_zstd one: `std` implies `alloc`; with neither,
+# the crate is pure `core` and still builds on Cortex-M and RISC-V bare metal.
+std = ["alloc", "rusty_rtos_core/std"]
+alloc = ["rusty_rtos_core/alloc"]
+
+[dependencies]
+rusty_rtos_core = { workspace = true }
+
+[lints]
+workspace = true
