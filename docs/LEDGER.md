@@ -7,12 +7,25 @@ order and the null-arm floor for anything timed.
 
 ## Conformance against the C kernel (2026-09-09, K1)
 
+| scenario | lines identical at 100,000 ticks | ticks | yields | exits |
+|---|---|---|---|---|
+| `dynamic` | 1,219,231 | 100000 | 179588 | 1066689 |
+| `PollQ` | 117,417 | 100051 | 2056 | 105608 |
+| `BlockQ` | 1,344,460 | 100011 | 195466 | 1282272 |
+| `semtest` | 1,503,634 | 100000 | 64837 | 1163649 |
+| `countsem` | 966,326 | 100000 | 21001 | 1280002 |
+| `recmutex` | 1,385,862 | 100000 | 40923 | 1068657 |
+| `blocktim` | 131,384 | 100062 | 4505 | 114313 |
+| `QPeek` | 486,871 | 100000 | 88964 | 414030 |
+| `GenQTest` | 1,253,579 | 100000 | 150435 | 1299809 |
+| **all nine** | **8,408,764** | equal on both sides | equal | equal |
+
 | gate | result | method |
 |---|---|---|
-| `dynamic`, 100,000 ticks | **1,219,231 trace lines identical** to the C kernel's, verdict line included | `kairos conform dynamic --ticks 100000` from the umbrella: runs this kernel through `rusty_rtos_demo`'s sim and the instrumented C kernel (FreeRTOS-Kernel V11.3.1 @ `3a22924e`, Posix port under the sim-contract-v1 patch), and compares line for line, failing at the first difference |
-| counters at 100,000 ticks | ticks 100000, yields 179588, exits 1066689, lines 1219230 — equal on both sides | the harness's `KAIROS_RESULT` line, from the patched C port's counters and from `SimPort`'s |
-| `dynamic`, 2000 ticks | 24,403 lines identical | `kairos conform dynamic`; pinned as a regression in `rusty_rtos_demo/crates/rusty_rtos_demo-core/tests/conformance.rs` (counters + an FNV-1a/64 digest of the trace), so drift fails without a C toolchain |
-| scenarios covered | 1 of 9 | `dynamic`; the rest land with their ports |
+| scenarios covered | **9 of 9** | the K1 corpus complete |
+| the gate | `kairos conform --all --ticks 100000` from the umbrella | runs this kernel through `rusty_rtos_demo`'s sim and the instrumented C kernel (FreeRTOS-Kernel V11.3.1 @ `3a22924e`, Posix port under the sim-contract-v1 patch), and compares line for line, failing at the first difference. The verdict line is compared with the rest |
+| counters | ticks, yields, exits and line counts equal on both sides, every scenario | the harness's `KAIROS_RESULT` line, from the patched C port's counters and from `SimPort`'s |
+| the same nine at 2000 ticks | identical | `kairos conform --all`; pinned as a regression in `rusty_rtos_demo/crates/rusty_rtos_demo-core/tests/conformance.rs` (counters, byte count and an FNV-1a/64 digest of the C kernel's own trace file), so drift fails without a C toolchain |
 
 An outermost critical-section exit is sim time (`ORACLES.md`, contract v1),
 so agreeing on the trace means agreeing on *when* a decision was made, not
@@ -26,7 +39,7 @@ only on what it was.
 | `cargo check -p rusty_rtos_kernel-core --no-default-features` and `--features alloc` on `thumbv7em-none-eabihf`, `thumbv8m.main-none-eabihf`, `riscv32imac-unknown-none-elf`, `riscv32imafc-unknown-none-elf` | all 8 rungs pass | `kairos check rusty_rtos_kernel --fmt --clippy --test --deny`, exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean | same run, under the workspace lint policy: `unsafe_code` denied, `unwrap`/`expect`/`panic`/`todo`/`unimplemented` denied, `indexing_slicing` + `arithmetic_side_effects` warned under `-D warnings` |
 | `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok | same run |
-| Miri | green | `cargo +nightly miri test --lib`, miri 0.1.0 of 2026-09-08 |
+| Miri | green | `cargo +nightly miri test --workspace`, miri 0.1.0 of 2026-09-08. The scheduler itself is put through the interpreter by `rusty_rtos_demo`'s corpus run, which covers all nine scenarios |
 
 No speed number, no size number: nothing here has been timed or sized, and
 nothing has run on a chip. The arena-and-list cost row the family plan asks

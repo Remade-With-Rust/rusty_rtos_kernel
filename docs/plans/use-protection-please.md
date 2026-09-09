@@ -98,7 +98,7 @@ Evidence; excluded from the totals).
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Incomplete | no parser yet | |
 | H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | | |
 | H-28 | Property tests cover the documented invariants | Incomplete | | |
-| H-29 | Mutation and/or differential testing on critical modules | Completed | **differential testing against the C kernel is this package's primary gate**: `kairos conform dynamic --ticks 100000` compares 1,219,231 trace lines and the tick/yield/critical-exit counters against FreeRTOS-Kernel V11.3.1 on its Posix port, and fails at the first difference (ledger). 1 scenario of 9; mutation testing is not yet run | |
+| H-29 | Mutation and/or differential testing on critical modules | Completed | **differential testing against the C kernel is this package's primary gate**: `kairos conform --all --ticks 100000` compares 8,408,764 trace lines across nine scenarios and the tick/yield/critical-exit counters against FreeRTOS-Kernel V11.3.1 on its Posix port, and fails at the first difference (ledger). 9 scenarios of 9; mutation testing is not yet run | |
 
 ### Phase 7 — Formal verification
 

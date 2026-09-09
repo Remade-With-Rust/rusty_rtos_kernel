@@ -22,24 +22,32 @@ flashed" means no chip has run it.
 
 ## Status
 
-**K1 — the scheduler agrees with the C kernel on the first scenario.**
+**K1 — the scheduler agrees with the C kernel. Passed.**
 
-The `dynamic` demo produces a trace **identical to the C kernel's for
-100,000 ticks** — 1,219,231 lines, with the tick, yield and
-critical-section-exit counters equal on both sides. That is one scenario of
-the nine-scenario conformance corpus; the other eight are open. Miri is
-green. Nothing has run on a chip and nothing here is timed.
+All nine scenarios of the conformance corpus produce traces **identical to
+the C kernel's for 100,000 ticks each** — 8,408,764 lines, with the tick,
+yield and critical-section-exit counters equal on both sides, every time.
+Miri is green over the whole corpus. Nothing has run on a chip and nothing
+here is timed.
 
 ```sh
-kairos conform dynamic --ticks 100000    # from the Kairos umbrella
+kairos conform --all --ticks 100000      # from the Kairos umbrella
 ```
 
 What that covers: tasks, the tick (pended-tick replay included), the
 context-switch decision, the ready and delayed and suspended lists, delay,
-suspend, resume, priority set, suspend-all and resume-all, and a queue with
-a zero block time. Notifications, mutexes, timers, event groups and stream
-buffers are K2; a blocking queue send or receive returns
-`Error::Unsupported` rather than pretending.
+delay-until, suspend, resume, priority set, suspend-all and resume-all,
+abort-delay; queues at both ends with blocking sends and receives and peek,
+binary and counting semaphores, mutexes with priority inheritance,
+disinheritance and disinheritance-after-timeout, and the recursive variant.
+Notifications, timers, event groups and stream buffers are K2.
+
+One number did not come out where the plan hoped. The arena-and-list cost
+row is **2.08×** the C list (46.45 against 22.32 instructions per list
+operation, callgrind), where 1.25× was the line at which the mission plan
+said to reopen "handles are indices, never pointers". The row, its method
+and where the cost actually goes are in the umbrella's `docs/LEDGER.md`; the
+decision is the owner's and nothing here assumes an answer.
 
 **The kernel never performs a context switch.** A switch is a stack swap
 and a stack swap is `unsafe`, which this family allows only in

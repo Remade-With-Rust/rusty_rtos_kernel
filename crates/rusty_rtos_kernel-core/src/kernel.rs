@@ -31,7 +31,21 @@ use rusty_rtos_core::tick::TickWidth;
 use rusty_rtos_core::trace::{Event, Trace};
 
 use crate::name::Name;
+use crate::queue::Queue;
 use crate::{OVERHEAD_LISTS, items_for, lists_for};
+
+/// A trace line owed by a task that was switched out before it could
+/// emit one. Only the queue failure paths can owe one: they are the only
+/// places FreeRTOS traces *after* leaving a critical section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwedTrace {
+    /// Nothing owed.
+    None,
+    /// `traceQUEUE_SEND_FAILED`.
+    SendFailed(QueueHandle),
+    /// `traceQUEUE_RECEIVE_FAILED`.
+    ReceiveFailed(QueueHandle),
+}
 
 /// `eTaskState`: what a task is doing, derived from the list it is in
 /// exactly as `eTaskGetState` derives it.
@@ -52,27 +66,39 @@ pub enum TaskState {
 /// One task control block: the C `TCB_t` minus everything that is a
 /// pointer. No stack, no TLS, no `pxTopOfStack`.
 #[derive(Debug, Clone, Copy)]
-struct Tcb {
+pub(crate) struct Tcb {
     name: Name,
     /// `uxPriority`, the possibly-inherited one the scheduler sorts by.
     priority: u8,
     /// `uxBasePriority`, what the task asked for.
     base_priority: u8,
+    /// `uxMutexesHeld`: how many mutexes this task holds, which is what
+    /// decides whether giving one back may drop an inherited priority.
+    mutexes_held: u32,
+    /// The locals a blocking queue call keeps on the C stack across a
+    /// block. This kernel has no stack, so they live here — see
+    /// [`crate::queue`].
+    wait: WaitFrame,
 }
 
-/// One queue: the C `Queue_t` minus the byte pointers. Storage is a range
-/// of the kernel's shared slot pool.
-#[derive(Debug, Clone, Copy)]
-struct Queue {
-    base: usize,
-    /// `uxLength`.
-    length: usize,
-    /// `uxMessagesWaiting`.
-    waiting: usize,
-    /// Index within `0..length` of the next item to read.
-    read: usize,
-    /// Index within `0..length` of the next slot to write.
-    write: usize,
+/// What `xQueueGenericSend` and friends keep between passes of their
+/// `for(;;)`: the queue being waited on, the ticks left, and the timeout
+/// bookkeeping (`TimeOut_t`).
+#[derive(Debug, Clone, Copy, Default)]
+struct WaitFrame {
+    /// The queue this task is part-way through a blocking call on;
+    /// `TaskHandle::NULL`-equivalent when there is none.
+    queue: QueueHandle,
+    /// `xTicksToWait`, decremented by each `xTaskCheckForTimeOut`.
+    ticks: u64,
+    /// `xTimeOut.xTimeOnEntering`.
+    entering: u64,
+    /// `xTimeOut.xOverflowCount`.
+    overflows: u64,
+    /// `xEntryTimeSet`.
+    entry_set: bool,
+    /// `xInheritanceOccurred`.
+    inherited: bool,
 }
 
 /// What [`Kernel::start_scheduler`] created, so a runner can attach bodies.
@@ -101,19 +127,19 @@ pub struct Kernel<
     const QUEUES: usize,
     const SLOTS: usize,
 > {
-    port: P,
-    trace: T,
-    tcbs: Arena<TaskKind, Tcb, TASKS>,
-    queues: Arena<QueueKind, Queue, QUEUES>,
-    lists: Lists<ITEMS, LISTS>,
-    slots: [u64; SLOTS],
-    slots_used: usize,
+    pub(crate) port: P,
+    pub(crate) trace: T,
+    pub(crate) tcbs: Arena<TaskKind, Tcb, TASKS>,
+    pub(crate) queues: Arena<QueueKind, Queue, QUEUES>,
+    pub(crate) lists: Lists<ITEMS, LISTS>,
+    pub(crate) slots: [u64; SLOTS],
+    pub(crate) slots_used: usize,
     /// `pxCurrentTCB`.
-    current: TaskHandle,
+    pub(crate) current: TaskHandle,
     /// `uxTopReadyPriority`.
     top_ready_priority: u8,
     /// `xTickCount`, masked to the configuration's tick width.
-    tick: u64,
+    pub(crate) tick: u64,
     /// `xPendedTicks`.
     pended_ticks: u64,
     /// `uxSchedulerSuspended`.
@@ -142,11 +168,30 @@ pub struct Kernel<
     /// stack; here the stack is a program counter, so the debt is recorded
     /// and paid by [`Kernel::resume_pending`] when the task runs again.
     owes_yield: [bool; TASKS],
-    /// How deep a task's critical nesting was when it was switched out —
-    /// `uxSavedCriticalNesting` in the Posix port's `prvSwitchThread`. The
-    /// exits that unwind it are owed too, and counted when they are paid,
-    /// which is what puts a sim tick where the C one lands.
+    /// A trace line a task owes from a call it was switched out of.
+    ///
+    /// `xQueueReceive`'s failure path is `taskEXIT_CRITICAL();
+    /// traceQUEUE_RECEIVE_FAILED( pxQueue ); return errQUEUE_EMPTY;` — and
+    /// if the tick that the exit released switches the task away, those two
+    /// lines sit on a stack that is not running. The C emits the trace when
+    /// the task resumes, so this kernel does too.
+    owed_trace: [OwedTrace; TASKS],
+    /// How many outermost critical-section exits a task owes the clock.
+    ///
+    /// This is `uxSavedCriticalNesting` in the Posix port's
+    /// `prvSwitchThread` and then some. A thread stops at the switch; a
+    /// stackless call does not, so the abandoned frame runs on — closing
+    /// the sections it had open and, on some paths, opening one more. The
+    /// port tallies every exit that frame makes instead of counting it as
+    /// sim time, and the tally is paid here when the task runs again. That
+    /// is what puts a sim tick where the C one lands.
     owed_exits: [u32; TASKS],
+    /// The task whose abandoned frame is running right now, if any.
+    unwinding: Option<TaskHandle>,
+    /// `ucDelayAborted`: the task was pulled out of the Blocked state by
+    /// [`Kernel::abort_delay`] rather than by its own block time running
+    /// out, so it must not re-evaluate that block time and block again.
+    delay_aborted: [bool; TASKS],
     _config: PhantomData<C>,
 }
 
@@ -205,6 +250,9 @@ impl<
             started: [false; TASKS],
             owes_yield: [false; TASKS],
             owed_exits: [0; TASKS],
+            unwinding: None,
+            delay_aborted: [false; TASKS],
+            owed_trace: [OwedTrace::None; TASKS],
             _config: PhantomData,
         })
     }
@@ -242,7 +290,7 @@ impl<
     // whole scheduler addresses lists and items by small integers, which is
     // what keeps a TCB free of pointers.
 
-    const fn ready_list(priority: u8) -> ListId {
+    pub(crate) const fn ready_list(priority: u8) -> ListId {
         priority
     }
 
@@ -271,7 +319,7 @@ impl<
     }
 
     /// `xTasksWaitingToSend` of a queue.
-    fn queue_send_list(queue: QueueHandle) -> ListId {
+    pub(crate) fn queue_send_list(queue: QueueHandle) -> ListId {
         let offset = u8::try_from(queue.index().saturating_mul(2)).unwrap_or(u8::MAX);
         C::MAX_PRIORITIES
             .saturating_add(u8::try_from(OVERHEAD_LISTS).unwrap_or(u8::MAX))
@@ -279,18 +327,18 @@ impl<
     }
 
     /// `xTasksWaitingToReceive` of a queue.
-    fn queue_receive_list(queue: QueueHandle) -> ListId {
+    pub(crate) fn queue_receive_list(queue: QueueHandle) -> ListId {
         Self::queue_send_list(queue).saturating_add(1)
     }
 
     /// A task's `xStateListItem`: the task's own arena index.
-    const fn state_item(task: TaskHandle) -> ItemId {
+    pub(crate) const fn state_item(task: TaskHandle) -> ItemId {
         task.index()
     }
 
     /// A task's `xEventListItem`: `TASKS` above its state item, so the two
     /// never collide and either maps back to its task by arithmetic alone.
-    fn event_item(task: TaskHandle) -> ItemId {
+    pub(crate) fn event_item(task: TaskHandle) -> ItemId {
         Self::task_item_base().saturating_add(task.index())
     }
 
@@ -364,7 +412,7 @@ impl<
         self.tcbs.resolve(h).map(|t| t.priority)
     }
 
-    fn current_priority(&self) -> u8 {
+    pub(crate) fn current_priority(&self) -> u8 {
         self.priority_of(None).unwrap_or(0)
     }
 
@@ -442,7 +490,7 @@ impl<
 
     // ------------------------------------------------------------ tracing --
 
-    fn trace_task<F>(&mut self, task: TaskHandle, make: F)
+    pub(crate) fn trace_task<F>(&mut self, task: TaskHandle, make: F)
     where
         F: for<'a> FnOnce(TaskHandle, &'a str) -> Event<'a>,
     {
@@ -452,11 +500,25 @@ impl<
         self.trace.event(tick, make(task, name.as_str()));
     }
 
-    fn priority_value(raw: u8) -> Priority {
+    pub(crate) fn priority_value(raw: u8) -> Priority {
         Priority::new(raw, C::MAX_PRIORITIES).unwrap_or(Priority::IDLE)
     }
 
     // --------------------------------------------------- critical section --
+
+    /// What `pvPortMalloc` costs in sim time on a heap-backed C kernel:
+    /// `vTaskSuspendAll()` around the allocation, then `xTaskResumeAll()`,
+    /// whose critical section is one outermost exit.
+    ///
+    /// This kernel allocates nothing, so the call is the whole of it. On a
+    /// configuration with [`Config::DYNAMIC_ALLOCATION`] off it compiles
+    /// away to nothing at all.
+    pub(crate) fn account_for_allocation(&mut self) {
+        if C::DYNAMIC_ALLOCATION {
+            self.suspend_all();
+            let _ = self.resume_all();
+        }
+    }
 
     /// `taskENTER_CRITICAL()`.
     pub fn enter_critical(&mut self) {
@@ -504,7 +566,7 @@ impl<
 
     /// `portYIELD()` as the Posix port spells it: a critical section around
     /// the context switch, so a tick raised during it lands on the way out.
-    fn port_yield(&mut self) {
+    pub(crate) fn port_yield(&mut self) {
         self.enter_critical();
         self.port.count_yield();
         self.switch_context();
@@ -530,6 +592,8 @@ impl<
             name: Name::new(name, C::MAX_TASK_NAME_LEN),
             priority,
             base_priority: priority,
+            mutexes_held: 0,
+            wait: WaitFrame::default(),
         };
         let handle = match self.tcbs.try_insert(tcb) {
             Ok(h) => h,
@@ -579,7 +643,7 @@ impl<
     }
 
     /// `prvAddTaskToReadyList`.
-    fn add_task_to_ready_list(&mut self, task: TaskHandle) -> Result<()> {
+    pub(crate) fn add_task_to_ready_list(&mut self, task: TaskHandle) -> Result<()> {
         let priority = self.tcbs.resolve(task)?.priority;
         self.trace_task(task, |task, name| Event::MovedTaskToReadyState {
             task,
@@ -677,20 +741,53 @@ impl<
     /// `true` means work was done and the current task may have changed
     /// again, so nothing else should be assumed.
     pub fn resume_pending(&mut self) -> bool {
+        self.settle_unwind();
         let index = usize::from(self.current.index());
-        // First the stack unwinds — the critical sections the task had open
-        // when it was switched out — and only then does the statement after
-        // the yield run. Reversing the two moves every tick.
+        // First the stack unwinds — the sections the task had open when it
+        // was switched out, and whatever its abandoned frame opened after
+        // that — and only then does the statement after the yield run.
+        // Reversing the two moves every tick.
         let owed = self.owed_exits.get(index).copied().unwrap_or(0);
         if owed > 0 {
             if let Some(slot) = self.owed_exits.get_mut(index) {
                 *slot = 0;
             }
-            self.port.set_nesting(owed);
+            // One counted exit each: the tally is already in outermost
+            // exits, so replaying it as nesting would lose the sections the
+            // tail opened and closed on its own.
             for _ in 0..owed {
+                self.enter_critical();
                 self.exit_critical();
+                // A replayed exit can release a tick that switches this
+                // task straight back out. The rest of the loop is then the
+                // tail of *this* frame, which the port tallies and the next
+                // resume pays — so there is nothing to unwind by hand.
             }
             return true;
+        }
+        // Then the line the abandoned frame had not reached yet.
+        match self.owed_trace.get(index).copied() {
+            Some(OwedTrace::SendFailed(queue)) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace
+                    .event(tick, Event::QueueSendFailed { queue, name: "" });
+                return true;
+            }
+            Some(OwedTrace::ReceiveFailed(queue)) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace
+                    .event(tick, Event::QueueReceiveFailed { queue, name: "" });
+                return true;
+            }
+            Some(OwedTrace::None) | None => {}
         }
         if self.owes_yield.get(index).copied() != Some(true) {
             return false;
@@ -702,9 +799,49 @@ impl<
         true
     }
 
+    /// Collect the tally of an abandoned frame that has finished running.
+    ///
+    /// The frame runs to its end before control comes back to the runner,
+    /// so this is called once, at the top of [`Kernel::resume_pending`],
+    /// which is the first thing the runner does.
+    fn settle_unwind(&mut self) {
+        let Some(task) = self.unwinding.take() else {
+            return;
+        };
+        let owed = self.port.end_unwind();
+        if let Some(slot) = self.owed_exits.get_mut(usize::from(task.index())) {
+            // Accumulate: a replay that is itself interrupted leaves the
+            // rest of its own loop as a tail, and that tail is more of the
+            // same debt.
+            *slot = slot.saturating_add(owed);
+        }
+    }
+
+    /// Emit a queue failure line now, or owe it if a tick switched the
+    /// caller out of the call that was about to emit it.
+    pub(crate) fn trace_failure_or_owe(&mut self, caller: TaskHandle, owed: OwedTrace) {
+        if self.current == caller {
+            let tick = self.tick;
+            self.trace.note_exits(self.port.exits());
+            match owed {
+                OwedTrace::SendFailed(queue) => self
+                    .trace
+                    .event(tick, Event::QueueSendFailed { queue, name: "" }),
+                OwedTrace::ReceiveFailed(queue) => self
+                    .trace
+                    .event(tick, Event::QueueReceiveFailed { queue, name: "" }),
+                OwedTrace::None => {}
+            }
+            return;
+        }
+        if let Some(slot) = self.owed_trace.get_mut(usize::from(caller.index())) {
+            *slot = owed;
+        }
+    }
+
     /// Record that `task` was preempted before the `portYIELD()` at the end
     /// of the call it is inside.
-    fn owe_yield(&mut self, task: TaskHandle) {
+    pub(crate) fn owe_yield(&mut self, task: TaskHandle) {
         if let Some(flag) = self.owes_yield.get_mut(usize::from(task.index())) {
             *flag = true;
         }
@@ -713,19 +850,19 @@ impl<
     /// Hand the CPU from `outgoing` to `incoming`: what `prvSwitchThread`
     /// does to `uxCriticalNesting`.
     ///
-    /// The outgoing task's open sections go with it, to be unwound when it
-    /// runs again; the calls that would have unwound them here are the tail
-    /// of a frame that is no longer running, so the port ignores exactly
-    /// that many. A task being switched in for the first time has a fresh
+    /// Everything the outgoing task's call still does from here belongs to
+    /// that task at the time it runs again, so the port stops counting the
+    /// frame's exits as sim time and starts tallying them;
+    /// [`Kernel::settle_unwind`] collects the tally once the frame has
+    /// finished. A task being switched in for the first time has a fresh
     /// stack and owes nothing.
     fn hand_over(&mut self, outgoing: TaskHandle, incoming: TaskHandle) {
-        let pending = self.port.take_nesting();
-        if let Some(slot) = self.owed_exits.get_mut(usize::from(outgoing.index())) {
-            // A task cannot be switched out twice without running in
-            // between, so this replaces rather than accumulates.
-            *slot = pending;
+        // A tail that switches again is still the first frame's tail: the
+        // code after the second switch is on the same abandoned stack.
+        if self.unwinding.is_none() {
+            self.unwinding = Some(outgoing);
+            self.port.begin_unwind();
         }
-        self.port.swallow_exits(pending);
         let index = usize::from(incoming.index());
         if let Some(flag) = self.started.get_mut(index) {
             if !*flag {
@@ -735,6 +872,9 @@ impl<
                 }
                 if let Some(flag) = self.owes_yield.get_mut(index) {
                     *flag = false;
+                }
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
                 }
             }
         }
@@ -870,14 +1010,71 @@ impl<
         Ok(())
     }
 
+    /// `xTaskAbortDelay`: pull a task out of the Blocked state early.
+    ///
+    /// `true` is `pdPASS` — the task really was blocked and is now ready.
+    /// A task that was not blocked is left alone and `false` comes back,
+    /// which is the C's `pdFAIL`.
+    ///
+    /// The shape matters as much as the effect: the whole thing runs with
+    /// the scheduler suspended, the event list is touched inside a critical
+    /// section of its own because an interrupt can reach it, and a yield
+    /// that the higher priority of the woken task calls for is *pended*
+    /// rather than taken, so it happens on the way out of `xTaskResumeAll`.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn abort_delay(&mut self, task: TaskHandle) -> Result<bool> {
+        if !self.tcbs.contains(task) {
+            return Err(Error::Gone);
+        }
+        self.suspend_all();
+        // eTaskGetState: a critical section of its own on any task but the
+        // running one, and the running one is never Blocked.
+        let blocked = self.task_state_get(task)? == TaskState::Blocked;
+        if !blocked {
+            let _ = self.resume_all();
+            return Ok(false);
+        }
+        let item = Self::state_item(task);
+        if self.lists.container(item)?.is_some() {
+            let _ = self.lists.remove(item);
+        }
+        self.enter_critical();
+        {
+            let event = Self::event_item(task);
+            if self.lists.container(event)?.is_some() {
+                let _ = self.lists.remove(event);
+                if let Some(flag) = self.delay_aborted.get_mut(usize::from(task.index())) {
+                    *flag = true;
+                }
+            }
+        }
+        self.exit_critical();
+        self.add_task_to_ready_list(task)?;
+        // configUSE_PREEMPTION, one core: pend the yield rather than take
+        // it, so it lands where `xTaskResumeAll` puts it.
+        let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
+        if woken > self.current_priority() {
+            self.yield_pending = true;
+        }
+        let _ = self.resume_all();
+        Ok(true)
+    }
+
     /// `prvAddCurrentTaskToDelayedList`.
-    fn add_current_task_to_delayed_list(
+    pub(crate) fn add_current_task_to_delayed_list(
         &mut self,
         ticks: u64,
         can_block_indefinitely: bool,
     ) -> Result<()> {
         let now = self.tick;
         let current = self.current;
+        // About to enter a delayed list, so the abort flag is cleared here
+        // and can only be seen set by a task that really was aborted.
+        if let Some(flag) = self.delay_aborted.get_mut(usize::from(current.index())) {
+            *flag = false;
+        }
         let item = Self::state_item(current);
         if self.lists.container(item)?.is_some() {
             let _ = self.lists.remove(item);
@@ -1117,222 +1314,296 @@ impl<
         already_yielded
     }
 
-    // ------------------------------------------------------------ queues --
+    // ------------------------------------------- the blocking-call frame --
 
-    /// `xQueueCreate`, for a queue of `u64` items.
+    /// Start (or continue) a blocking call's `for(;;)`.
     ///
-    /// The C kernel copies bytes; K1's corpus moves 32-bit values, so the
-    /// slot is a `u64` and a wider payload waits for the scenario that
-    /// needs it rather than a generic nobody exercises.
-    ///
-    /// # Errors
-    /// [`Error::Full`] when the queue arena or the shared slot pool is
-    /// exhausted; [`Error::InvalidArgument`] for a zero length.
-    pub fn queue_create(&mut self, length: usize) -> Result<QueueHandle> {
-        if length == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let base = self.slots_used;
-        let end = base.checked_add(length).ok_or(Error::Full)?;
-        if end > SLOTS {
-            return Err(Error::Full);
-        }
-        let handle = self
-            .queues
-            .try_insert(Queue {
-                base,
-                length,
-                waiting: 0,
-                read: 0,
-                write: 0,
-            })
-            .map_err(|_| Error::Full)?;
-        self.slots_used = end;
-        // `xQueueGenericReset` runs in a critical section before
-        // `traceQUEUE_CREATE` fires at the end of `prvInitialiseNewQueue`.
-        self.enter_critical();
-        self.exit_critical();
+    /// The first pass records the block time and the entry timestamp, the
+    /// way `xEntryTimeSet` / `vTaskInternalSetTimeOutState` do; later
+    /// passes leave the running total alone, because the `ticks` the caller
+    /// passes is the original block time and the kernel is holding what is
+    /// left of it.
+    pub(crate) fn begin_wait(
+        &mut self,
+        task: TaskHandle,
+        queue: QueueHandle,
+        ticks: u64,
+    ) -> Result<()> {
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
-        self.trace.event(
-            tick,
-            Event::QueueCreate {
-                queue: handle,
-                name: "",
-                length,
-            },
-        );
-        Ok(handle)
+        let overflows = self.overflows;
+        let Ok(tcb) = self.tcbs.resolve_mut(task) else {
+            // A queue call made before the scheduler started, from what the
+            // C would call `main()`: there is no task to keep a frame for,
+            // and such a call never blocks — `xSemaphoreGive` on a fresh
+            // semaphore is the usual one.
+            return Ok(());
+        };
+        if tcb.wait.queue != queue || !tcb.wait.entry_set {
+            tcb.wait = WaitFrame {
+                queue,
+                ticks,
+                entering: tick,
+                overflows,
+                entry_set: true,
+                inherited: false,
+            };
+        }
+        Ok(())
     }
 
-    /// `xQueueSend` to the back, with a block time in ticks.
-    ///
-    /// K1's corpus only ever sends with a zero block time, so a full queue
-    /// returns [`Error::Full`] rather than blocking; blocking sends arrive
-    /// with the scenario that needs them.
-    ///
-    /// # Errors
-    /// [`Error::Full`] when the queue is full; [`Error::Gone`] for a stale
-    /// handle; [`Error::Unsupported`] for a non-zero block time.
-    pub fn queue_send(&mut self, queue: QueueHandle, value: u64, ticks: u64) -> Result<()> {
-        if ticks != 0 {
-            return Err(Error::Unsupported);
+    /// The call finished, one way or the other.
+    pub(crate) fn end_wait(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.wait = WaitFrame::default();
         }
+    }
+
+    /// `xTicksToWait` as it now stands.
+    pub(crate) fn remaining_ticks(&self, task: TaskHandle) -> u64 {
+        self.tcbs.resolve(task).map(|t| t.wait.ticks).unwrap_or(0)
+    }
+
+    /// `xInheritanceOccurred`.
+    pub(crate) fn wait_inherited(&self, task: TaskHandle) -> bool {
+        self.tcbs
+            .resolve(task)
+            .map(|t| t.wait.inherited)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn set_wait_inherited(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.wait.inherited = true;
+        }
+    }
+
+    /// `xTaskCheckForTimeOut`: `true` when the block time has run out.
+    /// Takes a critical section, as the C does, and charges the elapsed
+    /// time against what is left.
+    pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> bool {
         self.enter_critical();
-        let snapshot = match self.queues.resolve(queue) {
-            Ok(q) => *q,
-            Err(e) => {
-                self.exit_critical();
-                return Err(e);
-            }
-        };
-        if snapshot.waiting < snapshot.length {
-            let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
-            self.trace.event(tick, Event::QueueSend { queue, name: "" });
-            if let Some(cell) = self
-                .slots
-                .get_mut(snapshot.base.saturating_add(snapshot.write))
-            {
-                *cell = value;
-            }
-            if let Ok(q) = self.queues.resolve_mut(queue) {
-                q.write = q.write.saturating_add(1);
-                if q.write >= q.length {
-                    q.write = 0;
-                }
-                q.waiting = q.waiting.saturating_add(1);
-            }
-            let receivers = Self::queue_receive_list(queue);
-            if self.lists.is_empty(receivers) == Ok(false)
-                && self.remove_from_event_list(receivers)?
-            {
-                // queueYIELD_IF_USING_PREEMPTION(), inside the section.
-                self.port_yield();
+        // An aborted delay is not the same as a time out, but it has the
+        // same result: stop waiting.
+        if self.delay_aborted.get(usize::from(task.index())).copied() == Some(true) {
+            if let Some(flag) = self.delay_aborted.get_mut(usize::from(task.index())) {
+                *flag = false;
             }
             self.exit_critical();
+            return true;
+        }
+        let now = self.tick;
+        let overflows = self.overflows;
+        let result = match self.tcbs.resolve_mut(task) {
+            Ok(tcb) => {
+                let elapsed = now.wrapping_sub(tcb.wait.entering) & Self::MAX_DELAY;
+                if tcb.wait.ticks == Self::MAX_DELAY {
+                    // An indefinite block never times out.
+                    false
+                } else if overflows != tcb.wait.overflows && now >= tcb.wait.entering {
+                    tcb.wait.ticks = 0;
+                    true
+                } else if elapsed < tcb.wait.ticks {
+                    tcb.wait.ticks = tcb.wait.ticks.saturating_sub(elapsed);
+                    tcb.wait.entering = now;
+                    tcb.wait.overflows = overflows;
+                    false
+                } else {
+                    tcb.wait.ticks = 0;
+                    true
+                }
+            }
+            Err(_) => true,
+        };
+        self.exit_critical();
+        result
+    }
+
+    /// `vTaskPlaceOnEventList`: sorted by priority, then blocked.
+    pub(crate) fn place_on_event_list(&mut self, list: ListId, ticks: u64) -> Result<()> {
+        let current = self.current;
+        let item = Self::event_item(current);
+        let value = self.lists.value(item)?;
+        self.lists.insert(list, item, value)?;
+        self.add_current_task_to_delayed_list(ticks, true)
+    }
+
+    /// Take the trailing `portYIELD()` now, or owe it if a tick already
+    /// switched us out of this call.
+    pub(crate) fn yield_or_owe(&mut self, caller: TaskHandle) {
+        if self.current == caller {
+            self.port_yield();
+        } else {
+            self.owe_yield(caller);
+        }
+    }
+
+    /// `pvTaskIncrementMutexHeldCount`.
+    pub(crate) fn increment_mutexes_held(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.mutexes_held = tcb.mutexes_held.saturating_add(1);
+        }
+    }
+
+    // ------------------------------------------------ priority inheritance --
+
+    /// `xTaskPriorityInherit`: lift the mutex holder to the waiter's
+    /// priority. `true` when the holder is (or already was) lifted, which
+    /// is what the waiter remembers so it can undo it on a timeout.
+    pub(crate) fn priority_inherit(&mut self, holder: TaskHandle) -> Result<bool> {
+        if holder.is_null() || !self.tcbs.contains(holder) {
+            return Ok(false);
+        }
+        let waiter_priority = self.current_priority();
+        let (holder_priority, holder_base) = {
+            let tcb = self.tcbs.resolve(holder)?;
+            (tcb.priority, tcb.base_priority)
+        };
+        if holder_priority >= waiter_priority {
+            // Already at least as urgent; the waiter still records that the
+            // holder is running above its base, if it is.
+            return Ok(holder_base < waiter_priority);
+        }
+        let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(waiter_priority));
+        self.lists
+            .set_value(Self::event_item(holder), event_value)?;
+        let item = Self::state_item(holder);
+        if self.lists.container(item)? == Some(Self::ready_list(holder_priority)) {
+            let _ = self.lists.remove(item);
+            self.tcbs.resolve_mut(holder)?.priority = waiter_priority;
+            self.add_task_to_ready_list(holder)?;
+        } else {
+            self.tcbs.resolve_mut(holder)?.priority = waiter_priority;
+        }
+        self.trace_task(holder, |task, name| Event::TaskPriorityInherit {
+            task,
+            name,
+            priority: Self::priority_value(waiter_priority),
+        });
+        Ok(true)
+    }
+
+    /// `xTaskPriorityDisinherit`: giving the mutex back drops the
+    /// inherited priority. `true` when a yield is wanted.
+    pub(crate) fn priority_disinherit(&mut self, holder: TaskHandle) -> Result<bool> {
+        if holder.is_null() || !self.tcbs.contains(holder) {
+            return Ok(false);
+        }
+        let (priority, base, held) = {
+            let tcb = self.tcbs.resolve(holder)?;
+            (tcb.priority, tcb.base_priority, tcb.mutexes_held)
+        };
+        let remaining = held.saturating_sub(1);
+        if let Ok(tcb) = self.tcbs.resolve_mut(holder) {
+            tcb.mutexes_held = remaining;
+        }
+        if priority == base || remaining != 0 {
+            return Ok(false);
+        }
+        let item = Self::state_item(holder);
+        if self.lists.remove(item).is_err() {
+            return Ok(false);
+        }
+        self.trace_task(holder, |task, name| Event::TaskPriorityDisinherit {
+            task,
+            name,
+            priority: Self::priority_value(base),
+        });
+        {
+            let tcb = self.tcbs.resolve_mut(holder)?;
+            tcb.priority = base;
+        }
+        let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(base));
+        self.lists
+            .set_value(Self::event_item(holder), event_value)?;
+        self.add_task_to_ready_list(holder)?;
+        Ok(true)
+    }
+
+    /// `vTaskPriorityDisinheritAfterTimeout`: a waiter gave up, so the
+    /// holder keeps only what the tasks still waiting justify.
+    pub(crate) fn priority_disinherit_after_timeout(
+        &mut self,
+        holder: TaskHandle,
+        highest_waiting: u8,
+    ) -> Result<()> {
+        if holder.is_null() || !self.tcbs.contains(holder) {
             return Ok(());
         }
-        // The C exits the critical section *before* the failure trace.
-        self.exit_critical();
-        let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
-        self.trace
-            .event(tick, Event::QueueSendFailed { queue, name: "" });
-        Err(Error::Full)
-    }
-
-    /// `xQueueReceive` with a block time in ticks.
-    ///
-    /// As [`Kernel::queue_send`], K1's corpus only receives with a zero
-    /// block time.
-    ///
-    /// # Errors
-    /// [`Error::Empty`] when the queue is empty; [`Error::Gone`] for a
-    /// stale handle; [`Error::Unsupported`] for a non-zero block time.
-    pub fn queue_receive(&mut self, queue: QueueHandle, ticks: u64) -> Result<u64> {
-        if ticks != 0 {
-            return Err(Error::Unsupported);
-        }
-        self.enter_critical();
-        let snapshot = match self.queues.resolve(queue) {
-            Ok(q) => *q,
-            Err(e) => {
-                self.exit_critical();
-                return Err(e);
-            }
+        let (priority, base, held) = {
+            let tcb = self.tcbs.resolve(holder)?;
+            (tcb.priority, tcb.base_priority, tcb.mutexes_held)
         };
-        if snapshot.waiting > 0 {
-            // C copies the data out, then fires the trace.
-            let value = self
-                .slots
-                .get(snapshot.base.saturating_add(snapshot.read))
-                .copied()
-                .unwrap_or(0);
-            if let Ok(q) = self.queues.resolve_mut(queue) {
-                q.read = q.read.saturating_add(1);
-                if q.read >= q.length {
-                    q.read = 0;
-                }
-                q.waiting = q.waiting.saturating_sub(1);
-            }
-            let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
-            self.trace
-                .event(tick, Event::QueueReceive { queue, name: "" });
-            let senders = Self::queue_send_list(queue);
-            if self.lists.is_empty(senders) == Ok(false) && self.remove_from_event_list(senders)? {
-                // queueYIELD_IF_USING_PREEMPTION(), inside the section.
-                self.port_yield();
-            }
-            self.exit_critical();
-            return Ok(value);
+        if priority == base || held != 1 {
+            return Ok(());
         }
-        self.exit_critical();
-        let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
-        self.trace
-            .event(tick, Event::QueueReceiveFailed { queue, name: "" });
-        Err(Error::Empty)
+        let target = if highest_waiting > base {
+            highest_waiting
+        } else {
+            base
+        };
+        if priority == target {
+            return Ok(());
+        }
+        self.trace_task(holder, |task, name| Event::TaskPriorityDisinherit {
+            task,
+            name,
+            priority: Self::priority_value(target),
+        });
+        self.tcbs.resolve_mut(holder)?.priority = target;
+        let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(target));
+        self.lists
+            .set_value(Self::event_item(holder), event_value)?;
+        let item = Self::state_item(holder);
+        if self.lists.container(item)? == Some(Self::ready_list(priority)) {
+            let _ = self.lists.remove(item);
+            self.add_task_to_ready_list(holder)?;
+        }
+        Ok(())
     }
 
-    /// `vQueueWaitForMessageRestricted`: what the timer service task does
-    /// when it has no timer to run — block on the timer queue without
-    /// suspending the scheduler.
-    ///
-    /// `wait_indefinitely` is the C third argument: when set, the wait
-    /// becomes `portMAX_DELAY` and the task goes to the suspended list
-    /// rather than a delayed one. The two queue locks around it are C's
-    /// `prvLockQueue` and `prvUnlockQueue`, which are three critical
-    /// sections in total — and therefore three ticks' worth of sim time
-    /// every sixteen, which is why they are here rather than elided.
+    // ------------------------------------------------------- delay until --
+
+    /// `xTaskDelayUntil`: wake at `*previous_wake + period`, whatever the
+    /// task did in between. `false` when the deadline has already passed,
+    /// in which case nothing blocks — exactly as the C returns `pdFALSE`.
     ///
     /// # Errors
     /// A list error surfaces as itself.
-    pub fn wait_for_message_restricted(
-        &mut self,
-        queue: QueueHandle,
-        ticks: u64,
-        wait_indefinitely: bool,
-    ) -> Result<()> {
-        // prvLockQueue
-        self.enter_critical();
-        let empty = self
-            .queues
-            .resolve(queue)
-            .map(|q| q.waiting == 0)
-            .unwrap_or(false);
-        self.exit_critical();
-        if empty {
-            // vTaskPlaceOnEventListRestricted
-            let current = self.current;
-            let event = Self::event_item(current);
-            self.lists
-                .insert_end(Self::queue_receive_list(queue), event)?;
-            let ticks = if wait_indefinitely {
-                Self::MAX_DELAY
-            } else {
-                ticks
-            };
-            let wake_at = self.tick.wrapping_add(ticks) & Self::MAX_DELAY;
-            self.trace_task(current, |task, name| Event::TaskDelayUntil {
-                task,
-                name,
-                wake_at,
-            });
-            self.add_current_task_to_delayed_list(ticks, wait_indefinitely)?;
+    pub fn delay_until(&mut self, previous_wake: &mut u64, period: u64) -> Result<bool> {
+        let caller = self.current;
+        let mut should_delay = false;
+        self.suspend_all();
+        {
+            let now = self.tick;
+            let wake_at = previous_wake.wrapping_add(period) & Self::MAX_DELAY;
+            if now < *previous_wake {
+                // The tick count overflowed since the last wake.
+                if wake_at < *previous_wake && wake_at > now {
+                    should_delay = true;
+                }
+            } else if wake_at < *previous_wake || wake_at > now {
+                should_delay = true;
+            }
+            *previous_wake = wake_at;
+            if should_delay {
+                self.trace_task(caller, |task, name| Event::TaskDelayUntil {
+                    task,
+                    name,
+                    wake_at,
+                });
+                let ticks = wake_at.wrapping_sub(now) & Self::MAX_DELAY;
+                self.add_current_task_to_delayed_list(ticks, false)?;
+            }
         }
-        // prvUnlockQueue: one critical section per lock counter.
-        self.enter_critical();
-        self.exit_critical();
-        self.enter_critical();
-        self.exit_critical();
-        Ok(())
+        if !self.resume_all() {
+            self.yield_or_owe(caller);
+        }
+        Ok(should_delay)
     }
 
     /// `xTaskRemoveFromEventList`; `true` when the woken task outranks the
     /// running one and a yield is therefore required.
-    fn remove_from_event_list(&mut self, list: ListId) -> Result<bool> {
+    pub(crate) fn remove_from_event_list(&mut self, list: ListId) -> Result<bool> {
         let Some(item) = self.lists.head(list)? else {
             return Ok(false);
         };

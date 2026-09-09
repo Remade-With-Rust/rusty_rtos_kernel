@@ -6,10 +6,14 @@ Family plan: Kairos `docs/plans/rtos-mission.md` (umbrella repo) — its §2.1
 names what this package remakes, wraps and never touches; its §6 carries the
 phase this package's kill test belongs to. This file obeys that one.
 
-Written 2026-09-09. Status: **K1 — the scheduler agrees with the C kernel on
-the first scenario.** `dynamic` produces a trace identical to the C kernel's
-for 100,000 ticks, counters included. Eight scenarios of the corpus remain,
-and IPC beyond the queue is K2's.
+Written 2026-09-09. Status: **K1 — the scheduler agrees with the C kernel.
+Passed.** All nine corpus scenarios trace identically to the C kernel for
+100,000 ticks each, 8,408,764 lines, counters included; Miri is green over
+the corpus. Queues, semaphores, mutexes with inheritance and the recursive
+variant came with them. Notifications, timers, event groups and stream
+buffers are K2's. The arena-and-list cost row came out at 2.08× the C list,
+which fires the mission plan's 1.25× revisit condition on §2.5 — the row and
+its diagnosis are in the umbrella ledger, and the decision is the owner's.
 
 ---
 
@@ -91,7 +95,7 @@ statement.
 | Milestone | Adds | Driven by | Kill test |
 |---|---|---|---|
 | **K1a** (done 2026-09-09) | tasks, the tick, the switch, the zero-block queue | K1 | `dynamic` trace-identical for 100,000 ticks |
-| K1b | whatever the remaining eight scenarios need — blocking queue sends and receives, `vTaskDelayUntil`, `vTaskDelete` | K1 | all nine trace-identical |
+| K1b | whatever the remaining eight scenarios need — blocking queue sends and receives, semaphores, mutexes with inheritance, `vTaskDelayUntil`, `xTaskAbortDelay` | K1 | **done**: all nine trace-identical |
 | K2 | notifications, mutexes with priority inheritance, counting semaphores, queue sets, software timers, event groups, stream and message buffers | K2 | the K2 corpus trace-identical; Kani harnesses for the CBMC proof list |
 | K3 | whatever a real port needs from the switch decision (a `Port` that swaps stacks rather than a runner that steps bodies) | K3 | the corpus on QEMU and on a C6 |
 
@@ -108,7 +112,7 @@ statement.
 
 | Risk | Mitigation |
 |---|---|
-| The remaining eight scenarios each expose a new C corner and the diff turns into a long grind | each divergence is localised by `kairos conform --exits` in one run; the three mechanisms in §3 were the structural ones, and the rest are expected to be single functions |
+| The remaining eight scenarios each expose a new C corner and the diff turns into a long grind | **held**: each divergence was localised by `kairos conform --exits` in one run. Two more structural mechanisms turned up beyond §3's three — an abandoned frame's tail must be tallied rather than discarded, and the C heap costs an exit per allocation — and the rest were single functions |
 | The state-machine model diverges from a real stack-switching port at K3, and the corpus has to be re-proved | the kernel's decisions are the same either way; K3's kill test runs the same corpus on QEMU, which is what would catch it |
 | A blocking queue path is written to satisfy a scenario rather than to match C | every path lands with its scenario's trace diff, never before |
 

@@ -44,9 +44,11 @@
 
 pub mod kernel;
 pub mod name;
+pub mod queue;
 
 pub use kernel::{Kernel, StartHandles, TaskState};
 pub use name::{NAME_CAPACITY, Name};
+pub use queue::{Blocked, Kind as QueueKind, Position, Ready, Wait};
 
 /// Crate version, for manifests and logs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -77,6 +79,7 @@ pub const OVERHEAD_LISTS: usize = 4;
 pub mod prelude {
     pub use crate::kernel::{Kernel, StartHandles, TaskState};
     pub use crate::name::Name;
+    pub use crate::queue::{Blocked, Position, Ready, Wait};
     pub use crate::{items_for, lists_for};
     pub use rusty_rtos_core::prelude::*;
 }
