@@ -9,7 +9,7 @@
 **Architect**: [Tim Almond](https://github.com/Ttimmahlax) — accountable for this unit's security design; rendered
 at the foot of the block in every README and mirror
 **Audit depth**: survey
-**Audited**: 2026-09-09 by kairos (scaffold pass) · **Next review**: the first milestone with a kill test
+**Audited**: 2026-09-09 by kairos (K1 pass) · **Next review**: the rest of the nine-scenario corpus
 
 > Source of truth for this unit's hardening status. The README's status table is
 > **generated from this file** — edit here, then run:
@@ -57,8 +57,8 @@ Evidence; excluded from the totals).
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-07 | ★ `Cargo.lock` committed | Completed | `Cargo.lock` tracked in the first commit (`git ls-files Cargo.lock`) | |
-| H-08 | ★ `deny.toml` policy present and enforced | Incomplete | `deny.toml` present (licenses, bans incl. `*-sys`, sources); `cargo deny check` runs in CI; the first run's verdict goes here | |
-| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Incomplete | not yet run | |
+| H-08 | ★ `deny.toml` policy present and enforced | Completed | `cargo deny check` 2026-09-09: advisories ok, bans ok, licenses ok, sources ok (fleet gate `kairos check --deny`; ledger) | |
+| H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | `cargo audit` 2026-09-09: 0 advisories (ledger) | |
 | H-10 | ★ `cargo vet` coverage complete | Incomplete | no `supply-chain/` yet | |
 | H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | `UNSAFE.md` says zero; `cargo geiger` not yet archived | |
 | H-12 | ★ SBOM generated and published with releases | Incomplete | no release yet | |
@@ -69,13 +69,13 @@ Evidence; excluded from the totals).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-15 | ★ Workspace lint policy set and clean | Completed | `[workspace.lints]`: `unsafe_code = deny`, `undocumented_unsafe_blocks`, `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented` = deny, `indexing_slicing` + `arithmetic_side_effects` = warn; `cargo clippy --workspace --all-targets -- -D warnings` clean at scaffold | |
-| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | `forbid(unsafe_code)` in every crate; `UNSAFE.md` lists none | |
-| H-17 | Arithmetic safety explicit | Incomplete | `arithmetic_side_effects = warn` under `-D warnings`; no arithmetic yet to audit | |
+| H-15 | ★ Workspace lint policy set and clean | Completed | `[workspace.lints]`: `unsafe_code = deny`, `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented` = deny, `indexing_slicing` + `arithmetic_side_effects` = warn; `cargo clippy --workspace --all-targets -- -D warnings` clean on the K1 scheduler | |
+| H-16 | ★ `unsafe` isolated, SAFETY-commented, inventoried | Completed | `forbid(unsafe_code)` in both crates; `UNSAFE.md` lists none. The scheduler decides a context switch and never performs one, which is what keeps that true — the switch is `rusty_rtos_port-<arch>`'s, and its `unsafe` is inventoried there | |
+| H-17 | Arithmetic safety explicit | Completed | `arithmetic_side_effects = warn` under `-D warnings` is clean: every tick, index, priority and queue-slot operation is `checked_*`, `wrapping_*` or `saturating_*` by name, and the tick arithmetic is masked to the configuration's width | |
 | H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | `unwrap_used`, `expect_used`, `panic` = deny at the workspace; tests opt out per file | |
-| H-19 | Input validation — external bytes treated as hostile | Incomplete | no parser yet; the no-panic gate arrives with the first one | |
+| H-19 | Input validation — external bytes treated as hostile | Completed | no byte parser in this crate; every externally supplied value (a task or queue handle, a priority, a block time, a list index) returns `Error` where the C kernel would `configASSERT`, and a stale handle is `Error::Gone` rather than a use-after-free | |
 | H-20 | ★ Secrets zeroized; never logged | Incomplete | no secret enters this crate by design; state it in the threat model | |
-| H-21 | Concurrency discipline | Incomplete | no shared mutable state yet | |
+| H-21 | Concurrency discipline | Completed | single-context by construction on the sim; no `static mut`, no interior mutability, no hand-written `Send`/`Sync`. The critical-section discipline is the C kernel's, and is proven to match it: the conformance diff would move every line if a section opened or closed anywhere else (ledger) | |
 
 ### Phase 4 — Static analysis
 
@@ -87,7 +87,7 @@ Evidence; excluded from the totals).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-23 | ★ Tests pass under Miri | Incomplete | not yet run | |
+| H-23 | ★ Tests pass under Miri | Completed | `cargo +nightly miri test --lib` 2026-09-09: green (miri 0.1.0 of 2026-09-08). The whole scheduler also runs green under Miri through `rusty_rtos_demo`'s corpus (158 s for a 500-tick scenario) | |
 | H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | | |
 | H-25 | `cargo careful test` green | Incomplete | | |
 
@@ -98,7 +98,7 @@ Evidence; excluded from the totals).
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Incomplete | no parser yet | |
 | H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | | |
 | H-28 | Property tests cover the documented invariants | Incomplete | | |
-| H-29 | Mutation and/or differential testing on critical modules | Incomplete | the C oracle differential arrives with K1 | |
+| H-29 | Mutation and/or differential testing on critical modules | Completed | **differential testing against the C kernel is this package's primary gate**: `kairos conform dynamic --ticks 100000` compares 1,219,231 trace lines and the tick/yield/critical-exit counters against FreeRTOS-Kernel V11.3.1 on its Posix port, and fails at the first difference (ledger). 1 scenario of 9; mutation testing is not yet run | |
 
 ### Phase 7 — Formal verification
 
@@ -201,3 +201,4 @@ Append one line per pass; never rewrite history. The trend is the point.
 | Date | Depth | Auditor | Completed / Scheduled / Incomplete | ★ met | Note |
 |---|---|---|---|---|---|
 | 2026-09-09 | survey | kairos (scaffold pass) | 7 / 0 / 28 | 5 | first pass, at stamp time; every Completed row names a file that exists |
+| 2026-09-09 | survey + tool probes | kairos (K1 pass) | 15 / 0 / 21 | 9 | K1: the trace differential against the C kernel is live and is this unit's strongest evidence; deny, audit and Miri run on the developer box |
