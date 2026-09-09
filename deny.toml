@@ -27,6 +27,15 @@ deny = [
   { crate = "aws-lc-sys", reason = "C; use RustCrypto / rustls-rustcrypto" },
   { crate = "freertos-sys", reason = "the C kernel is the oracle, never a dependency" },
   { crate = "freertos-rust", reason = "the C kernel is the oracle, never a dependency" },
+  # Four crates.io names that are NOT the house crates they resemble
+  # (umbrella docs/HOUSE-STACK.md). The house versions: rusty_time-core / -api
+  # / -clock on crates.io; remade_ffmpeg_rs (lib `rff`) by git URL; thoth by
+  # git tag (or the split rusty_symbols / rusty_tokens / rusty_a11y, which is
+  # what Kairos uses); spacedb-sdk on crates.io.
+  { crate = "rusty_time", reason = "cleancut's timer crate, not the house NTP remake (rusty_time-core)" },
+  { crate = "rff", reason = "a fuzzy finder, not remade_ffmpeg_rs; media is above the RTOS anyway" },
+  { crate = "thoth", reason = "a GraphQL crate on crates.io; the house thoth is a git tag, and Kairos uses rusty_symbols" },
+  { crate = "spacedb", reason = "spacesprotocol's, not the house SDK (spacedb-sdk)" },
 ]
 
 [advisories]
@@ -35,4 +44,7 @@ ignore = []
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# A house crate taken by git URL (thoth by tag, rusty_json_turbo, remade_ffmpeg_rs)
+# is added here with its URL when it is added to a manifest, never ahead of it:
+# an allow-git entry nothing uses is a cargo-deny warning on every run.
 allow-git = ["https://github.com/Remade-With-Rust/rusty_rtos_core"]
