@@ -35,8 +35,8 @@ only on what it was.
 
 | gate | result | method |
 |---|---|---|
-| scenarios covered | **15** through `rusty_rtos_demo`, 12,688,209 lines identical at 100,000 ticks | `kairos conform --all --ticks 100000` |
-| subsystems added since K1 | the whole `FromISR` surface, queue sets with real `cTxLock`/`cRxLock` counts, task notifications, stream and message buffers over a byte arena with a free list, software timers with the daemon task, event groups | each proved by the scenario that exercises it, not by a unit test |
+| scenarios covered | **16** through `rusty_rtos_demo`, 12,808,722 lines identical at 100,000 ticks | `kairos conform --all --ticks 100000` |
+| subsystems added since K1 | the whole `FromISR` surface, queue sets with real `cTxLock`/`cRxLock` counts, task notifications, stream and message buffers over a byte arena with a free list, software timers with the daemon task, event groups, and `sbSEND_COMPLETED` as a hook an application can replace | each proved by the scenario that exercises it, not by a unit test |
 | no-panic gate | **passed** | `tests/no_panic.rs`: 64 kernels, 4,000 arbitrary calls each over the whole public surface, with handles from other arenas, handles from nowhere and stale handles. It asserts the calls landed — the run must trace more than 100,000 lines |
 
 ## The build fact (2026-09-09)

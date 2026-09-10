@@ -605,7 +605,14 @@ where
 
     /// `sbSEND_COMPLETED`: tell a waiting reader, with the scheduler
     /// suspended so the notify cannot switch away mid-update.
+    ///
+    /// The application may replace it — that is what the macro is for, and
+    /// `MessageBufferAMP` is the demo that does — so the hook gets first
+    /// refusal and `true` means it handled the whole thing.
     fn send_completed(&mut self, buffer: StreamBufferHandle) -> Result<()> {
+        if H::send_completed(self, buffer) {
+            return Ok(());
+        }
         self.suspend_all();
         let waiting = self.buffers.resolve(buffer)?.waiting_to_receive;
         if waiting != TaskHandle::NULL {
@@ -617,8 +624,16 @@ where
         Ok(())
     }
 
-    /// `sbSEND_COMPLETED_FROM_ISR`.
-    fn send_completed_from_isr(&mut self, buffer: StreamBufferHandle) -> Result<Woken> {
+    /// `xStreamBufferSendCompletedFromISR` / `sbSEND_COMPLETED_FROM_ISR`.
+    ///
+    /// Public because an application that replaced [`TickHook::send_completed`]
+    /// has to be able to do the notify itself, later and from interrupt
+    /// context — which is exactly what `MessageBufferAMP` does once its
+    /// stand-in interrupt has read the handle back off the control buffer.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn send_completed_from_isr(&mut self, buffer: StreamBufferHandle) -> Result<Woken> {
         let waiting = self.buffers.resolve(buffer)?.waiting_to_receive;
         if waiting == TaskHandle::NULL {
             return Ok(Woken::NO);
