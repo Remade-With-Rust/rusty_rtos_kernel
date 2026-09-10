@@ -50,6 +50,7 @@ pub mod proofs;
 pub mod queue;
 pub mod stream;
 pub mod timer;
+pub mod typed;
 
 pub use kernel::{Kernel, StartHandles, TaskState};
 pub use name::{NAME_CAPACITY, Name};

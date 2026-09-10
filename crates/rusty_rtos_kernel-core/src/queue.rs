@@ -1246,3 +1246,52 @@ const fn wrap_prev(index: usize, length: usize) -> usize {
         None => length.saturating_sub(1),
     }
 }
+
+/// The Rust face's raw surface: see [`crate::typed`].
+///
+/// Every method here is one of the kernel's own calls under another name.
+/// The one that is not — [`Raw::raw_queue_has_room`] — is the kernel
+/// reading its own queue rather than a task asking, so it takes no
+/// critical section and costs no sim time, which is what lets the typed
+/// face be free.
+impl<
+    C: Config,
+    P: Port,
+    T: Trace,
+    H,
+    const TASKS: usize,
+    const ITEMS: usize,
+    const LISTS: usize,
+    const QUEUES: usize,
+    const SLOTS: usize,
+    const BUFFERS: usize,
+    const BYTES: usize,
+    const TIMERS: usize,
+    const GROUPS: usize,
+> crate::typed::Raw
+    for Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+where
+    H: TickHook<Self>,
+{
+    fn raw_queue_create(&mut self, length: usize) -> Result<QueueHandle> {
+        self.queue_create(length)
+    }
+
+    fn raw_queue_send(&mut self, queue: QueueHandle, value: u64, ticks: u64) -> Result<Wait<()>> {
+        self.queue_send(queue, value, ticks)
+    }
+
+    fn raw_queue_receive(&mut self, queue: QueueHandle, ticks: u64) -> Result<Wait<u64>> {
+        self.queue_receive(queue, ticks)
+    }
+
+    fn raw_queue_messages_waiting(&mut self, queue: QueueHandle) -> Result<usize> {
+        self.queue_messages_waiting(queue)
+    }
+
+    fn raw_queue_has_room(&self, queue: QueueHandle) -> bool {
+        self.queues
+            .resolve(queue)
+            .is_ok_and(|q| q.waiting < q.length)
+    }
+}
