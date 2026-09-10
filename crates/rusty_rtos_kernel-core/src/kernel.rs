@@ -25,6 +25,7 @@ use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{
     Queue as QueueKind, QueueHandle, StreamBuffer as StreamKind, Task as TaskKind, TaskHandle,
+    Timer as TimerKind,
 };
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
@@ -38,6 +39,7 @@ use crate::name::Name;
 use crate::queue::Queue;
 use crate::queue::Wait;
 use crate::stream::StreamBuffer;
+use crate::timer::{MAX_TIMER_COMMANDS, Message, Timer};
 use crate::{OVERHEAD_LISTS, items_for, lists_for};
 
 /// A trace line owed by a task that was switched out before it could
@@ -191,6 +193,7 @@ pub struct Kernel<
     const SLOTS: usize,
     const BUFFERS: usize,
     const BYTES: usize,
+    const TIMERS: usize,
 > {
     pub(crate) port: P,
     pub(crate) trace: T,
@@ -199,6 +202,18 @@ pub struct Kernel<
     pub(crate) lists: Lists<ITEMS, LISTS>,
     pub(crate) slots: [u64; SLOTS],
     pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
+    pub(crate) timers: Arena<TimerKind, Timer, TIMERS>,
+    /// The ring of `DaemonTaskMessage_t`s the timer queue carries indices
+    /// into. It is exactly as long as the queue, so a message can only be
+    /// overwritten once the queue has already refused to hold its index.
+    pub(crate) timer_messages: [Message; MAX_TIMER_COMMANDS],
+    pub(crate) timer_message_next: usize,
+    /// Which of the two timer lists is `pxCurrentTimerList` right now.
+    pub(crate) timers_swapped: bool,
+    /// `xLastTime` in `prvSampleTimeNow`.
+    pub(crate) timer_last_time: u64,
+    /// `xTimerQueue`.
+    pub(crate) timer_queue: QueueHandle,
     pub(crate) bytes: [u8; BYTES],
     pub(crate) bytes_used: usize,
     /// Blocks of the byte arena that a deleted stream buffer gave back,
@@ -288,7 +303,8 @@ impl<
     const SLOTS: usize,
     const BUFFERS: usize,
     const BYTES: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES>
+    const TIMERS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS>
 where
     H: TickHook<Self>,
 {
@@ -318,7 +334,7 @@ where
     /// As [`Kernel::new`].
     pub fn with_tick_hook(port: P, trace: T, tick_hook: H) -> Result<Self> {
         C::validate()?;
-        if ITEMS != items_for(TASKS)
+        if ITEMS != items_for(TASKS, TIMERS)
             || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES)
             || TASKS == 0
             || C::MAX_TASK_NAME_LEN > crate::NAME_CAPACITY
@@ -334,6 +350,12 @@ where
             slots: [0; SLOTS],
             slots_used: 0,
             buffers: Arena::new(),
+            timers: Arena::new(),
+            timer_messages: [Message::default(); MAX_TIMER_COMMANDS],
+            timer_message_next: 0,
+            timers_swapped: false,
+            timer_last_time: 0,
+            timer_queue: QueueHandle::NULL,
             bytes: [0; BYTES],
             bytes_used: 0,
             free_blocks: [(0, 0); BUFFERS],
@@ -796,6 +818,7 @@ where
     pub fn start_scheduler(&mut self) -> Result<StartHandles> {
         let idle = self.create_task("IDLE", 0)?;
         let timer_queue = self.queue_create(C::TIMER_QUEUE_LENGTH)?;
+        self.timer_queue = timer_queue;
         let timer = self.create_task("Tmr Svc", C::TIMER_TASK_PRIORITY)?;
         self.next_unblock_time = Self::MAX_DELAY;
         self.running = true;

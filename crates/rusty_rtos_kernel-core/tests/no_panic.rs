@@ -23,7 +23,7 @@
 use core::fmt;
 
 use rusty_rtos_core::config::{Config, PosixDemoConfig};
-use rusty_rtos_core::handle::{QueueHandle, StreamBufferHandle, TaskHandle};
+use rusty_rtos_core::handle::{QueueHandle, StreamBufferHandle, TaskHandle, TimerHandle};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -36,6 +36,7 @@ const QUEUES: usize = 8;
 const SLOTS: usize = 32;
 const BUFFERS: usize = 4;
 const BYTES: usize = 256;
+const TIMERS: usize = 4;
 
 /// The smallest port that satisfies the seam: it counts nesting so the
 /// kernel's own bookkeeping has something real to talk to, and does nothing
@@ -92,12 +93,13 @@ type K = Kernel<
     Counting,
     NoTickHook,
     TASKS,
-    { items_for(TASKS) },
+    { items_for(TASKS, TIMERS) },
     { lists_for(<PosixDemoConfig as Config>::MAX_PRIORITIES, QUEUES) },
     QUEUES,
     SLOTS,
     BUFFERS,
     BYTES,
+    TIMERS,
 >;
 
 /// A fixed-size list of handles that are (probably) still live, so the
@@ -188,6 +190,18 @@ impl Rng {
         }
     }
 
+    fn timer(&mut self, live: &[TimerHandle]) -> TimerHandle {
+        match self.below(4) {
+            0 if !live.is_empty() => {
+                let i = self.below(live.len() as u64) as usize;
+                live.get(i).copied().unwrap_or(TimerHandle::NULL)
+            }
+            1 => TimerHandle::NULL,
+            2 => TimerHandle::from_raw(self.next() as u32),
+            _ => TimerHandle::from_raw((self.below(16) as u32) | ((self.below(4) as u32) << 16)),
+        }
+    }
+
     fn buffer(&mut self, live: &[StreamBufferHandle]) -> StreamBufferHandle {
         match self.below(4) {
             0 if !live.is_empty() => {
@@ -221,6 +235,7 @@ fn hammer(seed: u64, calls: u32) -> Worked {
     let mut tasks = Live::<TaskHandle, TASKS>::new(TaskHandle::NULL);
     let mut queues = Live::<QueueHandle, QUEUES>::new(QueueHandle::NULL);
     let mut buffers = Live::<StreamBufferHandle, BUFFERS>::new(StreamBufferHandle::NULL);
+    let mut timers = Live::<TimerHandle, TIMERS>::new(TimerHandle::NULL);
 
     for i in 0..3 {
         if let Ok(t) = k.create_task("h", (i % 5) as u8) {
@@ -240,11 +255,12 @@ fn hammer(seed: u64, calls: u32) -> Worked {
         let task = rng.task(tasks.all());
         let queue = rng.queue(queues.all());
         let buffer = rng.buffer(buffers.all());
+        let timer = rng.timer(timers.all());
         let index = rng.below(8) as usize;
         let value = rng.next();
         let length = rng.below(80) as usize;
 
-        match rng.below(34) {
+        match rng.below(45) {
             0 => {
                 if let Ok(t) = k.create_task("h", rng.below(300) as u8) {
                     tasks.push(t);
@@ -370,10 +386,55 @@ fn hammer(seed: u64, calls: u32) -> Worked {
                 let slice = data.get(..n).unwrap_or(&[]);
                 let _ = k.stream_buffer_send(buffer, slice, ticks);
             }
-            _ => {
+            33 => {
                 let n = length.min(out.len());
                 let slice = out.get_mut(..n).unwrap_or(&mut []);
                 let _ = k.stream_buffer_receive(buffer, slice, ticks);
+            }
+            34 => {
+                if let Ok(t) =
+                    k.timer_create("t", rng.below(40).max(1), rng.below(2) == 0, value, 0)
+                {
+                    timers.push(t);
+                }
+            }
+            35 => {
+                let _ = k.timer_start(timer, ticks);
+            }
+            36 => {
+                let _ = k.timer_stop(timer, ticks);
+            }
+            37 => {
+                let _ = k.timer_reset(timer, ticks);
+            }
+            38 => {
+                let _ = k.timer_change_period(timer, rng.below(40), ticks);
+            }
+            39 => {
+                let _ = k.timer_delete(timer, ticks);
+            }
+            40 => {
+                // The four wrappers, not the raw command: the C's public
+                // from-ISR API fills the value in itself, and a value from
+                // anywhere else is a command time the daemon believes.
+                match rng.below(4) {
+                    0 => drop(k.timer_start_from_isr(timer)),
+                    1 => drop(k.timer_stop_from_isr(timer)),
+                    2 => drop(k.timer_reset_from_isr(timer)),
+                    _ => drop(k.timer_change_period_from_isr(timer, rng.below(40).max(1))),
+                }
+            }
+            41 => {
+                let _ = k.timer_pend_function_call(0, value, value, ticks);
+            }
+            42 => {
+                let _ = k.timer_is_active(timer);
+            }
+            43 => {
+                let _ = k.timer_expiry_time(timer);
+            }
+            _ => {
+                let _ = k.process_one_timer_command();
             }
         }
 

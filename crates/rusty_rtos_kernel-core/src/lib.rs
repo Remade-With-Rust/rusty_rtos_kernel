@@ -46,6 +46,7 @@ pub mod kernel;
 pub mod name;
 pub mod queue;
 pub mod stream;
+pub mod timer;
 
 pub use kernel::{Kernel, StartHandles, TaskState};
 pub use name::{NAME_CAPACITY, Name};
@@ -57,8 +58,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// List items a kernel needs for `tasks` tasks: a state item and an event
 /// item each, exactly the two `ListItem_t`s in a C `TCB_t`.
 #[must_use]
-pub const fn items_for(tasks: usize) -> usize {
-    tasks.saturating_mul(2)
+pub const fn items_for(tasks: usize, timers: usize) -> usize {
+    tasks.saturating_mul(2).saturating_add(timers)
 }
 
 /// Lists a kernel needs: one ready list per priority, the two delayed
@@ -73,8 +74,8 @@ pub const fn lists_for(max_priorities: u8, queues: usize) -> usize {
 }
 
 /// The number of fixed lists that are not a ready list: the two delayed
-/// lists, pending-ready and suspended.
-pub const OVERHEAD_LISTS: usize = 4;
+/// lists, pending-ready and suspended, and the two timer lists.
+pub const OVERHEAD_LISTS: usize = 6;
 
 /// The names a scenario or a port wants in scope.
 pub mod prelude {
