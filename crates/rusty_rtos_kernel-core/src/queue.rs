@@ -33,6 +33,8 @@
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{QueueHandle, TaskHandle};
+use rusty_rtos_core::hooks::TickHook;
+use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::trace::{Event, Trace};
 
@@ -57,6 +59,10 @@ pub enum Position {
     Back,
     /// `queueSEND_TO_FRONT`.
     Front,
+    /// `queueOVERWRITE`: write to the front of a length-one queue whether
+    /// or not it already holds something, and leave the message count
+    /// where it was rather than raising it.
+    Overwrite,
 }
 
 /// What a queue is underneath (`ucQueueType`).
@@ -72,12 +78,15 @@ pub enum Kind {
     Mutex,
     /// A recursive mutex: as above, and the holder may take it again.
     RecursiveMutex,
+    /// A queue set: a queue whose items are the handles of the queues in
+    /// it. `xQueueSelectFromSet` is a receive from this one.
+    Set,
 }
 
 impl Kind {
     /// `uxItemSize == 0`: semaphores and mutexes carry a count, not data.
     pub(crate) const fn carries_data(self) -> bool {
-        matches!(self, Self::Queue)
+        matches!(self, Self::Queue | Self::Set)
     }
 
     /// The two mutex kinds, which inherit priority.
@@ -106,7 +115,21 @@ pub(crate) struct Queue {
     pub(crate) holder: TaskHandle,
     /// `u.xSemaphore.uxRecursiveCallCount`.
     pub(crate) recursions: u32,
+    /// `cTxLock`: [`UNLOCKED`] when no task holds the queue locked;
+    /// otherwise how many sends an interrupt made while it was locked, and
+    /// therefore how many receivers `prvUnlockQueue` still owes a wake-up.
+    pub(crate) tx_lock: i8,
+    /// `cRxLock`, the same for receives and the tasks waiting to send.
+    pub(crate) rx_lock: i8,
+    /// `pxQueueSetContainer`: the set this queue belongs to, if any. An
+    /// item arriving here is announced there.
+    pub(crate) set_container: QueueHandle,
 }
+
+/// `queueUNLOCKED`.
+pub(crate) const UNLOCKED: i8 = -1;
+/// `queueLOCKED_UNMODIFIED`.
+pub(crate) const LOCKED_UNMODIFIED: i8 = 0;
 
 impl Queue {
     pub(crate) const fn new(base: usize, length: usize, kind: Kind) -> Self {
@@ -120,6 +143,9 @@ impl Queue {
             kind,
             holder: TaskHandle::NULL,
             recursions: 0,
+            tx_lock: UNLOCKED,
+            rx_lock: UNLOCKED,
+            set_container: QueueHandle::NULL,
         }
     }
 }
@@ -128,12 +154,15 @@ impl<
     C: Config,
     P: Port,
     T: Trace,
+    H,
     const TASKS: usize,
     const ITEMS: usize,
     const LISTS: usize,
     const QUEUES: usize,
     const SLOTS: usize,
-> Kernel<C, P, T, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+where
+    H: TickHook<Self>,
 {
     // ------------------------------------------------------------ create --
 
@@ -285,6 +314,362 @@ impl<
         self.queue_send_generic(queue, value, ticks, Position::Back)
     }
 
+    /// `xQueueReset`, which is `xQueueGenericReset( q, pdFALSE )`: empty
+    /// the queue and unlock it, waking one waiting sender if there is one.
+    ///
+    /// The event lists survive — only a brand-new queue re-initialises
+    /// those — so a task blocked on this queue stays blocked, and the one
+    /// woken here is woken because the reset made room.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_reset(&mut self, queue: QueueHandle) -> Result<()> {
+        self.enter_critical();
+        let result = (|| {
+            let length = self.queues.resolve(queue)?.length;
+            {
+                let q = self.queues.resolve_mut(queue)?;
+                q.waiting = 0;
+                q.write_to = 0;
+                q.read_from = length.saturating_sub(1);
+                q.rx_lock = UNLOCKED;
+                q.tx_lock = UNLOCKED;
+            }
+            let senders = Self::queue_send_list(queue);
+            if self.lists.is_empty(senders) == Ok(false) && self.remove_from_event_list(senders)? {
+                // queueYIELD_IF_USING_PREEMPTION(), inside the section.
+                self.port_yield();
+            }
+            Ok(())
+        })();
+        self.exit_critical();
+        result
+    }
+
+    /// `uxQueueSpacesAvailable`: how many more items would fit.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_spaces_available(&mut self, queue: QueueHandle) -> Result<usize> {
+        self.enter_critical();
+        let spaces = self
+            .queues
+            .resolve(queue)
+            .map(|q| q.length.saturating_sub(q.waiting));
+        self.exit_critical();
+        spaces
+    }
+
+    // --------------------------------------------------- queue sets --
+    //
+    // A queue set is a queue whose items are the handles of the queues in
+    // it. Nothing is *moved* into the set: an item arriving on a member
+    // queue puts that queue's handle on the set, and the task that wakes on
+    // the set reads the handle and then reads the member queue itself. So a
+    // set holds an announcement, not the data — which is why adding a queue
+    // that already has items in it is refused, and why the two counts would
+    // otherwise drift apart forever.
+
+    /// `xQueueCreateSet`: a set that can hold `length` announcements.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_create`].
+    pub fn queue_create_set(&mut self, length: usize) -> Result<QueueHandle> {
+        self.new_queue(length, Kind::Set)
+    }
+
+    /// `xQueueAddToSet`.
+    ///
+    /// `false` is the C's `pdFAIL`: the target is not a set, the queue is
+    /// already in one, or it has items waiting that the set never saw.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_add_to_set(&mut self, queue: QueueHandle, set: QueueHandle) -> Result<bool> {
+        self.enter_critical();
+        let result = (|| {
+            if self.queues.resolve(set)?.kind != Kind::Set {
+                return Ok(false);
+            }
+            let member = self.queues.resolve(queue)?;
+            if member.set_container != QueueHandle::NULL || member.waiting != 0 {
+                return Ok(false);
+            }
+            self.queues.resolve_mut(queue)?.set_container = set;
+            Ok(true)
+        })();
+        self.exit_critical();
+        result
+    }
+
+    /// `xQueueRemoveFromSet`.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_remove_from_set(&mut self, queue: QueueHandle, set: QueueHandle) -> Result<bool> {
+        self.enter_critical();
+        let result = (|| {
+            let member = self.queues.resolve(queue)?;
+            if member.set_container != set || member.waiting != 0 {
+                return Ok(false);
+            }
+            self.queues.resolve_mut(queue)?.set_container = QueueHandle::NULL;
+            Ok(true)
+        })();
+        self.exit_critical();
+        result
+    }
+
+    /// `xQueueSelectFromSet`: which member queue has something on it.
+    ///
+    /// The C is one line — `xQueueReceive( xQueueSet, &xReturn, xTicksToWait )`
+    /// — so this blocks, traces and costs exactly what a receive does, and
+    /// `None` is the C's `NULL`.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_receive`].
+    pub fn queue_select_from_set(
+        &mut self,
+        set: QueueHandle,
+        ticks: u64,
+    ) -> Result<Wait<Option<QueueHandle>>> {
+        match self.queue_receive(set, ticks) {
+            Ok(Blocked) => Ok(Blocked),
+            Ok(Ready(raw)) => {
+                let handle = QueueHandle::from_raw(u32::try_from(raw).unwrap_or(0));
+                Ok(Ready((handle != QueueHandle::NULL).then_some(handle)))
+            }
+            Err(Error::Empty) => Ok(Ready(None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `prvNotifyQueueSetContainer`: put `queue`'s handle on the set it
+    /// belongs to. `true` when that woke a task that outranks the current
+    /// one.
+    fn notify_queue_set_container(&mut self, queue: QueueHandle) -> Result<bool> {
+        let set = self.queues.resolve(queue)?.set_container;
+        let container = *self.queues.resolve(set)?;
+        if container.waiting >= container.length {
+            // The C asserts this cannot happen and does nothing if it does.
+            return Ok(false);
+        }
+        let tx_lock = container.tx_lock;
+        let tick = self.tick;
+        self.trace.note_exits(self.port.exits());
+        // `traceQUEUE_SET_SEND` is `traceQUEUE_SEND` unless a port says
+        // otherwise, and this port does not.
+        self.trace
+            .event(tick, Event::QueueSend { queue: set, name: "" });
+        let mut woke = self.copy_data_to_queue(set, u64::from(queue.to_raw()), Position::Back)?;
+        if tx_lock == UNLOCKED {
+            let receivers = Self::queue_receive_list(set);
+            if self.lists.is_empty(receivers) == Ok(false) && self.remove_from_event_list(receivers)?
+            {
+                woke = true;
+            }
+        } else {
+            self.increment_tx_lock(set, tx_lock);
+        }
+        Ok(woke)
+    }
+
+    /// `xQueueOverwrite`: write to a length-one queue whether or not it
+    /// already holds something.
+    ///
+    /// The C is `xQueueGenericSend( q, item, 0, queueOVERWRITE )` — a send
+    /// with no block time, because a queue that is always writable can
+    /// never make the caller wait.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_send`].
+    pub fn queue_overwrite(&mut self, queue: QueueHandle, value: u64) -> Result<Wait<()>> {
+        self.queue_send_generic(queue, value, 0, Position::Overwrite)
+    }
+
+    // ------------------------------------------------------- from an ISR --
+    //
+    // The `FromISR` half of the API. Three things make it a different
+    // animal from the task half, and all three are visible in a trace:
+    //
+    //   * It never blocks and never yields. It reports that a higher
+    //     priority task woke, by returning a [`Woken`], and the interrupt
+    //     decides what to do about it on the way out.
+    //   * Its critical section is `portSET_INTERRUPT_MASK_FROM_ISR`, not
+    //     `portENTER_CRITICAL`. On the Posix port both are empty, so a call
+    //     here costs no sim time at all — which is exactly what the C does
+    //     and therefore what a matching trace requires.
+    //   * If a task has the queue locked it may not touch the event lists.
+    //     It counts what it did in `cTxLock` / `cRxLock` instead, and
+    //     `prvUnlockQueue` pays the wake-ups back when the task is done.
+
+    /// `xQueueGenericSendFromISR`.
+    ///
+    /// # Errors
+    /// [`Error::Full`] when the queue is full and this is not an overwrite;
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_send_generic_from_isr(
+        &mut self,
+        queue: QueueHandle,
+        value: u64,
+        position: Position,
+    ) -> Result<Woken> {
+        let mask = self.port.enter_critical_from_isr();
+        let result = self.send_from_isr_locked(queue, value, position);
+        self.port.exit_critical_from_isr(mask);
+        result
+    }
+
+    fn send_from_isr_locked(
+        &mut self,
+        queue: QueueHandle,
+        value: u64,
+        position: Position,
+    ) -> Result<Woken> {
+        let snapshot = *self.queues.resolve(queue)?;
+        if snapshot.waiting >= snapshot.length && position != Position::Overwrite {
+            // `traceQUEUE_SEND_FROM_ISR_FAILED` is not one of the harness's
+            // hooks, so a full queue says nothing on either side.
+            return Err(Error::Full);
+        }
+        let tx_lock = snapshot.tx_lock;
+        let tick = self.tick;
+        self.trace.note_exits(self.port.exits());
+        self.trace
+            .event(tick, Event::QueueSendFromIsr { queue, name: "" });
+        let previously_waiting = snapshot.waiting;
+        let _ = self.copy_data_to_queue(queue, value, position)?;
+        let mut woken = Woken::NO;
+        if tx_lock == UNLOCKED {
+            if snapshot.set_container != QueueHandle::NULL {
+                let overwrote = position == Position::Overwrite && previously_waiting > 0;
+                if !overwrote && self.notify_queue_set_container(queue)? {
+                    woken = Woken::YES;
+                }
+                return Ok(woken);
+            }
+            let receivers = Self::queue_receive_list(queue);
+            if self.lists.is_empty(receivers) == Ok(false) && self.remove_from_event_list(receivers)?
+            {
+                woken = Woken::YES;
+            }
+        } else {
+            self.increment_tx_lock(queue, tx_lock);
+        }
+        Ok(woken)
+    }
+
+    /// `xQueueSendToBackFromISR`.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_send_generic_from_isr`].
+    pub fn queue_send_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken> {
+        self.queue_send_generic_from_isr(queue, value, Position::Back)
+    }
+
+    /// `xQueueSendToFrontFromISR`.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_send_generic_from_isr`].
+    pub fn queue_send_to_front_from_isr(
+        &mut self,
+        queue: QueueHandle,
+        value: u64,
+    ) -> Result<Woken> {
+        self.queue_send_generic_from_isr(queue, value, Position::Front)
+    }
+
+    /// `xQueueOverwriteFromISR`. Only for a queue of length one.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_send_generic_from_isr`].
+    pub fn queue_overwrite_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken> {
+        self.queue_send_generic_from_isr(queue, value, Position::Overwrite)
+    }
+
+    /// `xSemaphoreGiveFromISR`.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_send_generic_from_isr`].
+    pub fn semaphore_give_from_isr(&mut self, semaphore: QueueHandle) -> Result<Woken> {
+        self.queue_send_generic_from_isr(semaphore, 0, Position::Back)
+    }
+
+    /// `xQueueReceiveFromISR`: the value, and whether a waiting sender that
+    /// this made room for outranks the interrupted task.
+    ///
+    /// # Errors
+    /// [`Error::Empty`] when the queue is empty; [`Error::Gone`] for a
+    /// stale handle.
+    pub fn queue_receive_from_isr(&mut self, queue: QueueHandle) -> Result<(u64, Woken)> {
+        let mask = self.port.enter_critical_from_isr();
+        let result = self.receive_from_isr_locked(queue);
+        self.port.exit_critical_from_isr(mask);
+        result
+    }
+
+    fn receive_from_isr_locked(&mut self, queue: QueueHandle) -> Result<(u64, Woken)> {
+        let snapshot = *self.queues.resolve(queue)?;
+        if snapshot.waiting == 0 {
+            return Err(Error::Empty);
+        }
+        let rx_lock = snapshot.rx_lock;
+        let tick = self.tick;
+        self.trace.note_exits(self.port.exits());
+        self.trace
+            .event(tick, Event::QueueReceiveFromIsr { queue, name: "" });
+        let value = self.copy_data_from_queue(queue, false)?;
+        let mut woken = Woken::NO;
+        if rx_lock == UNLOCKED {
+            let senders = Self::queue_send_list(queue);
+            if self.lists.is_empty(senders) == Ok(false) && self.remove_from_event_list(senders)? {
+                woken = Woken::YES;
+            }
+        } else {
+            self.increment_rx_lock(queue, rx_lock);
+        }
+        Ok((value, woken))
+    }
+
+    /// `xQueuePeekFromISR`: the head without removing it.
+    ///
+    /// It wakes nobody and traces nothing — the C has no hook for it —
+    /// which is why it returns a bare value rather than a [`Woken`].
+    ///
+    /// # Errors
+    /// [`Error::Empty`] when the queue is empty; [`Error::Gone`] for a
+    /// stale handle.
+    pub fn queue_peek_from_isr(&mut self, queue: QueueHandle) -> Result<u64> {
+        let mask = self.port.enter_critical_from_isr();
+        let result = match self.queues.resolve(queue) {
+            Ok(q) if q.waiting > 0 => self.copy_data_from_queue(queue, true),
+            Ok(_) => Err(Error::Empty),
+            Err(e) => Err(e),
+        };
+        self.port.exit_critical_from_isr(mask);
+        result
+    }
+
+    /// `prvIncrementQueueTxLock`, capped at the task count as the C caps it.
+    fn increment_tx_lock(&mut self, queue: QueueHandle, tx_lock: i8) {
+        let tasks = self.task_count();
+        if let Ok(q) = self.queues.resolve_mut(queue) {
+            if i64::from(tx_lock) < tasks as i64 {
+                q.tx_lock = tx_lock.saturating_add(1);
+            }
+        }
+    }
+
+    /// `prvIncrementQueueRxLock`.
+    fn increment_rx_lock(&mut self, queue: QueueHandle, rx_lock: i8) {
+        let tasks = self.task_count();
+        if let Ok(q) = self.queues.resolve_mut(queue) {
+            if i64::from(rx_lock) < tasks as i64 {
+                q.rx_lock = rx_lock.saturating_add(1);
+            }
+        }
+    }
+
     /// `xQueueSendToFront`.
     ///
     /// # Errors
@@ -327,11 +712,25 @@ impl<
                 return Err(e);
             }
         };
-        if snapshot.waiting < snapshot.length {
+        // `( uxMessagesWaiting < uxLength ) || ( xCopyPosition == queueOVERWRITE )`
+        if snapshot.waiting < snapshot.length || position == Position::Overwrite {
             self.trace.note_exits(self.port.exits());
             let tick = self.tick;
             self.trace.event(tick, Event::QueueSend { queue, name: "" });
+            let previously_waiting = snapshot.waiting;
             let yield_required = self.copy_data_to_queue(queue, value, position)?;
+            if snapshot.set_container != QueueHandle::NULL {
+                // A queue in a set announces the arrival there, not here.
+                // An overwrite of an item that was already present is not an
+                // arrival: the count did not change, so the set is not told.
+                let overwrote = position == Position::Overwrite && previously_waiting > 0;
+                if !overwrote && self.notify_queue_set_container(queue)? {
+                    self.port_yield();
+                }
+                self.exit_critical();
+                self.end_wait(caller);
+                return Ok(Ready(()));
+            }
             let receivers = Self::queue_receive_list(queue);
             let woke_higher = if self.lists.is_empty(receivers) == Ok(false) {
                 self.remove_from_event_list(receivers)?
@@ -354,7 +753,7 @@ impl<
         }
         self.exit_critical();
         self.suspend_all();
-        self.lock_queue();
+        self.lock_queue(queue);
         if self.check_for_timeout(caller) {
             self.unlock_queue(queue)?;
             let _ = self.resume_all();
@@ -398,8 +797,9 @@ impl<
                     wrap_next(snapshot.write_to, snapshot.length),
                 ),
                 // Write at the item last read, then step back, so the next
-                // read's pre-increment lands on it.
-                Position::Front => (
+                // read's pre-increment lands on it. An overwrite takes the
+                // same path; only the message count differs.
+                Position::Front | Position::Overwrite => (
                     snapshot.read_from,
                     wrap_prev(snapshot.read_from, snapshot.length),
                     snapshot.write_to,
@@ -416,8 +816,14 @@ impl<
             yield_required = self.priority_disinherit(snapshot.holder)?;
             self.queues.resolve_mut(queue)?.holder = TaskHandle::NULL;
         }
+        // `prvCopyDataToQueue` counts the item in — except on an overwrite
+        // of a queue that already held one, where it decrements first so
+        // the increment cancels out and the count stays where it was.
+        let overwrote = position == Position::Overwrite && snapshot.waiting > 0;
         let q = self.queues.resolve_mut(queue)?;
-        q.waiting = q.waiting.saturating_add(1);
+        if !overwrote {
+            q.waiting = q.waiting.saturating_add(1);
+        }
         Ok(yield_required)
     }
 
@@ -514,7 +920,7 @@ impl<
         }
         self.exit_critical();
         self.suspend_all();
-        self.lock_queue();
+        self.lock_queue(queue);
         if self.check_for_timeout(caller) {
             self.unlock_queue(queue)?;
             let _ = self.resume_all();
@@ -644,18 +1050,78 @@ impl<
     /// `prvLockQueue`: one critical section. The lock counters themselves
     /// only matter to an ISR, and the sim has none — but the section is
     /// where sim time passes, so it is here.
-    fn lock_queue(&mut self) {
+    /// `prvLockQueue`: stop interrupts taking tasks off this queue's event
+    /// lists while a task walks them. An interrupt that finds the queue
+    /// locked counts what it did instead, and [`Kernel::unlock_queue`] pays
+    /// it back.
+    fn lock_queue(&mut self, queue: QueueHandle) {
         self.enter_critical();
+        if let Ok(q) = self.queues.resolve_mut(queue) {
+            if q.rx_lock == UNLOCKED {
+                q.rx_lock = LOCKED_UNMODIFIED;
+            }
+            if q.tx_lock == UNLOCKED {
+                q.tx_lock = LOCKED_UNMODIFIED;
+            }
+        }
         self.exit_critical();
     }
 
     /// `prvUnlockQueue`: two critical sections, one per lock counter. The
     /// loops inside them wake tasks that an ISR queued while the lock was
     /// held, and on the sim there are none.
-    fn unlock_queue(&mut self, _queue: QueueHandle) -> Result<()> {
+    /// `prvUnlockQueue`: two critical sections, one per lock count, each
+    /// waking one task per send or receive an interrupt made while the
+    /// queue was locked. The yields are *missed* yields — pended, not
+    /// taken — because a task is walking the list.
+    fn unlock_queue(&mut self, queue: QueueHandle) -> Result<()> {
         self.enter_critical();
+        {
+            let mut tx_lock = self.queues.resolve(queue).map(|q| q.tx_lock).unwrap_or(UNLOCKED);
+            let container = self
+                .queues
+                .resolve(queue)
+                .map(|q| q.set_container)
+                .unwrap_or(QueueHandle::NULL);
+            while tx_lock > LOCKED_UNMODIFIED {
+                if container != QueueHandle::NULL {
+                    if self.notify_queue_set_container(queue)? {
+                        self.missed_yield();
+                    }
+                    tx_lock = tx_lock.saturating_sub(1);
+                    continue;
+                }
+                let receivers = Self::queue_receive_list(queue);
+                if self.lists.is_empty(receivers) == Ok(true) {
+                    break;
+                }
+                if self.remove_from_event_list(receivers)? {
+                    self.missed_yield();
+                }
+                tx_lock = tx_lock.saturating_sub(1);
+            }
+            if let Ok(q) = self.queues.resolve_mut(queue) {
+                q.tx_lock = UNLOCKED;
+            }
+        }
         self.exit_critical();
         self.enter_critical();
+        {
+            let mut rx_lock = self.queues.resolve(queue).map(|q| q.rx_lock).unwrap_or(UNLOCKED);
+            while rx_lock > LOCKED_UNMODIFIED {
+                let senders = Self::queue_send_list(queue);
+                if self.lists.is_empty(senders) == Ok(true) {
+                    break;
+                }
+                if self.remove_from_event_list(senders)? {
+                    self.missed_yield();
+                }
+                rx_lock = rx_lock.saturating_sub(1);
+            }
+            if let Ok(q) = self.queues.resolve_mut(queue) {
+                q.rx_lock = UNLOCKED;
+            }
+        }
         self.exit_critical();
         Ok(())
     }
@@ -678,7 +1144,7 @@ impl<
         ticks: u64,
         wait_indefinitely: bool,
     ) -> Result<()> {
-        self.lock_queue();
+        self.lock_queue(queue);
         let empty = self
             .queues
             .resolve(queue)

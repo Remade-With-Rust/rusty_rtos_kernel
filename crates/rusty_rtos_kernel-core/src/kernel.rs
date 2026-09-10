@@ -22,6 +22,7 @@ use core::marker::PhantomData;
 
 use rusty_rtos_core::arena::Arena;
 use rusty_rtos_core::config::Config;
+use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{Queue as QueueKind, QueueHandle, Task as TaskKind, TaskHandle};
 use rusty_rtos_core::list::{ItemId, ListId, Lists};
@@ -121,6 +122,7 @@ pub struct Kernel<
     C: Config,
     P: Port,
     T: Trace,
+    H,
     const TASKS: usize,
     const ITEMS: usize,
     const LISTS: usize,
@@ -188,6 +190,8 @@ pub struct Kernel<
     owed_exits: [u32; TASKS],
     /// The task whose abandoned frame is running right now, if any.
     unwinding: Option<TaskHandle>,
+    /// `vApplicationTickHook`, held by value so it can borrow the kernel.
+    pub(crate) tick_hook: H,
     /// `ucDelayAborted`: the task was pulled out of the Blocked state by
     /// [`Kernel::abort_delay`] rather than by its own block time running
     /// out, so it must not re-evaluate that block time and block again.
@@ -199,12 +203,15 @@ impl<
     C: Config,
     P: Port,
     T: Trace,
+    H,
     const TASKS: usize,
     const ITEMS: usize,
     const LISTS: usize,
     const QUEUES: usize,
     const SLOTS: usize,
-> Kernel<C, P, T, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+where
+    H: TickHook<Self>,
 {
     /// `portMAX_DELAY` at this configuration's tick width.
     pub const MAX_DELAY: u64 = <C::Tick as TickWidth>::MAX;
@@ -219,7 +226,18 @@ impl<
     /// `MAX_TASK_NAME_LEN`, or if the const geometry does not match the
     /// configuration: `ITEMS` must be [`items_for`]`(TASKS)` and `LISTS`
     /// must be [`lists_for`]`(MAX_PRIORITIES, QUEUES)`.
-    pub fn new(port: P, trace: T) -> Result<Self> {
+    pub fn new(port: P, trace: T) -> Result<Self>
+    where
+        H: Default,
+    {
+        Self::with_tick_hook(port, trace, H::default())
+    }
+
+    /// [`Kernel::new`] with `vApplicationTickHook` installed.
+    ///
+    /// # Errors
+    /// As [`Kernel::new`].
+    pub fn with_tick_hook(port: P, trace: T, tick_hook: H) -> Result<Self> {
         C::validate()?;
         if ITEMS != items_for(TASKS)
             || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES)
@@ -251,6 +269,7 @@ impl<
             owes_yield: [false; TASKS],
             owed_exits: [0; TASKS],
             unwinding: None,
+            tick_hook,
             delay_aborted: [false; TASKS],
             owed_trace: [OwedTrace::None; TASKS],
             _config: PhantomData,
@@ -913,13 +932,69 @@ impl<
             {
                 switch_required = true;
             }
+            // The C guards this site with `xPendedTicks == 0`, so a hook
+            // does not fire again for each tick being unwound by
+            // `xTaskResumeAll`. It sits after the time-slicing test and
+            // before the yield-pending one, and a `FromISR` call inside it
+            // can set `yield_pending`, so the order is load-bearing.
+            if self.pended_ticks == 0 {
+                self.run_tick_hook();
+            }
             if C::USE_PREEMPTION && self.yield_pending {
                 switch_required = true;
             }
         } else {
             self.pended_ticks = self.pended_ticks.wrapping_add(1);
+            // "The tick hook gets called at regular intervals, even if the
+            // scheduler is locked" — and here with no guard, because this
+            // tick is being pended rather than unwound.
+            self.run_tick_hook();
         }
         switch_required
+    }
+
+    /// `xTaskGetTickCountFromISR`.
+    ///
+    /// No critical section, exactly as `xTaskGetTickCount` takes none: the
+    /// Posix port sets `portTICK_TYPE_IS_ATOMIC`, so reading the count is
+    /// a single load on both sides and costs no sim time.
+    #[must_use]
+    pub const fn tick_count_from_isr(&self) -> u64 {
+        self.tick
+    }
+
+    /// `vTaskMissedYield`: a yield that could not be taken where it was
+    /// asked for — because a task is walking an event list, or because the
+    /// scheduler is suspended — and must happen on the way out instead.
+    pub(crate) fn missed_yield(&mut self) {
+        self.yield_pending = true;
+    }
+
+    /// `vApplicationTickHook()`, when `configUSE_TICK_HOOK` is 1.
+    ///
+    /// The hook is copied out, run, and the result stored: that is what
+    /// lets it borrow the kernel mutably while the kernel owns it. A hook
+    /// that reads the kernel's own copy of itself therefore sees the value
+    /// from before this call.
+    fn run_tick_hook(&mut self) {
+        if !C::USE_TICK_HOOK {
+            return;
+        }
+        let hook = self.tick_hook;
+        self.tick_hook = hook.tick(self);
+    }
+
+    /// The tick hook, as it now stands.
+    ///
+    /// A scenario's `xAre...StillRunning()` reads the status its interrupt
+    /// half latched, so the owner of the kernel needs to see it.
+    pub const fn tick_hook(&self) -> &H {
+        &self.tick_hook
+    }
+
+    /// The tick hook, to install or reset one after construction.
+    pub const fn tick_hook_mut(&mut self) -> &mut H {
+        &mut self.tick_hook
     }
 
     /// The wake loop inside `xTaskIncrementTick`.
