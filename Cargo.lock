@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "rusty_rtos_core"
 version = "0.1.0"
-source = "git+https://github.com/Remade-With-Rust/rusty_rtos_core#a9f47d19693bf27f32134d1c4bf01272d4facf20"
+source = "git+https://github.com/Remade-With-Rust/rusty_rtos_core#564cec81e8a1e84f572da832a46957a4a6f4377b"
 
 [[package]]
 name = "rusty_rtos_kernel"

@@ -179,6 +179,34 @@ where
         self.new_queue(length, Kind::Queue)
     }
 
+    /// `vQueueDelete`, and `vSemaphoreDelete`, which the C defines as the
+    /// same function.
+    ///
+    /// # It traces nothing and still costs time
+    ///
+    /// `vQueueDelete` takes no critical section of its own — but it ends in
+    /// `vPortFree( pxQueue )`, and every `heap_N.c` wraps free in
+    /// `vTaskSuspendAll` / `xTaskResumeAll` exactly as it wraps malloc. So
+    /// a delete costs **one outermost critical-section exit**, which under
+    /// the sim contract is one unit of time, while emitting no trace line
+    /// at all (this harness defines no `traceQUEUE_DELETE`).
+    ///
+    /// `AbortDelay`'s remake left the deletes out on the reasoning that an
+    /// event-less call cannot move the trace. Every event still agreed and
+    /// the exit column was one short from the first delete onwards. The
+    /// sibling `event_group_delete` already carried this note; the queue
+    /// had no delete at all.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_delete(&mut self, queue: QueueHandle) -> Result<()> {
+        self.queues.resolve(queue)?;
+        let _ = self.queues.remove(queue);
+        // `vPortFree( pxQueue )`.
+        self.account_for_allocation();
+        Ok(())
+    }
+
     /// `xSemaphoreCreateBinary`: a one-deep semaphore, created empty.
     ///
     /// # Errors

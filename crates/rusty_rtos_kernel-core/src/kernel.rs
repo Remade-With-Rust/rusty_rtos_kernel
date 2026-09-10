@@ -1276,6 +1276,154 @@ where
         Ok(Wait::Ready((received, value)))
     }
 
+    /// `ulTaskGenericNotifyTake`: the notification used as a lightweight
+    /// counting semaphore — block until the value is non-zero, then either
+    /// zero it or decrement it by one.
+    ///
+    /// This is the half of the notification API the kernel was missing.
+    /// `notify_wait` waits on *bits*; this waits on a *count*, and the two
+    /// are separate calls in the C with their own trace events. Its
+    /// partner, `xTaskNotifyGive`, needs no method of its own: the C
+    /// defines it as `xTaskGenericNotify( .., 0, eIncrement, NULL )` and
+    /// it traces as an ordinary notify, so
+    /// `notify(task, index, 0, NotifyAction::Increment)` already is it.
+    ///
+    /// # The shape, and why it is not `notify_wait`'s
+    ///
+    /// The C blocks on `ulNotifiedValue == 0`, **not** on the notify
+    /// state, and it does no clear-on-entry. Both halves run on the way
+    /// out: `traceTASK_NOTIFY_TAKE` fires whether or not the call ever
+    /// blocked, which is what makes a take that finds a count already
+    /// waiting still emit one line.
+    ///
+    /// This kernel has no stack, so the block is a return: the first call
+    /// answers [`Wait::Blocked`] and the caller is entered again when the
+    /// scheduler runs it, taking the second half. `notify_wait_pending`
+    /// answers for this call too — a task is only ever inside one of the
+    /// two.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for an index past the configured array.
+    pub fn notify_take(
+        &mut self,
+        index: usize,
+        clear_on_exit: bool,
+        ticks: u64,
+    ) -> Result<Wait<u32>> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let caller = self.current;
+        if self.notified_value_of(caller, index) == 0 && ticks > 0 && !self.notify_blocked(caller) {
+            self.suspend_all();
+            self.enter_critical();
+            let mut should_block = false;
+            // Re-checked inside the section, as the C does: a notify from
+            // an ISR between the two reads would otherwise be lost.
+            if self.notified_value_of(caller, index) == 0 {
+                if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+                    if let Some(slot) = tcb.notify_state.get_mut(index) {
+                        *slot = NotifyState::Waiting;
+                    }
+                }
+                should_block = true;
+            }
+            self.exit_critical();
+            if should_block {
+                // The C traces BEFORE it adds itself to the delayed list.
+                self.trace.note_exits(self.port.exits());
+                self.trace_task(caller, |task, name| Event::TaskNotifyTakeBlock {
+                    task,
+                    name,
+                    index,
+                });
+                self.add_current_task_to_delayed_list(ticks, true)?;
+            }
+            let already_yielded = self.resume_all();
+            if should_block && !already_yielded {
+                if self.current == caller {
+                    self.port_yield();
+                } else {
+                    self.owe_yield(caller);
+                }
+            }
+            self.set_notify_blocked(caller, true);
+            return Ok(Wait::Blocked);
+        }
+        self.set_notify_blocked(caller, false);
+        self.enter_critical();
+        self.trace.note_exits(self.port.exits());
+        self.trace_task(caller, |task, name| Event::TaskNotifyTake {
+            task,
+            name,
+            index,
+        });
+        let value = self.notified_value_of(caller, index);
+        if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+            if value != 0 {
+                if let Some(slot) = tcb.notified.get_mut(index) {
+                    // Guarded by `value != 0` above, so the saturation
+                    // never fires; it is here because the workspace forbids
+                    // bare arithmetic, and a decrement is exactly the place
+                    // an unguarded one would wrap.
+                    *slot = if clear_on_exit {
+                        0
+                    } else {
+                        value.saturating_sub(1)
+                    };
+                }
+            }
+            if let Some(slot) = tcb.notify_state.get_mut(index) {
+                *slot = NotifyState::NotWaiting;
+            }
+        }
+        self.exit_critical();
+        Ok(Wait::Ready(value))
+    }
+
+    /// `xTaskGetHandle`: the task registered under `name`.
+    ///
+    /// # It is not free, and that is the point
+    ///
+    /// The C walks every ready list, then the delayed lists, then the
+    /// suspended and waiting-termination lists, all inside
+    /// `vTaskSuspendAll` / `xTaskResumeAll` — and `xTaskResumeAll` takes a
+    /// critical section. So a lookup that emits **no trace event** still
+    /// costs **one critical-section exit**, which under the sim contract is
+    /// one unit of time.
+    ///
+    /// That is why this exists rather than a scenario keeping the handle it
+    /// was given at creation. `AbortDelay`'s remake did exactly that, on the
+    /// reasoning that a lookup emitting no event could not change the trace,
+    /// and the corpus caught it: every event still agreed and the
+    /// exit column was one short at the first block.
+    ///
+    /// The arena is searched instead of five lists, which cannot change the
+    /// answer — a live task is in exactly one of them — and does not change
+    /// the accounting either, because the cost is the suspend/resume pair.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] when no live task carries that name.
+    pub fn task_get_handle(&mut self, name: &str) -> Result<TaskHandle> {
+        self.suspend_all();
+        let mut found = None;
+        for index in 0..u16::try_from(self.tcbs.capacity()).unwrap_or(u16::MAX) {
+            let Some(handle) = self.tcbs.handle_at(index) else {
+                continue;
+            };
+            if self
+                .tcbs
+                .resolve(handle)
+                .is_ok_and(|tcb| tcb.name.as_str() == name)
+            {
+                found = Some(handle);
+                break;
+            }
+        }
+        let _ = self.resume_all();
+        found.ok_or(Error::Gone)
+    }
+
     /// `xTaskGenericNotify`.
     ///
     /// # Errors
