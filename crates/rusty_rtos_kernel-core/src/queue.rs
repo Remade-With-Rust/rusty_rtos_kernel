@@ -714,7 +714,6 @@ where
         position: Position,
     ) -> Result<Wait<()>> {
         let caller = self.current;
-        self.begin_wait(caller, queue, ticks)?;
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
             Ok(q) => *q,
@@ -723,6 +722,15 @@ where
                 return Err(e);
             }
         };
+        // The wait frame is set only once the handle is known good, so a
+        // call with a handle that names nothing leaves the caller exactly
+        // as it found it. That is what `configASSERT( pxQueue )` means in
+        // the C, and it costs nothing here: the resolve was happening
+        // anyway, this only stops the frame being written before it.
+        if let Err(e) = self.begin_wait(caller, queue, ticks) {
+            self.exit_critical();
+            return Err(e);
+        }
         // `( uxMessagesWaiting < uxLength ) || ( xCopyPosition == queueOVERWRITE )`
         if snapshot.waiting < snapshot.length || position == Position::Overwrite {
             self.trace.note_exits(self.port.exits());
@@ -873,7 +881,6 @@ where
     /// `xQueueSemaphoreTake` — one pass of the C `for(;;)`.
     fn queue_take(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
         let caller = self.current;
-        self.begin_wait(caller, queue, ticks)?;
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
             Ok(q) => *q,
@@ -882,6 +889,15 @@ where
                 return Err(e);
             }
         };
+        // The wait frame is set only once the handle is known good, so a
+        // call with a handle that names nothing leaves the caller exactly
+        // as it found it. That is what `configASSERT( pxQueue )` means in
+        // the C, and it costs nothing here: the resolve was happening
+        // anyway, this only stops the frame being written before it.
+        if let Err(e) = self.begin_wait(caller, queue, ticks) {
+            self.exit_critical();
+            return Err(e);
+        }
         if snapshot.waiting > 0 {
             let value = self.copy_data_from_queue(queue, peek)?;
             self.trace.note_exits(self.port.exits());
