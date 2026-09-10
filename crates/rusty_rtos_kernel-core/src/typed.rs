@@ -766,3 +766,203 @@ impl<T, const N: usize> Queue<T, N> {
         Ok(self.len(kernel)? == 0)
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "a counting test double, where a wrong count should panic loudly"
+)]
+mod tests {
+    use super::{Isr, Mutex, Queue, Raw, Sent};
+    use crate::queue::Wait;
+    use rusty_rtos_core::error::Result;
+    use rusty_rtos_core::handle::QueueHandle;
+    use rusty_rtos_core::isr::Woken;
+
+    /// A `Raw` that counts what the face asked it to do.
+    ///
+    /// `PollQ-typed` proves the queue costs nothing by diffing a whole
+    /// scenario against the C kernel's own trace. That is the strongest
+    /// evidence there is, and it is only available for calls a corpus
+    /// scenario makes. This is the same claim for the ones it does not:
+    /// the face must make *exactly* the kernel calls the C would, and no
+    /// others — because every kernel call is a critical section, and a
+    /// critical section is sim time.
+    #[derive(Default)]
+    struct Counting {
+        held: usize,
+        length: usize,
+        last: u64,
+        in_isr: bool,
+        sends: usize,
+        receives: usize,
+        isr_sends: usize,
+        waitings: usize,
+        takes: usize,
+        gives: usize,
+    }
+
+    impl Raw for Counting {
+        fn raw_queue_create(&mut self, length: usize) -> Result<QueueHandle> {
+            self.length = length;
+            Ok(QueueHandle::from_raw(1))
+        }
+        fn raw_queue_send(&mut self, _q: QueueHandle, value: u64, _t: u64) -> Result<Wait<()>> {
+            self.sends += 1;
+            if self.held >= self.length {
+                return Ok(Wait::Blocked);
+            }
+            self.held += 1;
+            self.last = value;
+            Ok(Wait::Ready(()))
+        }
+        fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> {
+            self.receives += 1;
+            if self.held == 0 {
+                return Ok(Wait::Blocked);
+            }
+            self.held -= 1;
+            Ok(Wait::Ready(self.last))
+        }
+        fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> {
+            self.waitings += 1;
+            Ok(self.held)
+        }
+        fn raw_queue_has_room(&self, _q: QueueHandle) -> bool {
+            self.held < self.length
+        }
+        fn raw_in_isr(&self) -> bool {
+            self.in_isr
+        }
+        fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, value: u64) -> Result<Woken> {
+            self.isr_sends += 1;
+            if self.held < self.length {
+                self.held += 1;
+                self.last = value;
+            }
+            Ok(Woken::NO)
+        }
+        fn raw_mutex_create(&mut self) -> Result<QueueHandle> {
+            Ok(QueueHandle::from_raw(2))
+        }
+        fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> {
+            self.takes += 1;
+            Ok(Wait::Ready(()))
+        }
+        fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> {
+            self.gives += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_typed_send_is_one_send_and_a_receive_is_one_receive() {
+        let k = &mut Counting::default();
+        let mut q = Queue::<u16, 2>::create(k).unwrap();
+        assert!(q.send(k, 7, 0).is_ok());
+        assert_eq!(k.sends, 1, "a typed send must be exactly one queue send");
+        assert_eq!(k.waitings, 0, "and must not ask how many are waiting");
+
+        let out = match q.receive(k, 0).unwrap() {
+            Wait::Ready(v) => v,
+            Wait::Blocked => None,
+        };
+        assert_eq!(out, Some(7));
+        assert_eq!(k.receives, 1, "a typed receive must be exactly one");
+    }
+
+    #[test]
+    fn a_refused_send_is_still_exactly_one_send() {
+        // The C makes the call and gets `errQUEUE_FULL`; so must we, or the
+        // trace loses a `QUEUE_SEND_FAILED` line and the exits drift.
+        let k = &mut Counting::default();
+        let mut q = Queue::<u16, 1>::create(k).unwrap();
+        assert!(q.send(k, 1, 0).is_ok());
+        match q.send(k, 2, 0) {
+            Sent::Full(back) | Sent::Blocked(back) => assert_eq!(back, 2),
+            Sent::Ok => panic!("the queue was full"),
+        }
+        assert_eq!(k.sends, 2, "the refused send must still reach the kernel");
+    }
+
+    #[test]
+    fn a_typed_isr_send_is_one_from_isr_send() {
+        let k = &mut Counting {
+            length: 2,
+            in_isr: true,
+            ..Counting::default()
+        };
+        let mut q = Queue::<u16, 2>::create(k).unwrap();
+        let sent = Isr::with(k, |isr| q.send_from_isr(isr, 9_u16).is_ok());
+        assert_eq!(sent, Some(true));
+        assert_eq!(k.isr_sends, 1);
+        assert_eq!(k.sends, 0, "the from-ISR half must not take the task path");
+    }
+
+    #[test]
+    fn the_capability_is_refused_outside_interrupt_context() {
+        let k = &mut Counting {
+            length: 2,
+            in_isr: false,
+            ..Counting::default()
+        };
+        assert!(Isr::with(k, |_| unreachable!("f must not run")).is_none());
+        assert_eq!(k.isr_sends, 0);
+    }
+
+    #[test]
+    fn a_mutex_with_is_one_take_and_one_give() {
+        let k = &mut Counting::default();
+        let guarded = Mutex::new(k, 41_u32).unwrap();
+        let seen = guarded.with(k, 0, |n| {
+            *n += 1;
+            *n
+        });
+        assert_eq!(seen, Some(42));
+        assert_eq!(k.takes, 1, "exactly the take the C would have made");
+        assert_eq!(k.gives, 1, "and exactly the give");
+    }
+
+    #[test]
+    fn a_mutex_that_cannot_be_taken_does_not_run_the_closure() {
+        struct Busy;
+        impl Raw for Busy {
+            fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> {
+                Ok(QueueHandle::from_raw(1))
+            }
+            fn raw_queue_send(&mut self, _q: QueueHandle, _v: u64, _t: u64) -> Result<Wait<()>> {
+                Ok(Wait::Blocked)
+            }
+            fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> {
+                Ok(Wait::Blocked)
+            }
+            fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> {
+                Ok(0)
+            }
+            fn raw_queue_has_room(&self, _q: QueueHandle) -> bool {
+                false
+            }
+            fn raw_in_isr(&self) -> bool {
+                false
+            }
+            fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, _v: u64) -> Result<Woken> {
+                Ok(Woken::NO)
+            }
+            fn raw_mutex_create(&mut self) -> Result<QueueHandle> {
+                Ok(QueueHandle::from_raw(2))
+            }
+            fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> {
+                Ok(Wait::Blocked)
+            }
+            fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> {
+                panic!("nothing was taken, so nothing may be given back")
+            }
+        }
+        let k = &mut Busy;
+        let guarded = Mutex::new(k, 1_u32).unwrap();
+        let seen = guarded.with(k, 0, |_| unreachable!("f must not run"));
+        assert!(seen.is_none());
+    }
+}
