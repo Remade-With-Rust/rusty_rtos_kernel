@@ -22,15 +22,17 @@ flashed" means no chip has run it.
 
 ## Status
 
-**K2 in progress — 13 of the 18 IPC scenarios agree; K1 passed.**
+**K2 in progress — 11 of its 18 scenarios agree; K1 passed.**
 
 Since K1 the kernel has grown the whole `FromISR` surface (queue send,
 receive, peek, overwrite, semaphore give, task notify), queue sets with
 real `cTxLock` / `cRxLock` counts, task notifications, and stream and
-message buffers. Thirteen corpus scenarios trace identically to the C
-kernel for 100,000 ticks each — 11,328,945 lines. `QueueSet`, `TimerDemo`,
-`EventGroupsDemo` and the two buffer demos remain, as do K2's Kani,
-no-panic and mutants gates.
+message buffers. The conformance corpus is thirteen scenarios, all
+trace-identical to the C kernel for 100,000 ticks each — 11,328,945 lines.
+Eleven of them are on K2's list; `IntQueue` is out of scope for a
+signal-driven host port. Six remain: `QueueSet`, `TimerDemo`,
+`EventGroupsDemo`, `StreamBufferDemo`, `MessageBufferDemo` and
+`MessageBufferAMP`, along with K2's Kani, no-panic and mutants gates.
 
 **K1 — the scheduler agrees with the C kernel. Passed.**
 
