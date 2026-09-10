@@ -23,7 +23,9 @@
 use core::fmt;
 
 use rusty_rtos_core::config::{Config, PosixDemoConfig};
-use rusty_rtos_core::handle::{QueueHandle, StreamBufferHandle, TaskHandle, TimerHandle};
+use rusty_rtos_core::handle::{
+    EventGroupHandle, QueueHandle, StreamBufferHandle, TaskHandle, TimerHandle,
+};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -37,6 +39,7 @@ const SLOTS: usize = 32;
 const BUFFERS: usize = 4;
 const BYTES: usize = 256;
 const TIMERS: usize = 4;
+const GROUPS: usize = 4;
 
 /// The smallest port that satisfies the seam: it counts nesting so the
 /// kernel's own bookkeeping has something real to talk to, and does nothing
@@ -94,12 +97,13 @@ type K = Kernel<
     NoTickHook,
     TASKS,
     { items_for(TASKS, TIMERS) },
-    { lists_for(<PosixDemoConfig as Config>::MAX_PRIORITIES, QUEUES) },
+    { lists_for(<PosixDemoConfig as Config>::MAX_PRIORITIES, QUEUES, GROUPS) },
     QUEUES,
     SLOTS,
     BUFFERS,
     BYTES,
     TIMERS,
+    GROUPS,
 >;
 
 /// A fixed-size list of handles that are (probably) still live, so the
@@ -202,6 +206,20 @@ impl Rng {
         }
     }
 
+    fn group(&mut self, live: &[EventGroupHandle]) -> EventGroupHandle {
+        match self.below(4) {
+            0 if !live.is_empty() => {
+                let i = self.below(live.len() as u64) as usize;
+                live.get(i).copied().unwrap_or(EventGroupHandle::NULL)
+            }
+            1 => EventGroupHandle::NULL,
+            2 => EventGroupHandle::from_raw(self.next() as u32),
+            _ => {
+                EventGroupHandle::from_raw((self.below(16) as u32) | ((self.below(4) as u32) << 16))
+            }
+        }
+    }
+
     fn buffer(&mut self, live: &[StreamBufferHandle]) -> StreamBufferHandle {
         match self.below(4) {
             0 if !live.is_empty() => {
@@ -236,6 +254,7 @@ fn hammer(seed: u64, calls: u32) -> Worked {
     let mut queues = Live::<QueueHandle, QUEUES>::new(QueueHandle::NULL);
     let mut buffers = Live::<StreamBufferHandle, BUFFERS>::new(StreamBufferHandle::NULL);
     let mut timers = Live::<TimerHandle, TIMERS>::new(TimerHandle::NULL);
+    let mut groups = Live::<EventGroupHandle, GROUPS>::new(EventGroupHandle::NULL);
 
     for i in 0..3 {
         if let Ok(t) = k.create_task("h", (i % 5) as u8) {
@@ -256,11 +275,12 @@ fn hammer(seed: u64, calls: u32) -> Worked {
         let queue = rng.queue(queues.all());
         let buffer = rng.buffer(buffers.all());
         let timer = rng.timer(timers.all());
+        let group = rng.group(groups.all());
         let index = rng.below(8) as usize;
         let value = rng.next();
         let length = rng.below(80) as usize;
 
-        match rng.below(45) {
+        match rng.below(53) {
             0 => {
                 if let Ok(t) = k.create_task("h", rng.below(300) as u8) {
                     tasks.push(t);
@@ -432,6 +452,38 @@ fn hammer(seed: u64, calls: u32) -> Worked {
             }
             43 => {
                 let _ = k.timer_expiry_time(timer);
+            }
+            44 => {
+                if let Ok(g) = k.event_group_create() {
+                    groups.push(g);
+                }
+            }
+            45 => {
+                let _ = k.event_group_set_bits(group, value as u32);
+            }
+            46 => {
+                let _ = k.event_group_clear_bits(group, value as u32);
+            }
+            47 => {
+                let _ = k.event_group_wait_bits(
+                    group,
+                    value as u32,
+                    value & 1 == 0,
+                    value & 2 == 0,
+                    ticks,
+                );
+            }
+            48 => {
+                let _ = k.event_group_sync(group, value as u32, (value >> 32) as u32, ticks);
+            }
+            49 => {
+                let _ = k.event_group_bits(group);
+            }
+            50 => {
+                let _ = k.event_group_set_bits_from_isr(group, value as u32);
+            }
+            51 => {
+                let _ = k.event_group_delete(group);
             }
             _ => {
                 let _ = k.process_one_timer_command();

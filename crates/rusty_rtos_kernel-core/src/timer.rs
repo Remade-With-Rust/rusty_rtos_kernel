@@ -173,7 +173,8 @@ impl<
     const BUFFERS: usize,
     const BYTES: usize,
     const TIMERS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS>
+    const GROUPS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
 where
     H: TickHook<Self>,
 {

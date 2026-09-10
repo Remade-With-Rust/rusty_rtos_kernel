@@ -42,8 +42,11 @@
 //! `forbid(unsafe)`. `no_std` (+ `alloc`). Every arithmetic operation is
 //! checked, wrapping or saturating by name; every slice access is a `get`.
 
+pub mod events;
 pub mod kernel;
 pub mod name;
+#[cfg(kani)]
+pub mod proofs;
 pub mod queue;
 pub mod stream;
 pub mod timer;
@@ -65,12 +68,13 @@ pub const fn items_for(tasks: usize, timers: usize) -> usize {
 /// Lists a kernel needs: one ready list per priority, the two delayed
 /// lists, the pending-ready list and the suspended list, plus the two
 /// event lists (`xTasksWaitingToSend`, `xTasksWaitingToReceive`) of every
-/// queue.
+/// queue and the one (`xTasksWaitingForBits`) of every event group.
 #[must_use]
-pub const fn lists_for(max_priorities: u8, queues: usize) -> usize {
+pub const fn lists_for(max_priorities: u8, queues: usize, groups: usize) -> usize {
     (max_priorities as usize)
         .saturating_add(OVERHEAD_LISTS)
         .saturating_add(queues.saturating_mul(2))
+        .saturating_add(groups)
 }
 
 /// The number of fixed lists that are not a ready list: the two delayed

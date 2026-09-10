@@ -18,6 +18,9 @@ rust-version = "1.85"
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
+# `cfg(kani)` is set by the model checker, not by cargo, so rustc has to be
+# told the name exists or every `#[cfg(kani)]` is an unexpected-cfg warning.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 # The hardening policy (use-protection-please H-15 / H-16 / H-17 / H-18): no

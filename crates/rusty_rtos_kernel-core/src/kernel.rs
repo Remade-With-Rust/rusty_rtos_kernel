@@ -24,8 +24,8 @@ use rusty_rtos_core::arena::Arena;
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{
-    Queue as QueueKind, QueueHandle, StreamBuffer as StreamKind, Task as TaskKind, TaskHandle,
-    Timer as TimerKind, TimerHandle,
+    EventGroup as EventGroupKind, EventGroupHandle, Queue as QueueKind, QueueHandle,
+    StreamBuffer as StreamKind, Task as TaskKind, TaskHandle, Timer as TimerKind, TimerHandle,
 };
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
@@ -35,6 +35,7 @@ use rusty_rtos_core::priority::Priority;
 use rusty_rtos_core::tick::TickWidth;
 use rusty_rtos_core::trace::{Event, Trace};
 
+use crate::events::EventGroup;
 use crate::name::Name;
 use crate::queue::Queue;
 use crate::queue::Wait;
@@ -61,6 +62,14 @@ pub(crate) enum OwedTrace {
         name: Name,
         command: i32,
         value: u64,
+    },
+    /// `traceEVENT_GROUP_WAIT_BITS_END`, which the C runs after the
+    /// `xTaskResumeAll` that ends the wait — so a resume that switched away
+    /// traces once this task has the CPU back.
+    EventGroupWaitBitsEnd {
+        group: EventGroupHandle,
+        bits: u32,
+        timed_out: bool,
     },
 }
 
@@ -112,6 +121,11 @@ pub(crate) struct Tcb {
     /// with no stacks returns `Blocked` and is called again, so it needs to
     /// know the second call is a resumption rather than a fresh wait.
     notify_blocked: bool,
+    /// The same, for the event-group wait this task is inside. Those two
+    /// functions have no retry loop — the C blocks once and then reads the
+    /// event item value — so the second call has to know it is the far side
+    /// of the switch and not a fresh wait.
+    event_blocked: bool,
 }
 
 /// How many notification slots a task has room for.
@@ -203,6 +217,7 @@ pub struct Kernel<
     const BUFFERS: usize,
     const BYTES: usize,
     const TIMERS: usize,
+    const GROUPS: usize,
 > {
     pub(crate) port: P,
     pub(crate) trace: T,
@@ -212,6 +227,7 @@ pub struct Kernel<
     pub(crate) slots: [u64; SLOTS],
     pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
     pub(crate) timers: Arena<TimerKind, Timer, TIMERS>,
+    pub(crate) groups: Arena<EventGroupKind, EventGroup, GROUPS>,
     /// The ring of `DaemonTaskMessage_t`s the timer queue carries indices
     /// into. It is exactly as long as the queue, so a message can only be
     /// overwritten once the queue has already refused to hold its index.
@@ -313,7 +329,8 @@ impl<
     const BUFFERS: usize,
     const BYTES: usize,
     const TIMERS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS>
+    const GROUPS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
 where
     H: TickHook<Self>,
 {
@@ -344,7 +361,7 @@ where
     pub fn with_tick_hook(port: P, trace: T, tick_hook: H) -> Result<Self> {
         C::validate()?;
         if ITEMS != items_for(TASKS, TIMERS)
-            || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES)
+            || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES, GROUPS)
             || TASKS == 0
             || C::MAX_TASK_NAME_LEN > crate::NAME_CAPACITY
         {
@@ -360,6 +377,7 @@ where
             slots_used: 0,
             buffers: Arena::new(),
             timers: Arena::new(),
+            groups: Arena::new(),
             timer_messages: [Message::default(); MAX_TIMER_COMMANDS],
             timer_message_next: 0,
             timers_swapped: false,
@@ -748,6 +766,7 @@ where
             notified: [0; MAX_NOTIFICATION_ENTRIES],
             notify_state: [NotifyState::NotWaiting; MAX_NOTIFICATION_ENTRIES],
             notify_blocked: false,
+            event_blocked: false,
             stream_resume: false,
             stream_local: 0,
         };
@@ -947,6 +966,26 @@ where
                     .event(tick, Event::QueueReceiveFailed { queue, name: "" });
                 return true;
             }
+            Some(OwedTrace::EventGroupWaitBitsEnd {
+                group,
+                bits,
+                timed_out,
+            }) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace.event(
+                    tick,
+                    Event::EventGroupWaitBitsEnd {
+                        group,
+                        bits,
+                        timed_out,
+                    },
+                );
+                return true;
+            }
             Some(OwedTrace::TimerCommandSend {
                 timer,
                 name,
@@ -1024,6 +1063,18 @@ where
                         name: name.as_str(),
                         command,
                         value,
+                    },
+                ),
+                OwedTrace::EventGroupWaitBitsEnd {
+                    group,
+                    bits,
+                    timed_out,
+                } => self.trace.event(
+                    tick,
+                    Event::EventGroupWaitBitsEnd {
+                        group,
+                        bits,
+                        timed_out,
                     },
                 ),
                 OwedTrace::None => {}
@@ -1961,6 +2012,84 @@ where
         };
         self.exit_critical();
         result
+    }
+
+    /// `vTaskPlaceOnUnorderedEventList`: the item value carries the
+    /// condition rather than the priority, so the item goes on the end and
+    /// the list is never sorted.
+    ///
+    /// `taskEVENT_LIST_ITEM_VALUE_IN_USE` is not set here the way the C
+    /// sets it. The C needs it because the same `ListItem_t` is a
+    /// priority-ordered event item the rest of the time and the flag says
+    /// which; the value is only ever read back by the event-group code,
+    /// which masks the control byte off, so setting it would change
+    /// nothing but the arithmetic in the doc comment.
+    pub(crate) fn place_on_unordered_event_list(
+        &mut self,
+        list: ListId,
+        value: u64,
+        ticks: u64,
+    ) -> Result<()> {
+        let item = Self::event_item(self.current);
+        self.lists.set_value(item, value)?;
+        self.lists.insert_end(list, item)?;
+        self.add_current_task_to_delayed_list(ticks, true)
+    }
+
+    /// `vTaskRemoveFromUnorderedEventList`: write the answer into the item
+    /// value, then wake the task.
+    ///
+    /// Unlike `xTaskRemoveFromEventList` this always goes straight to the
+    /// ready list. It is only ever called with the scheduler suspended —
+    /// `xEventGroupSetBits` holds it across the whole walk — and the C
+    /// still bypasses the pending-ready list, because the value it just
+    /// wrote is the task's return value and a second pass would overwrite
+    /// it.
+    pub(crate) fn remove_from_unordered_event_list(
+        &mut self,
+        item: ItemId,
+        value: u64,
+    ) -> Result<()> {
+        self.lists.set_value(item, value)?;
+        let task = self.task_of_event_item(item)?;
+        let _ = self.lists.remove(item);
+        let _ = self.lists.remove(Self::state_item(task));
+        self.add_task_to_ready_list(task)?;
+        if self.tcbs.resolve(task)?.priority > self.current_priority() {
+            self.yield_pending = true;
+        }
+        Ok(())
+    }
+
+    /// `uxTaskResetEventItemValue`: read the answer the unblocker left, and
+    /// put the item back to the priority order an ordinary event list wants.
+    pub(crate) fn reset_event_item_value(&mut self, task: TaskHandle) -> Result<u64> {
+        let item = Self::event_item(task);
+        let value = self.lists.value(item)?;
+        let priority = self.tcbs.resolve(task)?.priority;
+        self.lists
+            .set_value(item, u64::from(C::MAX_PRIORITIES.saturating_sub(priority)))?;
+        Ok(value)
+    }
+
+    /// Whether `task` is resuming an event-group wait rather than starting
+    /// one. Taking it clears the marker.
+    pub(crate) fn take_event_resume(&mut self, task: TaskHandle) -> bool {
+        match self.tcbs.resolve_mut(task) {
+            Ok(tcb) if tcb.event_blocked => {
+                tcb.event_blocked = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mark that `task` blocked inside an event-group wait, so the call it
+    /// is inside resumes rather than restarts.
+    pub(crate) fn set_event_resume(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.event_blocked = true;
+        }
     }
 
     /// `vTaskPlaceOnEventList`: sorted by priority, then blocked.
