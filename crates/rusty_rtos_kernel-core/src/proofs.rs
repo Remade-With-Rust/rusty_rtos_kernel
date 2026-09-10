@@ -590,6 +590,9 @@ struct SymbolicQueue {
     held: usize,
     length: usize,
     last_sent: u64,
+    /// A mutex is a binary semaphore in this kernel as in the C, so one
+    /// bit is the whole of its state.
+    taken: bool,
 }
 
 #[cfg(kani)]
@@ -632,6 +635,31 @@ impl crate::typed::Raw for SymbolicQueue {
     fn raw_queue_send_from_isr(&mut self, q: QueueHandle, value: u64) -> Result<Woken> {
         self.raw_queue_send(q, value, 0).map(|_| Woken::NO)
     }
+
+    fn raw_mutex_create(&mut self) -> Result<QueueHandle> {
+        self.taken = false;
+        Ok(QueueHandle::from_raw(2))
+    }
+
+    /// Taking a mutex that is held blocks, exactly as the kernel's does.
+    /// The face may assume nothing more than that, which is why this is a
+    /// model of a mutex and not a stub that always succeeds — a stub would
+    /// prove `Mutex::with` correct on the only path it never has to be.
+    fn raw_mutex_take(&mut self, _m: QueueHandle, _ticks: u64) -> Result<Wait<()>> {
+        if self.taken {
+            return Ok(Wait::Blocked);
+        }
+        self.taken = true;
+        Ok(Wait::Ready(()))
+    }
+
+    fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> {
+        if !self.taken {
+            return Err(Error::NotActive);
+        }
+        self.taken = false;
+        Ok(())
+    }
 }
 
 /// **A value handed to `send` is never lost.** Either the queue took it, or
@@ -649,6 +677,7 @@ fn typed_send_never_loses_the_value() {
         held,
         length: 2,
         last_sent: 0,
+        taken: false,
     };
     let Ok(mut q) = crate::typed::Queue::<u16, 2>::create(&mut k) else {
         return;
@@ -677,6 +706,7 @@ fn typed_receive_gives_back_what_was_sent() {
         held: 0,
         length: 2,
         last_sent: 0,
+        taken: false,
     };
     let Ok(mut q) = crate::typed::Queue::<u16, 2>::create(&mut k) else {
         return;
@@ -703,6 +733,7 @@ fn typed_a_refused_send_does_not_disturb_a_queued_value() {
         held: 0,
         length: 1,
         last_sent: 0,
+        taken: false,
     };
     let Ok(mut q) = crate::typed::Queue::<u16, 1>::create(&mut k) else {
         return;
