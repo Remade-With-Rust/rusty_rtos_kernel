@@ -50,6 +50,7 @@
 //! with one priority cannot preempt.
 
 use rusty_rtos_core::config::Config;
+use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{QueueHandle, TaskHandle};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
@@ -562,6 +563,167 @@ fn task_start_scheduler() {
     assert!(k.is_running());
     assert!(k.task_count() == 3);
 }
+
+// ------------------------------------------------- the Rust face --
+//
+// The four above are the raw kernel's; these are `typed`'s, and the
+// comparison is the point of K2.1's third step.
+//
+// Four of the ten harnesses that do not converge fail because a *symbolic
+// handle* reaches a kernel call, and the model checker then has to explore
+// every arena slot that handle could name. Against the typed face those
+// four harnesses cannot be written at all: a `Queue<T, N>` is minted by
+// `create` and there is no constructor that invents one, so the state they
+// were exploring does not exist to be explored. That is what "compile-time
+// topology" buys, stated as something checkable rather than as a taste —
+// and it is why these finish in seconds while their raw equivalents do not
+// finish at all.
+
+/// A queue that behaves like the kernel's, with symbolic room.
+///
+/// It is deliberately not a stub of the real one: the property under proof
+/// is the *face's* slot discipline, and the face may only assume what
+/// `Raw` promises. Anything the real kernel does beyond that would be an
+/// assumption smuggled into the proof.
+#[cfg(kani)]
+struct SymbolicQueue {
+    held: usize,
+    length: usize,
+    last_sent: u64,
+}
+
+#[cfg(kani)]
+impl crate::typed::Raw for SymbolicQueue {
+    fn raw_queue_create(&mut self, length: usize) -> Result<QueueHandle> {
+        self.length = length;
+        self.held = 0;
+        Ok(QueueHandle::from_raw(1))
+    }
+
+    fn raw_queue_send(&mut self, _q: QueueHandle, value: u64, _ticks: u64) -> Result<Wait<()>> {
+        if self.held >= self.length {
+            return Err(Error::Full);
+        }
+        self.held = self.held.saturating_add(1);
+        self.last_sent = value;
+        Ok(Wait::Ready(()))
+    }
+
+    fn raw_queue_receive(&mut self, _q: QueueHandle, _ticks: u64) -> Result<Wait<u64>> {
+        if self.held == 0 {
+            return Ok(Wait::Blocked);
+        }
+        self.held = self.held.saturating_sub(1);
+        Ok(Wait::Ready(self.last_sent))
+    }
+
+    fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> {
+        Ok(self.held)
+    }
+
+    fn raw_queue_has_room(&self, _q: QueueHandle) -> bool {
+        self.held < self.length
+    }
+
+    fn raw_in_isr(&self) -> bool {
+        false
+    }
+
+    fn raw_queue_send_from_isr(&mut self, q: QueueHandle, value: u64) -> Result<Woken> {
+        self.raw_queue_send(q, value, 0).map(|_| Woken::NO)
+    }
+}
+
+/// **A value handed to `send` is never lost.** Either the queue took it, or
+/// it comes back — and it comes back *equal to what went in*, which is the
+/// half a `BaseType_t` return cannot express.
+///
+/// This is the property `Sent<T>` exists for, and it is proved for every
+/// `u16` and every starting occupancy rather than sampled.
+#[kani::proof]
+#[kani::unwind(8)]
+fn typed_send_never_loses_the_value() {
+    let held: usize = kani::any();
+    kani::assume(held <= 2);
+    let mut k = SymbolicQueue {
+        held,
+        length: 2,
+        last_sent: 0,
+    };
+    let Ok(mut q) = crate::typed::Queue::<u16, 2>::create(&mut k) else {
+        return;
+    };
+    // `create` resets the fake, so put the occupancy back.
+    k.held = held;
+    let value: u16 = kani::any();
+    let before = k.held;
+    match q.send(&mut k, value, 0) {
+        crate::typed::Sent::Ok => {
+            assert!(k.held == before + 1);
+        }
+        crate::typed::Sent::Full(back) | crate::typed::Sent::Blocked(back) => {
+            assert!(back == value);
+            assert!(k.held == before);
+        }
+    }
+}
+
+/// **What comes out is what went in.** For every `u16`, a send that was
+/// taken is followed by a receive that answers the same value.
+#[kani::proof]
+#[kani::unwind(8)]
+fn typed_receive_gives_back_what_was_sent() {
+    let mut k = SymbolicQueue {
+        held: 0,
+        length: 2,
+        last_sent: 0,
+    };
+    let Ok(mut q) = crate::typed::Queue::<u16, 2>::create(&mut k) else {
+        return;
+    };
+    let value: u16 = kani::any();
+    if !q.send(&mut k, value, 0).is_ok() {
+        return;
+    }
+    match q.receive(&mut k, 0) {
+        Ok(Wait::Ready(Some(out))) => assert!(out == value),
+        // The queue was just sent to, so it is not empty.
+        _ => assert!(false),
+    }
+}
+
+/// **A refused send leaves the ring alone.** The rule the timer command
+/// queue learned the hard way: a slot may only be written once the queue
+/// has agreed to carry the index that names it, or a refused send
+/// overwrites a value whose index is still queued.
+#[kani::proof]
+#[kani::unwind(8)]
+fn typed_a_refused_send_does_not_disturb_a_queued_value() {
+    let mut k = SymbolicQueue {
+        held: 0,
+        length: 1,
+        last_sent: 0,
+    };
+    let Ok(mut q) = crate::typed::Queue::<u16, 1>::create(&mut k) else {
+        return;
+    };
+    let first: u16 = kani::any();
+    let second: u16 = kani::any();
+    if !q.send(&mut k, first, 0).is_ok() {
+        return;
+    }
+    // The queue holds one and its length is one, so this must be refused.
+    match q.send(&mut k, second, 0) {
+        crate::typed::Sent::Full(back) => assert!(back == second),
+        _ => assert!(false),
+    }
+    // ...and the first value is still the one that comes out.
+    match q.receive(&mut k, 0) {
+        Ok(Wait::Ready(Some(out))) => assert!(out == first),
+        _ => assert!(false),
+    }
+}
+
 // `Task/TaskDelete`, `Task/TaskGetTaskNumber`, `Task/TaskCheckForTimeOut`
 // and `Task/TaskSetTimeOutState` have no harness yet, and the reason is the
 // same in each case: the surface they prove is not public here. There is no

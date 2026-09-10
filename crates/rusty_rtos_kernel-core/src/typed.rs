@@ -35,7 +35,9 @@
 //! the *same C oracle trace*: identical, exits included, or the claim is
 //! false.
 
+use core::cell::RefCell;
 use rusty_rtos_core::error::Result;
+
 use rusty_rtos_core::handle::QueueHandle;
 use rusty_rtos_core::isr::Woken;
 
@@ -90,6 +92,24 @@ pub trait Raw {
     /// # Errors
     /// As [`crate::Kernel::queue_send_from_isr`].
     fn raw_queue_send_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken>;
+
+    /// `xSemaphoreCreateMutex`.
+    ///
+    /// # Errors
+    /// As [`crate::Kernel::mutex_create`].
+    fn raw_mutex_create(&mut self) -> Result<QueueHandle>;
+
+    /// `xSemaphoreTake`.
+    ///
+    /// # Errors
+    /// As [`crate::Kernel::semaphore_take`].
+    fn raw_mutex_take(&mut self, mutex: QueueHandle, ticks: u64) -> Result<Wait<()>>;
+
+    /// `xSemaphoreGive`.
+    ///
+    /// # Errors
+    /// As [`crate::Kernel::semaphore_give`].
+    fn raw_mutex_give(&mut self, mutex: QueueHandle) -> Result<()>;
 }
 
 /// Proof that the code holding it is running in interrupt context.
@@ -139,6 +159,9 @@ pub trait Raw {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { self.in_isr }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// let k = &mut Fake { in_isr: true, ..Fake::default() };
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -174,6 +197,9 @@ pub trait Raw {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { self.in_isr }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -202,6 +228,9 @@ pub trait Raw {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { self.in_isr }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// let k = &mut Fake { in_isr: true, ..Fake::default() };
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -262,6 +291,154 @@ impl<T> Sent<T> {
             Self::Ok => None,
             Self::Full(value) | Self::Blocked(value) => Some(value),
         }
+    }
+}
+
+/// A mutex that **owns what it protects**.
+///
+/// # The bug this exists to delete
+///
+/// A FreeRTOS mutex protects nothing. It is a counting semaphore with
+/// priority inheritance and a name, and the data it is *said* to guard is
+/// an unrelated variable somewhere else. Nothing connects the two but a
+/// comment and everybody's good intentions, so "forgot to take the mutex"
+/// is a bug that compiles, ships, and shows up as corruption under load
+/// years later.
+///
+/// Here the data is *inside* the mutex and there is no way to reach it
+/// except through [`Mutex::with`], which takes the lock first and gives it
+/// back after. There is no `get`, no `lock` that returns the value, and no
+/// field you can reach: not because they are discouraged, but because they
+/// do not exist.
+///
+/// # Why a closure rather than a guard
+///
+/// A guard would have to give the mutex back when it dropped, and `Drop`
+/// cannot reach the kernel — it takes no arguments, and this crate has no
+/// globals and no allocator to hide one in. A guard you must remember to
+/// release is the same bug in a new coat. The closure cannot be forgotten.
+///
+/// It is the shape [`Isr::with`] uses, and the standard one for a
+/// capability that must not outlive its context.
+///
+/// # What it costs
+///
+/// One `xSemaphoreTake` and one `xSemaphoreGive`, which is what the C
+/// would have done — plus a [`RefCell`] borrow, which is a counter and
+/// which can never fail here: the RTOS mutex has already serialised every
+/// task that could reach it. That redundancy is the price of
+/// `forbid(unsafe)`, and it is a compare-and-branch.
+///
+/// ```
+/// # use rusty_rtos_kernel_core::typed::{Mutex, Raw};
+/// # use rusty_rtos_kernel_core::queue::Wait;
+/// # use rusty_rtos_core::error::Result;
+/// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
+/// # #[derive(Default)]
+/// # struct Fake { taken: bool }
+/// # impl Raw for Fake {
+/// #     fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(1)) }
+/// #     fn raw_queue_send(&mut self, _q: QueueHandle, _v: u64, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> { Ok(Wait::Blocked) }
+/// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(0) }
+/// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { true }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, _v: u64) -> Result<Woken> { Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { self.taken = true; Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { self.taken = false; Ok(()) }
+/// # }
+/// # let k = &mut Fake::default();
+/// let counter = Mutex::new(k, 0_u32).unwrap();
+///
+/// // The only way in. The lock is taken before `f` and given back after.
+/// let seen = counter.with(k, 0, |n| { *n += 1; *n }).unwrap();
+/// assert_eq!(seen, 1);
+/// assert!(!k.taken);
+/// ```
+///
+/// **The data cannot be reached without the lock.** In C the variable is
+/// simply in scope:
+///
+/// ```compile_fail
+/// # use rusty_rtos_kernel_core::typed::{Mutex, Raw};
+/// # use rusty_rtos_kernel_core::queue::Wait;
+/// # use rusty_rtos_core::error::Result;
+/// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
+/// # #[derive(Default)]
+/// # struct Fake { taken: bool }
+/// # impl Raw for Fake {
+/// #     fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(1)) }
+/// #     fn raw_queue_send(&mut self, _q: QueueHandle, _v: u64, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> { Ok(Wait::Blocked) }
+/// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(0) }
+/// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { true }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, _v: u64) -> Result<Woken> { Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { self.taken = true; Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { self.taken = false; Ok(()) }
+/// # }
+/// # let k = &mut Fake::default();
+/// let counter = Mutex::new(k, 0_u32).unwrap();
+/// // There is no way to say this. The field is private and there is no
+/// // accessor that does not take the lock first.
+/// let _n = counter.value;
+/// ```
+#[derive(Debug)]
+pub struct Mutex<T> {
+    handle: QueueHandle,
+    value: RefCell<T>,
+}
+
+impl<T> Mutex<T> {
+    /// `xSemaphoreCreateMutex`, with the thing it protects.
+    ///
+    /// # Errors
+    /// As [`Raw::raw_mutex_create`].
+    pub fn new<K: Raw>(kernel: &mut K, value: T) -> Result<Self> {
+        Ok(Self {
+            handle: kernel.raw_mutex_create()?,
+            value: RefCell::new(value),
+        })
+    }
+
+    /// The handle the kernel knows this mutex by, for the calls the face
+    /// does not cover yet.
+    #[must_use]
+    pub const fn handle(&self) -> QueueHandle {
+        self.handle
+    }
+
+    /// Take the mutex, run `f` on what it protects, and give it back.
+    ///
+    /// Answers `None` — without running `f` — when the mutex could not be
+    /// taken in `ticks`, which is the C's `xSemaphoreTake( ... ) != pdPASS`
+    /// branch that is so easy to leave empty.
+    pub fn with<K: Raw, R>(
+        &self,
+        kernel: &mut K,
+        ticks: u64,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        if !matches!(
+            kernel.raw_mutex_take(self.handle, ticks),
+            Ok(Wait::Ready(()))
+        ) {
+            return None;
+        }
+        // The RTOS mutex has serialised everyone who could reach this, so
+        // the borrow cannot fail. `try_borrow_mut` rather than `borrow_mut`
+        // because this crate does not panic, ever, for any reason.
+        let answer = self
+            .value
+            .try_borrow_mut()
+            .ok()
+            .map(|mut value| f(&mut value));
+        let _ = kernel.raw_mutex_give(self.handle);
+        answer
     }
 }
 
@@ -345,6 +522,9 @@ impl<T> SentFromIsr<T> {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { false }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -379,6 +559,9 @@ impl<T> SentFromIsr<T> {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { false }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -407,6 +590,9 @@ impl<T> SentFromIsr<T> {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { false }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -442,6 +628,9 @@ impl<T> SentFromIsr<T> {
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
 /// #     fn raw_in_isr(&self) -> bool { false }
 /// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// #     fn raw_mutex_create(&mut self) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(2)) }
+/// #     fn raw_mutex_take(&mut self, _m: QueueHandle, _t: u64) -> Result<Wait<()>> { Ok(Wait::Ready(())) }
+/// #     fn raw_mutex_give(&mut self, _m: QueueHandle) -> Result<()> { Ok(()) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();

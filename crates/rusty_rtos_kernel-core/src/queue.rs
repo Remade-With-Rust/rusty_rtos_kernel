@@ -1302,4 +1302,16 @@ where
     fn raw_queue_send_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken> {
         self.queue_send_from_isr(queue, value)
     }
+
+    fn raw_mutex_create(&mut self) -> Result<QueueHandle> {
+        self.mutex_create()
+    }
+
+    fn raw_mutex_take(&mut self, mutex: QueueHandle, ticks: u64) -> Result<Wait<()>> {
+        self.semaphore_take(mutex, ticks)
+    }
+
+    fn raw_mutex_give(&mut self, mutex: QueueHandle) -> Result<()> {
+        self.semaphore_give(mutex).map(|_| ())
+    }
 }
