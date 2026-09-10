@@ -29,10 +29,16 @@
 //!
 //! # Running them
 //!
-//! `cargo kani -p rusty_rtos_kernel-core` verifies the lot;
-//! `--harness <name>` runs one. Kani is Linux and macOS only, so on a
-//! Windows box this is a WSL command. Nothing here compiles outside `cfg(kani)`,
-//! so the crate builds and tests exactly as before without the tool.
+//! `cargo kani -p rusty_rtos_kernel-core --harness <name>` runs one, and
+//! one at a time is the way to run them: ten of the thirty-two do not
+//! converge, and in a combined run a single blow-up says nothing about the
+//! others. Twenty-two verify — 32,145 checks, 0 failures — most in under
+//! ten seconds. Which ten do not, and why, is measured rather than guessed;
+//! the umbrella ledger has the two rows.
+//!
+//! Kani is Linux and macOS only, so on a Windows box this is a WSL command.
+//! Nothing here compiles outside `cfg(kani)`, so the crate builds and
+//! tests exactly as before without the tool.
 //!
 //! # Why the geometry is tiny
 //!
@@ -135,23 +141,56 @@ type K = Kernel<
     GROUPS,
 >;
 
-/// A started kernel with one application task running.
+/// A kernel with one application task, before the scheduler starts.
 ///
-/// Every harness needs the same thing: a kernel past `start_scheduler`, so
-/// that the paths under proof are the ones a running system takes rather
-/// than the ones the pre-scheduler special cases take.
-fn started() -> K {
+/// This is what nearly every harness below uses, and the reason is
+/// measured rather than assumed: `start_scheduler` is the one step the
+/// model checker cannot afford (`a_fresh_kernel_is_not_running` and the two
+/// beside it are that measurement). A kernel that has its tasks but has not
+/// started costs seconds.
+///
+/// What it gives up is real and worth naming. The *bodies* under proof are
+/// the same either side of `vTaskStartScheduler` — a queue send copies,
+/// counts and unblocks the same way — so the no-panic result, which is what
+/// the CBMC proofs are mostly about, holds for every argument on the same
+/// code. What it does not reach is the part of a blocking call that only
+/// runs with a scheduler: the block itself, and the switch after it. The
+/// four harnesses that need that keep [`started`] and are named as the ones
+/// that do not converge.
+fn ready() -> K {
     let mut k = match K::new(ProofPort::default(), NoTrace) {
         Ok(k) => k,
         Err(_) => unreachable!(),
     };
     let _ = k.create_task("p", 1);
+    k
+}
+
+/// A kernel past `start_scheduler`, for the harnesses whose property is
+/// about a running system.
+///
+/// These do not converge — CBMC passes 2 GB and 500 s on one with no
+/// symbolic input at all — and they are kept because they are the
+/// harnesses, not because they pass. Running them is
+/// `cargo kani --harness <name>` and a long wait; the way to make them
+/// finish is to stub this function rather than let it build the state.
+fn started() -> K {
+    let mut k = ready();
     let _ = k.start_scheduler();
     k
 }
 
 /// A handle no arena minted: the harnesses that want to prove a nonsense
 /// argument is refused rather than followed.
+///
+/// It ranges over the whole word, and the obvious economy does not pay.
+/// Bounding the index and the generation to the handful of values next to
+/// the arena — which is where the interesting disagreements live, and what
+/// the C proofs do with their pointers — was tried and changed nothing:
+/// the four harnesses that pass a symbolic handle into a kernel call time
+/// out either way. The cost is not the size of the space; it is that a
+/// call which walks the arena and the lists with a symbolic handle has to
+/// be explored for every slot it could name.
 fn any_queue() -> QueueHandle {
     QueueHandle::from_raw(kani::any())
 }
@@ -172,9 +211,9 @@ fn small_ticks() -> u64 {
 /// `Queue/QueueGenericCreate`: a queue of any length either comes back or
 /// is refused, and a refused one leaves no slots taken.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_generic_create() {
-    let mut k = started();
+    let mut k = ready();
     let length: usize = kani::any();
     kani::assume(length <= SLOTS + 1);
     if let Ok(q) = k.queue_create(length) {
@@ -186,9 +225,9 @@ fn queue_generic_create() {
 /// `Queue/QueueGenericSend`: a send either takes a slot or does not, and
 /// the count never passes the length.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_generic_send() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -209,9 +248,9 @@ fn queue_generic_send() {
 /// The same call with a handle from nowhere: refused, and nothing else
 /// changed.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_generic_send_stale_handle() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(real) = k.queue_create(2) else {
         return;
     };
@@ -224,9 +263,9 @@ fn queue_generic_send_stale_handle() {
 
 /// `Queue/QueueGenericSendFromISR`.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_generic_send_from_isr() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -240,9 +279,9 @@ fn queue_generic_send_from_isr() {
 /// `Queue/QueueReceive`: a receive that answers took exactly one message
 /// off, and one that did not took none.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_receive() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -256,9 +295,9 @@ fn queue_receive() {
 
 /// `Queue/QueueReceiveFromISR`.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_receive_from_isr() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -271,9 +310,9 @@ fn queue_receive_from_isr() {
 
 /// `Queue/QueuePeek`: a peek never changes what is waiting.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_peek() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -286,9 +325,9 @@ fn queue_peek() {
 /// `Queue/QueueGenericReset`: after a reset the queue is empty, whatever it
 /// held before.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_generic_reset() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -303,9 +342,9 @@ fn queue_generic_reset() {
 /// `Queue/QueueMessagesWaiting` and `Queue/QueueSpacesAvailable`: the two
 /// always add up to the length, for any handle that resolves.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_messages_waiting_and_spaces_available() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -320,9 +359,9 @@ fn queue_messages_waiting_and_spaces_available() {
 /// `Queue/QueueCreateCountingSemaphore`: a counting semaphore starts with
 /// the initial count it was asked for, or is refused.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_create_counting_semaphore() {
-    let mut k = started();
+    let mut k = ready();
     let max: usize = kani::any();
     let initial: usize = kani::any();
     kani::assume(max <= SLOTS && initial <= max);
@@ -334,9 +373,9 @@ fn queue_create_counting_semaphore() {
 /// `Queue/QueueCreateMutex` and `Queue/QueueGetMutexHolder`: a fresh mutex
 /// is free and has no holder.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_create_mutex_and_get_holder() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(m) = k.mutex_create() else {
         return;
     };
@@ -347,9 +386,9 @@ fn queue_create_mutex_and_get_holder() {
 /// `Queue/QueueSemaphoreTake` and `Queue/QueueGiveFromISR`: a take that
 /// succeeded leaves the count one lower, and a give one higher.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_semaphore_take_and_give_from_isr() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(s) = k.semaphore_create_counting(2, 1) else {
         return;
     };
@@ -368,9 +407,9 @@ fn queue_semaphore_take_and_give_from_isr() {
 /// `Queue/QueueTakeMutexRecursive` and `Queue/QueueGiveMutexRecursive`: a
 /// recursive take and its matching give leave the mutex exactly as it was.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_take_and_give_mutex_recursive() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(m) = k.mutex_create_recursive() else {
         return;
     };
@@ -388,9 +427,9 @@ fn queue_take_and_give_mutex_recursive() {
 /// takes and gives back: a queue an interrupt has touched is a queue a task
 /// can still use, which is the observable half of the unlock.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn queue_unlock_leaves_the_queue_usable() {
-    let mut k = started();
+    let mut k = ready();
     let Ok(q) = k.queue_create(2) else {
         return;
     };
@@ -410,9 +449,9 @@ fn queue_unlock_leaves_the_queue_usable() {
 /// `Task/TaskCreate`: a task either exists at the priority it asked for, or
 /// was refused and the count did not move.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_create() {
-    let mut k = started();
+    let mut k = ready();
     let priority: u8 = kani::any();
     let before = k.task_count();
     match k.create_task("t", priority) {
@@ -428,9 +467,9 @@ fn task_create() {
 /// `Task/TaskPrioritySet`: whatever is asked for, the priority ends inside
 /// the configured range.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_priority_set() {
-    let mut k = started();
+    let mut k = ready();
     let priority: u8 = kani::any();
     let _ = k.set_priority(None, priority);
     let now = k.task_priority_get(None).unwrap_or(u8::MAX);
@@ -440,9 +479,9 @@ fn task_priority_set() {
 /// The same call with a handle from nowhere: refused, and the running
 /// task's own priority is untouched.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_priority_set_stale_handle() {
-    let mut k = started();
+    let mut k = ready();
     let before = k.task_priority_get(None).unwrap_or(0);
     let t = any_task();
     kani::assume(k.state_of(t) == Ok(crate::kernel::TaskState::Deleted));
@@ -453,7 +492,7 @@ fn task_priority_set_stale_handle() {
 /// `Task/TaskGetTickCount` and `Task/TaskIncrementTick`: the tick only ever
 /// goes forward, and a tick from interrupt context advances it by one.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_increment_tick() {
     let mut k = started();
     let before = k.tick_count();
@@ -463,7 +502,7 @@ fn task_increment_tick() {
 
 /// `Task/TaskDelay`: a delay of zero is a yield and does not move the tick.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_delay() {
     let mut k = started();
     let before = k.tick_count();
@@ -474,9 +513,9 @@ fn task_delay() {
 /// `Task/TaskSuspendAll` and `Task/TaskResumeAll`: the two nest, and the
 /// scheduler is only running again when the last one has come back.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_suspend_all_and_resume_all() {
-    let mut k = started();
+    let mut k = ready();
     k.suspend_all();
     k.suspend_all();
     let _ = k.resume_all();
@@ -496,7 +535,7 @@ fn task_get_scheduler_state() {
 /// `Task/TaskGetCurrentTaskHandle`: whatever is current is a task that
 /// exists.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_get_current_task_handle() {
     let k = started();
     let current = k.current();
@@ -506,7 +545,7 @@ fn task_get_current_task_handle() {
 /// `Task/TaskSwitchContext`: a switch always leaves a runnable task
 /// current, however many times it is asked for.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_switch_context() {
     let mut k = started();
     k.switch_context();
@@ -517,7 +556,7 @@ fn task_switch_context() {
 /// `Task/TaskStartScheduler`: a started kernel has the idle task and the
 /// timer daemon on top of whatever the application made.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(40)]
 fn task_start_scheduler() {
     let k = started();
     assert!(k.is_running());
