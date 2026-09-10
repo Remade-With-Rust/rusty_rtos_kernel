@@ -37,6 +37,7 @@
 
 use rusty_rtos_core::error::Result;
 use rusty_rtos_core::handle::QueueHandle;
+use rusty_rtos_core::isr::Woken;
 
 use crate::queue::Wait;
 
@@ -80,6 +81,153 @@ pub trait Raw {
     /// reason: a slot in the ring may only be written when the queue can
     /// take the index that names it.
     fn raw_queue_has_room(&self, queue: QueueHandle) -> bool;
+
+    /// Whether the kernel is in interrupt context — `xPortIsInsideInterrupt`.
+    fn raw_in_isr(&self) -> bool;
+
+    /// `xQueueSendToBackFromISR`.
+    ///
+    /// # Errors
+    /// As [`crate::Kernel::queue_send_from_isr`].
+    fn raw_queue_send_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken>;
+}
+
+/// Proof that the code holding it is running in interrupt context.
+///
+/// # The bug this exists to delete
+///
+/// FreeRTOS has two of almost every call — `xQueueSend` and
+/// `xQueueSendFromISR` — and picking the wrong one is a bug the compiler
+/// cannot see. From an interrupt the task version can try to block, which
+/// on most ports corrupts the scheduler; from a task the ISR version takes
+/// the wrong lock. FreeRTOS's own answer is `configASSERT(
+/// xPortIsInsideInterrupt() )` on the ports that can tell, and silence on
+/// the ones that cannot.
+///
+/// Here the two halves live on two different types. A task holds `&mut K`
+/// and can reach [`Queue::send`]; an interrupt holds `&mut Isr<K>` and can
+/// reach [`Queue::send_from_isr`]; neither can reach the other's. There is
+/// exactly one runtime check, at the boundary where [`Isr::with`] hands the
+/// token out, and everything downstream of it is the type system.
+///
+/// The shape is [`critical_section::with`]'s, and for the same reason: a
+/// capability that cannot outlive the context that granted it has to be
+/// borrowed inside a closure rather than returned.
+///
+/// [`critical_section::with`]: https://docs.rs/critical-section
+///
+/// # The two halves cannot be confused
+///
+/// The control arm: an interrupt takes the capability and uses the from-ISR
+/// half, a task uses the task half, and both work.
+///
+/// ```
+/// # use rusty_rtos_kernel_core::typed::{Isr, Queue, Raw, Sent};
+/// # use rusty_rtos_kernel_core::queue::Wait;
+/// # use rusty_rtos_core::error::Result;
+/// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
+/// # #[derive(Default)]
+/// # struct Fake { held: Vec<u64>, in_isr: bool }
+/// # impl Raw for Fake {
+/// #     fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(1)) }
+/// #     fn raw_queue_send(&mut self, _q: QueueHandle, v: u64, _t: u64) -> Result<Wait<()>> { self.held.push(v); Ok(Wait::Ready(())) }
+/// #     fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> {
+/// #         if self.held.is_empty() { Ok(Wait::Blocked) } else { Ok(Wait::Ready(self.held.remove(0))) }
+/// #     }
+/// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
+/// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { self.in_isr }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// # }
+/// let k = &mut Fake { in_isr: true, ..Fake::default() };
+/// let mut q = Queue::<u16, 4>::create(k).unwrap();
+/// // In interrupt context the capability is granted, and the from-ISR
+/// // half is what is reachable through it.
+/// let sent = Isr::with(k, |isr| q.send_from_isr(isr, 7_u16).is_ok());
+/// assert_eq!(sent, Some(true));
+/// // Out of interrupt context it is refused, and `f` never runs.
+/// k.in_isr = false;
+/// assert!(Isr::with(k, |_| unreachable!()).is_none());
+/// // ...and the task half is the one that works here.
+/// assert!(q.send(k, 8_u16, 0).is_ok());
+/// ```
+///
+/// **A task cannot reach the from-ISR half.** In C both are in scope from
+/// everywhere and `xQueueSendFromISR` from a task takes the wrong lock:
+///
+/// ```compile_fail
+/// # use rusty_rtos_kernel_core::typed::{Isr, Queue, Raw, Sent};
+/// # use rusty_rtos_kernel_core::queue::Wait;
+/// # use rusty_rtos_core::error::Result;
+/// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
+/// # #[derive(Default)]
+/// # struct Fake { held: Vec<u64>, in_isr: bool }
+/// # impl Raw for Fake {
+/// #     fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(1)) }
+/// #     fn raw_queue_send(&mut self, _q: QueueHandle, v: u64, _t: u64) -> Result<Wait<()>> { self.held.push(v); Ok(Wait::Ready(())) }
+/// #     fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> {
+/// #         if self.held.is_empty() { Ok(Wait::Blocked) } else { Ok(Wait::Ready(self.held.remove(0))) }
+/// #     }
+/// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
+/// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { self.in_isr }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// # }
+/// let k = &mut Fake::default();
+/// let mut q = Queue::<u16, 4>::create(k).unwrap();
+/// // `send_from_isr` wants an `Isr`, and a task has only the kernel.
+/// let _ = q.send_from_isr(k, 7_u16);
+/// ```
+///
+/// **An interrupt cannot reach the task half.** In C this is the one that
+/// corrupts the scheduler, because the task version may try to block:
+///
+/// ```compile_fail
+/// # use rusty_rtos_kernel_core::typed::{Isr, Queue, Raw, Sent};
+/// # use rusty_rtos_kernel_core::queue::Wait;
+/// # use rusty_rtos_core::error::Result;
+/// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
+/// # #[derive(Default)]
+/// # struct Fake { held: Vec<u64>, in_isr: bool }
+/// # impl Raw for Fake {
+/// #     fn raw_queue_create(&mut self, _n: usize) -> Result<QueueHandle> { Ok(QueueHandle::from_raw(1)) }
+/// #     fn raw_queue_send(&mut self, _q: QueueHandle, v: u64, _t: u64) -> Result<Wait<()>> { self.held.push(v); Ok(Wait::Ready(())) }
+/// #     fn raw_queue_receive(&mut self, _q: QueueHandle, _t: u64) -> Result<Wait<u64>> {
+/// #         if self.held.is_empty() { Ok(Wait::Blocked) } else { Ok(Wait::Ready(self.held.remove(0))) }
+/// #     }
+/// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
+/// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { self.in_isr }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
+/// # }
+/// let k = &mut Fake { in_isr: true, ..Fake::default() };
+/// let mut q = Queue::<u16, 4>::create(k).unwrap();
+/// Isr::with(k, |isr| {
+///     // `send` wants the kernel, and an interrupt has only the `Isr`.
+///     let _ = q.send(isr, 7_u16, 0);
+/// });
+/// ```
+#[derive(Debug)]
+pub struct Isr<'a, K: Raw> {
+    kernel: &'a mut K,
+}
+
+impl<K: Raw> Isr<'_, K> {
+    /// Run `f` with interrupt-context capability, if this really is
+    /// interrupt context.
+    ///
+    /// Answers `None` — and does not run `f` — when it is not, which is the
+    /// `configASSERT` the C would have fired, moved to a place where the
+    /// caller has to look at it.
+    pub fn with<R>(kernel: &mut K, f: impl FnOnce(&mut Isr<'_, K>) -> R) -> Option<R> {
+        if !kernel.raw_in_isr() {
+            return None;
+        }
+        Some(f(&mut Isr { kernel }))
+    }
 }
 
 /// What became of a value handed to [`Queue::send`].
@@ -113,6 +261,35 @@ impl<T> Sent<T> {
         match self {
             Self::Ok => None,
             Self::Full(value) | Self::Blocked(value) => Some(value),
+        }
+    }
+}
+
+/// What became of a value handed to [`Queue::send_from_isr`].
+///
+/// There is no `Blocked`: an interrupt never blocks, which is the whole
+/// reason the from-ISR half exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a send that did not happen is holding your value"]
+pub enum SentFromIsr<T> {
+    /// The queue took it, and this is whether a higher-priority task woke.
+    Ok(Woken),
+    /// The queue was full: here it is back.
+    Full(T),
+}
+
+impl<T> SentFromIsr<T> {
+    /// Whether the queue took it — `== pdPASS`.
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok(_))
+    }
+
+    /// Whether a higher-priority task was woken and a yield is owed.
+    pub const fn woken(&self) -> Woken {
+        match self {
+            Self::Ok(woken) => *woken,
+            Self::Full(_) => Woken::NO,
         }
     }
 }
@@ -155,6 +332,7 @@ impl<T> Sent<T> {
 /// # use rusty_rtos_kernel_core::queue::Wait;
 /// # use rusty_rtos_core::error::Result;
 /// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
 /// # #[derive(Default)]
 /// # struct Fake { held: Vec<u64> }
 /// # impl Raw for Fake {
@@ -165,6 +343,8 @@ impl<T> Sent<T> {
 /// #     }
 /// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -186,6 +366,7 @@ impl<T> Sent<T> {
 /// # use rusty_rtos_kernel_core::queue::Wait;
 /// # use rusty_rtos_core::error::Result;
 /// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
 /// # #[derive(Default)]
 /// # struct Fake { held: Vec<u64> }
 /// # impl Raw for Fake {
@@ -196,6 +377,8 @@ impl<T> Sent<T> {
 /// #     }
 /// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -211,6 +394,7 @@ impl<T> Sent<T> {
 /// # use rusty_rtos_kernel_core::queue::Wait;
 /// # use rusty_rtos_core::error::Result;
 /// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
 /// # #[derive(Default)]
 /// # struct Fake { held: Vec<u64> }
 /// # impl Raw for Fake {
@@ -221,6 +405,8 @@ impl<T> Sent<T> {
 /// #     }
 /// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -243,6 +429,7 @@ impl<T> Sent<T> {
 /// # use rusty_rtos_kernel_core::queue::Wait;
 /// # use rusty_rtos_core::error::Result;
 /// # use rusty_rtos_core::handle::QueueHandle;
+/// # use rusty_rtos_core::isr::Woken;
 /// # #[derive(Default)]
 /// # struct Fake { held: Vec<u64> }
 /// # impl Raw for Fake {
@@ -253,6 +440,8 @@ impl<T> Sent<T> {
 /// #     }
 /// #     fn raw_queue_messages_waiting(&mut self, _q: QueueHandle) -> Result<usize> { Ok(self.held.len()) }
 /// #     fn raw_queue_has_room(&self, _q: QueueHandle) -> bool { self.held.len() < 4 }
+/// #     fn raw_in_isr(&self) -> bool { false }
+/// #     fn raw_queue_send_from_isr(&mut self, _q: QueueHandle, v: u64) -> Result<Woken> { self.held.push(v); Ok(Woken::NO) }
 /// # }
 /// # let k = &mut Fake::default();
 /// let mut q = Queue::<u16, 4>::create(k).unwrap();
@@ -336,6 +525,39 @@ impl<T, const N: usize> Queue<T, N> {
                 Ok(Wait::Ready(value))
             }
             Wait::Blocked => Ok(Wait::Blocked),
+        }
+    }
+
+    /// `xQueueSendToBackFromISR`, moving the value in.
+    ///
+    /// It takes an [`Isr`] rather than the kernel, so it can only be
+    /// reached from interrupt context — and [`Queue::send`], which takes the
+    /// kernel, can only be reached from a task. Choosing the wrong half is
+    /// a type error rather than a `configASSERT`.
+    ///
+    /// The answer carries whether a higher-priority task was woken, which
+    /// is the C's `pxHigherPriorityTaskWoken` out-parameter turned into a
+    /// return value that cannot be passed as `NULL` by accident.
+    pub fn send_from_isr<K: Raw>(&mut self, isr: &mut Isr<'_, K>, value: T) -> SentFromIsr<T> {
+        let kernel = &mut *isr.kernel;
+        if !kernel.raw_queue_has_room(self.handle) {
+            let _ = kernel.raw_queue_send_from_isr(self.handle, 0);
+            return SentFromIsr::Full(value);
+        }
+        let slot = self.next;
+        if let Some(cell) = self.slots.get_mut(slot) {
+            *cell = Some(value);
+        }
+        match kernel.raw_queue_send_from_isr(self.handle, slot as u64) {
+            Ok(woken) => {
+                self.next = slot.saturating_add(1).checked_rem(N).unwrap_or(0);
+                SentFromIsr::Ok(woken)
+            }
+            Err(_) => match self.slots.get_mut(slot).and_then(Option::take) {
+                Some(value) => SentFromIsr::Full(value),
+                // Unreachable: the slot was written two lines above.
+                None => SentFromIsr::Ok(Woken::NO),
+            },
         }
     }
 

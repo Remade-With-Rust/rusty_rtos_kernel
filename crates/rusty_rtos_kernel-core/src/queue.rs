@@ -1294,4 +1294,12 @@ where
             .resolve(queue)
             .is_ok_and(|q| q.waiting < q.length)
     }
+
+    fn raw_in_isr(&self) -> bool {
+        self.port.in_isr()
+    }
+
+    fn raw_queue_send_from_isr(&mut self, queue: QueueHandle, value: u64) -> Result<Woken> {
+        self.queue_send_from_isr(queue, value)
+    }
 }
