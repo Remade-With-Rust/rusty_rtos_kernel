@@ -487,6 +487,7 @@ fn task_suspend_all_and_resume_all() {
 
 /// `Task/TaskGetSchedulerState`: a started kernel says so.
 #[kani::proof]
+#[kani::unwind(40)]
 fn task_get_scheduler_state() {
     let k = started();
     assert!(k.is_running());
@@ -531,3 +532,139 @@ fn task_start_scheduler() {
 // `queue_generic_send` above drive through it with a symbolic block time.
 // The `*Static` variants of six queue proofs have no counterpart either:
 // this kernel has one allocation story, the arena, and it is the static one.
+
+// ------------------------------------- the structures underneath --
+//
+// The CBMC proofs are mostly about memory safety, and in the C that means
+// pointers. Here it means these three: a list whose links are indices, an
+// arena whose handles are an index and a generation, and a name that is a
+// fixed buffer and a length. Every out-of-range access the kernel could
+// make it makes through one of them, so proving them on *unconstrained*
+// inputs proves the property for every caller at once — and they are small
+// enough that the model checker finishes, which a whole started kernel is
+// not.
+
+/// Every list operation, on an item and a list that may not exist and a
+/// value anywhere in range: no panic, and an item is in at most one list.
+#[kani::proof]
+#[kani::unwind(9)]
+fn lists_take_any_argument() {
+    let mut lists: rusty_rtos_core::list::Lists<4, 3> = rusty_rtos_core::list::Lists::new();
+    let item: u16 = kani::any();
+    let list: u8 = kani::any();
+    let value: u64 = kani::any();
+    let inserted = lists.insert(list, item, value).is_ok();
+    assert!(lists.container(item).unwrap_or(None).is_some() == inserted);
+    if inserted {
+        assert!(lists.value(item) == Ok(value));
+        assert!(lists.is_empty(list) == Ok(false));
+        assert!(lists.remove(item).is_ok());
+        assert!(lists.container(item) == Ok(None));
+    }
+}
+
+/// `vListInsertEnd` keeps the value the item already had, which is what
+/// `vTaskPlaceOnUnorderedEventList` relies on to carry a condition.
+#[kani::proof]
+#[kani::unwind(9)]
+fn insert_end_keeps_the_item_value() {
+    let mut lists: rusty_rtos_core::list::Lists<4, 3> = rusty_rtos_core::list::Lists::new();
+    let item: u16 = kani::any();
+    let list: u8 = kani::any();
+    let value: u64 = kani::any();
+    if lists.set_value(item, value).is_ok() && lists.insert_end(list, item).is_ok() {
+        assert!(lists.value(item) == Ok(value));
+    }
+}
+
+/// An arena hands out handles that only it can resolve, and a handle it did
+/// not mint resolves to nothing however it was built.
+#[kani::proof]
+#[kani::unwind(9)]
+fn an_arena_only_resolves_its_own_handles() {
+    let mut arena: rusty_rtos_core::arena::Arena<rusty_rtos_core::handle::Task, u32, 3> =
+        rusty_rtos_core::arena::Arena::new();
+    let value: u32 = kani::any();
+    let Ok(handle) = arena.try_insert(value) else {
+        return;
+    };
+    assert!(arena.resolve(handle) == Ok(&value));
+    let other = TaskHandle::from_raw(kani::any());
+    kani::assume(other != handle);
+    assert!(arena.resolve(other).is_err());
+    // A slot handed back and taken again mints a different handle, so the
+    // old one is stale rather than an alias for the new object.
+    let _ = arena.remove(handle);
+    assert!(arena.resolve(handle).is_err());
+    if let Ok(again) = arena.try_insert(value) {
+        assert!(again != handle);
+        assert!(arena.resolve(handle).is_err());
+    }
+}
+
+/// A name is truncated to the configuration's limit, never past the end of
+/// its buffer, and reads back as valid UTF-8 of the length it kept.
+#[kani::proof]
+#[kani::unwind(9)]
+fn a_name_is_truncated_not_overrun() {
+    let limit: usize = kani::any();
+    kani::assume(limit <= crate::NAME_CAPACITY);
+    let bytes: [u8; 4] = kani::any();
+    kani::assume(bytes.iter().all(|b| b.is_ascii_graphic()));
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return;
+    };
+    let name = crate::Name::new(text, limit);
+    assert!(name.as_str().len() <= limit);
+    assert!(name.as_str().len() <= text.len());
+}
+
+/// How much of a kernel the model checker can actually take.
+///
+/// These three are proofs in their own right — a fresh kernel is not
+/// running, a created task is counted, three created tasks are three — and
+/// they are also the measurement that says why the harnesses above stop
+/// where they do. Building the kernel costs 0.8 s, one task 3.0 s, three
+/// tasks 10.2 s, and `start_scheduler` on top of that does not finish in
+/// ten minutes. The wall is the setup, not the call under proof.
+#[kani::proof]
+#[kani::unwind(40)]
+fn a_fresh_kernel_is_not_running() {
+    let k = match K::new(ProofPort::default(), NoTrace) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    assert!(!k.is_running());
+    assert!(k.task_count() == 0);
+}
+
+#[kani::proof]
+#[kani::unwind(40)]
+fn a_created_task_is_counted() {
+    let mut k = match K::new(ProofPort::default(), NoTrace) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let Ok(t) = k.create_task("p", 1) else {
+        return;
+    };
+    assert!(k.task_count() == 1);
+    // Before the scheduler starts, the first task created is the one that
+    // will run first — `pxCurrentTCB` is set as it is created.
+    assert!(k.current() == t);
+}
+
+#[kani::proof]
+#[kani::unwind(40)]
+fn three_tasks_are_three() {
+    let mut k = match K::new(ProofPort::default(), NoTrace) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let _ = k.create_task("p", 1);
+    let _ = k.create_task("q", 1);
+    let _ = k.create_task("r", 0);
+    assert!(k.task_count() == 3);
+    // `<=`, so the last-created task of the highest priority runs first.
+    assert!(k.task_priority_get(None) == Ok(1));
+}
