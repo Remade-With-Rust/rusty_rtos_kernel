@@ -152,11 +152,7 @@ where
         let trigger = if trigger == 0 { 1 } else { trigger };
         // `xBufferSizeBytes++` before the allocation: the spare byte.
         let length = size.saturating_add(1);
-        let base = self.bytes_used;
-        let end = base.checked_add(length).ok_or(Error::Full)?;
-        if end > BYTES {
-            return Err(Error::Full);
-        }
+        let base = self.take_bytes(length).ok_or(Error::Full)?;
         let handle = self
             .buffers
             .try_insert(StreamBuffer {
@@ -171,7 +167,6 @@ where
                 notify_index: 0,
             })
             .map_err(|_| Error::Full)?;
-        self.bytes_used = end;
         self.account_for_allocation();
         let tick = self.tick;
         self.trace.note_exits(self.port.exits());
@@ -183,6 +178,93 @@ where
             },
         );
         Ok(handle)
+    }
+
+    /// Take `length` bytes of the arena: first fit from what deleted
+    /// buffers gave back, and only then from the untouched end.
+    ///
+    /// First fit rather than best fit because the pattern that needs an
+    /// allocator at all is create-then-delete of the *same size*, which
+    /// first fit serves exactly and without fragmenting.
+    fn take_bytes(&mut self, length: usize) -> Option<usize> {
+        for i in 0..self.free_count {
+            let (base, free) = *self.free_blocks.get(i)?;
+            if free < length {
+                continue;
+            }
+            if free == length {
+                self.drop_free_block(i);
+            } else if let Some(slot) = self.free_blocks.get_mut(i) {
+                *slot = (base.saturating_add(length), free.saturating_sub(length));
+            }
+            return Some(base);
+        }
+        let end = self.bytes_used.checked_add(length)?;
+        if end > BYTES {
+            return None;
+        }
+        let base = self.bytes_used;
+        self.bytes_used = end;
+        Some(base)
+    }
+
+    /// Give a block back, coalescing with whichever neighbours touch it so
+    /// the list cannot grow past one entry per hole.
+    fn give_bytes(&mut self, base: usize, length: usize) {
+        let mut base = base;
+        let mut length = length;
+        let mut i = 0;
+        while i < self.free_count {
+            let Some(&(other_base, other_len)) = self.free_blocks.get(i) else {
+                break;
+            };
+            if other_base.saturating_add(other_len) == base {
+                base = other_base;
+                length = length.saturating_add(other_len);
+                self.drop_free_block(i);
+                continue;
+            }
+            if base.saturating_add(length) == other_base {
+                length = length.saturating_add(other_len);
+                self.drop_free_block(i);
+                continue;
+            }
+            i = i.saturating_add(1);
+        }
+        // A block at the very end goes back to the bump pointer instead of
+        // the list, which is what keeps a create/delete loop free.
+        if base.saturating_add(length) == self.bytes_used {
+            self.bytes_used = base;
+            return;
+        }
+        if let Some(slot) = self.free_blocks.get_mut(self.free_count) {
+            *slot = (base, length);
+            self.free_count = self.free_count.saturating_add(1);
+        }
+    }
+
+    fn drop_free_block(&mut self, index: usize) {
+        let last = self.free_count.saturating_sub(1);
+        if index < last {
+            if let Some(&moved) = self.free_blocks.get(last) {
+                if let Some(slot) = self.free_blocks.get_mut(index) {
+                    *slot = moved;
+                }
+            }
+        }
+        self.free_count = last;
+    }
+
+    /// `vStreamBufferDelete`: the handle goes stale and the ring's bytes go
+    /// back to the arena.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn stream_buffer_delete(&mut self, buffer: StreamBufferHandle) -> Result<()> {
+        let b = *self.buffers.resolve(buffer)?;
+        let _ = self.buffers.remove(buffer);
+        self.give_bytes(b.base, b.length);
+        Ok(())
     }
 
     /// `xStreamBufferBytesAvailable`. No critical section, as in the C.

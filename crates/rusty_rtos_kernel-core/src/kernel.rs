@@ -201,6 +201,17 @@ pub struct Kernel<
     pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
     pub(crate) bytes: [u8; BYTES],
     pub(crate) bytes_used: usize,
+    /// Blocks of the byte arena that a deleted stream buffer gave back,
+    /// as `(base, length)`, kept sorted and coalesced.
+    ///
+    /// This is the one allocator in the kernel, and it exists because the
+    /// C's stream buffers are heap objects: `MessageBufferDemo`'s echo
+    /// server creates one and deletes it again on every loop, and a bump
+    /// allocator would run out in a few hundred ticks. At most `BUFFERS`
+    /// buffers can be alive, so at most `BUFFERS` holes can exist between
+    /// them, which is why the list is that long and cannot overflow.
+    pub(crate) free_blocks: [(usize, usize); BUFFERS],
+    pub(crate) free_count: usize,
     pub(crate) slots_used: usize,
     /// `pxCurrentTCB`.
     pub(crate) current: TaskHandle,
@@ -325,6 +336,8 @@ where
             buffers: Arena::new(),
             bytes: [0; BYTES],
             bytes_used: 0,
+            free_blocks: [(0, 0); BUFFERS],
+            free_count: 0,
             current: TaskHandle::NULL,
             top_ready_priority: 0,
             tick: C::INITIAL_TICK_COUNT,
