@@ -45,6 +45,7 @@
 pub mod kernel;
 pub mod name;
 pub mod queue;
+pub mod stream;
 
 pub use kernel::{Kernel, StartHandles, TaskState};
 pub use name::{NAME_CAPACITY, Name};

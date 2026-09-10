@@ -160,7 +160,9 @@ impl<
     const LISTS: usize,
     const QUEUES: usize,
     const SLOTS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+    const BUFFERS: usize,
+    const BYTES: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES>
 where
     H: TickHook<Self>,
 {
@@ -459,12 +461,18 @@ where
         self.trace.note_exits(self.port.exits());
         // `traceQUEUE_SET_SEND` is `traceQUEUE_SEND` unless a port says
         // otherwise, and this port does not.
-        self.trace
-            .event(tick, Event::QueueSend { queue: set, name: "" });
+        self.trace.event(
+            tick,
+            Event::QueueSend {
+                queue: set,
+                name: "",
+            },
+        );
         let mut woke = self.copy_data_to_queue(set, u64::from(queue.to_raw()), Position::Back)?;
         if tx_lock == UNLOCKED {
             let receivers = Self::queue_receive_list(set);
-            if self.lists.is_empty(receivers) == Ok(false) && self.remove_from_event_list(receivers)?
+            if self.lists.is_empty(receivers) == Ok(false)
+                && self.remove_from_event_list(receivers)?
             {
                 woke = true;
             }
@@ -549,7 +557,8 @@ where
                 return Ok(woken);
             }
             let receivers = Self::queue_receive_list(queue);
-            if self.lists.is_empty(receivers) == Ok(false) && self.remove_from_event_list(receivers)?
+            if self.lists.is_empty(receivers) == Ok(false)
+                && self.remove_from_event_list(receivers)?
             {
                 woken = Woken::YES;
             }
@@ -1077,7 +1086,11 @@ where
     fn unlock_queue(&mut self, queue: QueueHandle) -> Result<()> {
         self.enter_critical();
         {
-            let mut tx_lock = self.queues.resolve(queue).map(|q| q.tx_lock).unwrap_or(UNLOCKED);
+            let mut tx_lock = self
+                .queues
+                .resolve(queue)
+                .map(|q| q.tx_lock)
+                .unwrap_or(UNLOCKED);
             let container = self
                 .queues
                 .resolve(queue)
@@ -1107,7 +1120,11 @@ where
         self.exit_critical();
         self.enter_critical();
         {
-            let mut rx_lock = self.queues.resolve(queue).map(|q| q.rx_lock).unwrap_or(UNLOCKED);
+            let mut rx_lock = self
+                .queues
+                .resolve(queue)
+                .map(|q| q.rx_lock)
+                .unwrap_or(UNLOCKED);
             while rx_lock > LOCKED_UNMODIFIED {
                 let senders = Self::queue_send_list(queue);
                 if self.lists.is_empty(senders) == Ok(true) {

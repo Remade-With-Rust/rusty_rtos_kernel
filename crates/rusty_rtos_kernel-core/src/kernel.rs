@@ -22,9 +22,12 @@ use core::marker::PhantomData;
 
 use rusty_rtos_core::arena::Arena;
 use rusty_rtos_core::config::Config;
-use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::error::{Error, Result};
-use rusty_rtos_core::handle::{Queue as QueueKind, QueueHandle, Task as TaskKind, TaskHandle};
+use rusty_rtos_core::handle::{
+    Queue as QueueKind, QueueHandle, StreamBuffer as StreamKind, Task as TaskKind, TaskHandle,
+};
+use rusty_rtos_core::hooks::TickHook;
+use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::list::{ItemId, ListId, Lists};
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::priority::Priority;
@@ -33,6 +36,8 @@ use rusty_rtos_core::trace::{Event, Trace};
 
 use crate::name::Name;
 use crate::queue::Queue;
+use crate::queue::Wait;
+use crate::stream::StreamBuffer;
 use crate::{OVERHEAD_LISTS, items_for, lists_for};
 
 /// A trace line owed by a task that was switched out before it could
@@ -80,6 +85,60 @@ pub(crate) struct Tcb {
     /// block. This kernel has no stack, so they live here — see
     /// [`crate::queue`].
     wait: WaitFrame,
+    /// `ulNotifiedValue[]`.
+    notified: [u32; MAX_NOTIFICATION_ENTRIES],
+    /// `ucNotifyState[]`.
+    notify_state: [NotifyState; MAX_NOTIFICATION_ENTRIES],
+    /// Whether a stream-buffer call this task made was preempted at the
+    /// critical-section exit that samples the buffer, and must resume
+    /// *after* that exit rather than repeat it.
+    stream_resume: bool,
+    /// The stack local that exit produced — `xBytesAvailable` on a receive,
+    /// `xSpace` on a send — kept because the frame it belonged to is gone.
+    stream_local: usize,
+    /// Whether this task has already blocked inside the notification wait
+    /// it is in. The C blocks inside `xTaskGenericNotifyWait`; a kernel
+    /// with no stacks returns `Blocked` and is called again, so it needs to
+    /// know the second call is a resumption rather than a fresh wait.
+    notify_blocked: bool,
+}
+
+/// How many notification slots a task has room for.
+///
+/// The C sizes its arrays from `configTASK_NOTIFICATION_ARRAY_ENTRIES`
+/// directly. A `Config` is a type here and stable Rust cannot size an array
+/// from one of its associated consts, so the arrays are the largest a
+/// configuration may ask for and [`Config::validate`] refuses more. The
+/// cost is a few bytes per task per unused slot; the alternative was a
+/// tenth const generic on every kernel type.
+pub const MAX_NOTIFICATION_ENTRIES: usize = 4;
+
+/// `ucNotifyState[]`: what a task's notification slot is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifyState {
+    /// `taskNOT_WAITING_NOTIFICATION`.
+    #[default]
+    NotWaiting,
+    /// `taskWAITING_NOTIFICATION`.
+    Waiting,
+    /// `taskNOTIFICATION_RECEIVED`.
+    Received,
+}
+
+/// `eNotifyAction`: what a notification does to the value already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifyAction {
+    /// `eNoAction`: wake the task, leave the value alone.
+    #[default]
+    None,
+    /// `eSetBits`.
+    SetBits,
+    /// `eIncrement`.
+    Increment,
+    /// `eSetValueWithOverwrite`.
+    Overwrite,
+    /// `eSetValueWithoutOverwrite`: fails if one is already pending.
+    NoOverwrite,
 }
 
 /// What `xQueueGenericSend` and friends keep between passes of their
@@ -115,9 +174,11 @@ pub struct StartHandles {
 
 /// The scheduler.
 ///
-/// `TASKS`, `ITEMS`, `LISTS`, `QUEUES` and `SLOTS` are the geometry: see
-/// the crate docs and [`items_for`] / [`lists_for`]. [`Kernel::new`]
-/// refuses a geometry that does not add up.
+/// `TASKS`, `ITEMS`, `LISTS`, `QUEUES`, `SLOTS`, `BUFFERS` and `BYTES` are
+/// the geometry: how many tasks, list items, lists, queues, queue item
+/// slots, stream buffers, and stream-buffer bytes this kernel has room
+/// for. See the crate docs and [`items_for`] / [`lists_for`].
+/// [`Kernel::new`] refuses a geometry that does not add up.
 pub struct Kernel<
     C: Config,
     P: Port,
@@ -128,6 +189,8 @@ pub struct Kernel<
     const LISTS: usize,
     const QUEUES: usize,
     const SLOTS: usize,
+    const BUFFERS: usize,
+    const BYTES: usize,
 > {
     pub(crate) port: P,
     pub(crate) trace: T,
@@ -135,6 +198,9 @@ pub struct Kernel<
     pub(crate) queues: Arena<QueueKind, Queue, QUEUES>,
     pub(crate) lists: Lists<ITEMS, LISTS>,
     pub(crate) slots: [u64; SLOTS],
+    pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
+    pub(crate) bytes: [u8; BYTES],
+    pub(crate) bytes_used: usize,
     pub(crate) slots_used: usize,
     /// `pxCurrentTCB`.
     pub(crate) current: TaskHandle,
@@ -209,7 +275,9 @@ impl<
     const LISTS: usize,
     const QUEUES: usize,
     const SLOTS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS>
+    const BUFFERS: usize,
+    const BYTES: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES>
 where
     H: TickHook<Self>,
 {
@@ -254,6 +322,9 @@ where
             lists: Lists::new(),
             slots: [0; SLOTS],
             slots_used: 0,
+            buffers: Arena::new(),
+            bytes: [0; BYTES],
+            bytes_used: 0,
             current: TaskHandle::NULL,
             top_ready_priority: 0,
             tick: C::INITIAL_TICK_COUNT,
@@ -482,8 +553,25 @@ where
             return Ok(TaskState::Deleted);
         };
         if list == Self::suspended_list() {
-            let waiting_on_event = self.lists.container(Self::event_item(task))?.is_some();
-            return Ok(if waiting_on_event {
+            if self.lists.container(Self::event_item(task))?.is_some() {
+                return Ok(TaskState::Blocked);
+            }
+            // A task blocked indefinitely on a notification is in the
+            // suspended list and on no event list at all, so the C scans
+            // the notification array before it calls such a task suspended.
+            // Miss this and a stream buffer's reader looks suspended to
+            // `eTaskGetState` while it is plainly waiting.
+            let waiting_notification = self
+                .tcbs
+                .resolve(task)
+                .map(|t| {
+                    t.notify_state
+                        .iter()
+                        .take(C::NOTIFICATION_ARRAY_ENTRIES)
+                        .any(|s| *s == NotifyState::Waiting)
+                })
+                .unwrap_or(false);
+            return Ok(if waiting_notification {
                 TaskState::Blocked
             } else {
                 TaskState::Suspended
@@ -613,6 +701,11 @@ where
             base_priority: priority,
             mutexes_held: 0,
             wait: WaitFrame::default(),
+            notified: [0; MAX_NOTIFICATION_ENTRIES],
+            notify_state: [NotifyState::NotWaiting; MAX_NOTIFICATION_ENTRIES],
+            notify_blocked: false,
+            stream_resume: false,
+            stream_local: 0,
         };
         let handle = match self.tcbs.try_insert(tcb) {
             Ok(h) => h,
@@ -951,6 +1044,299 @@ where
             self.run_tick_hook();
         }
         switch_required
+    }
+
+    // ------------------------------------------- task notifications --
+    //
+    // A notification is the lightest thing a task can block on: no object,
+    // no event list, just a slot in the TCB and the delayed list. That is
+    // why the stream buffers use one rather than a queue, and why waking a
+    // task this way is a list move rather than an event-list walk.
+
+    /// `xTaskGenericNotifyWait`.
+    ///
+    /// `true` is `pdTRUE`: a notification was received. `Blocked` means the
+    /// caller must call again — the C blocks inside this function, and a
+    /// kernel with no stacks returns instead.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for an index past the configured array.
+    pub fn notify_wait(
+        &mut self,
+        index: usize,
+        clear_on_entry: u32,
+        clear_on_exit: u32,
+        ticks: u64,
+    ) -> Result<Wait<(bool, u32)>> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let caller = self.current;
+        let state = self.notify_state_of(caller, index);
+        if state != NotifyState::Received && ticks > 0 && !self.notify_blocked(caller) {
+            self.suspend_all();
+            self.enter_critical();
+            let mut should_block = false;
+            if self.notify_state_of(caller, index) != NotifyState::Received {
+                if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+                    if let Some(slot) = tcb.notified.get_mut(index) {
+                        *slot &= !clear_on_entry;
+                    }
+                    if let Some(slot) = tcb.notify_state.get_mut(index) {
+                        *slot = NotifyState::Waiting;
+                    }
+                }
+                should_block = true;
+            }
+            self.exit_critical();
+            if should_block {
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace_task(caller, |task, name| Event::TaskNotifyWaitBlock {
+                    task,
+                    name,
+                    index,
+                });
+                let _ = tick;
+                self.add_current_task_to_delayed_list(ticks, true)?;
+            }
+            let already_yielded = self.resume_all();
+            if should_block && !already_yielded {
+                if self.current == caller {
+                    self.port_yield();
+                } else {
+                    self.owe_yield(caller);
+                }
+            }
+            // The C blocks here; this kernel comes back and is called again.
+            self.set_notify_blocked(caller, true);
+            return Ok(Wait::Blocked);
+        }
+        self.set_notify_blocked(caller, false);
+        self.enter_critical();
+        self.trace.note_exits(self.port.exits());
+        self.trace_task(caller, |task, name| Event::TaskNotifyWait {
+            task,
+            name,
+            index,
+        });
+        let value = self.notified_value_of(caller, index);
+        let received = self.notify_state_of(caller, index) == NotifyState::Received;
+        if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+            if received {
+                if let Some(slot) = tcb.notified.get_mut(index) {
+                    *slot &= !clear_on_exit;
+                }
+            }
+            if let Some(slot) = tcb.notify_state.get_mut(index) {
+                *slot = NotifyState::NotWaiting;
+            }
+        }
+        self.exit_critical();
+        Ok(Wait::Ready((received, value)))
+    }
+
+    /// `xTaskGenericNotify`.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] for a bad index; [`Error::Gone`] for a
+    /// stale handle.
+    pub fn notify(
+        &mut self,
+        task: TaskHandle,
+        index: usize,
+        value: u32,
+        action: NotifyAction,
+    ) -> Result<bool> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        self.enter_critical();
+        let result = self.notify_locked(task, index, value, action, false);
+        self.exit_critical();
+        result.map(|(ok, _)| ok)
+    }
+
+    /// `xTaskGenericNotifyFromISR`: the same, without a critical section
+    /// that costs anything, and putting a woken task on the pending-ready
+    /// list when the scheduler is suspended.
+    ///
+    /// # Errors
+    /// As [`Kernel::notify`].
+    pub fn notify_from_isr(
+        &mut self,
+        task: TaskHandle,
+        index: usize,
+        value: u32,
+        action: NotifyAction,
+    ) -> Result<(bool, Woken)> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let mask = self.port.enter_critical_from_isr();
+        let result = self.notify_locked(task, index, value, action, true);
+        self.port.exit_critical_from_isr(mask);
+        result.map(|(ok, woken)| (ok, if woken { Woken::YES } else { Woken::NO }))
+    }
+
+    /// The body both notify paths share.
+    fn notify_locked(
+        &mut self,
+        task: TaskHandle,
+        index: usize,
+        value: u32,
+        action: NotifyAction,
+        from_isr: bool,
+    ) -> Result<(bool, bool)> {
+        let original = self.notify_state_of(task, index);
+        let mut ok = true;
+        {
+            let tcb = self.tcbs.resolve_mut(task)?;
+            if let Some(slot) = tcb.notify_state.get_mut(index) {
+                *slot = NotifyState::Received;
+            }
+            if let Some(slot) = tcb.notified.get_mut(index) {
+                match action {
+                    NotifyAction::SetBits => *slot |= value,
+                    NotifyAction::Increment => *slot = slot.wrapping_add(1),
+                    NotifyAction::Overwrite => *slot = value,
+                    NotifyAction::NoOverwrite => {
+                        if original == NotifyState::Received {
+                            ok = false;
+                        } else {
+                            *slot = value;
+                        }
+                    }
+                    NotifyAction::None => {}
+                }
+            }
+        }
+        // `traceTASK_NOTIFY` is hooked; `traceTASK_NOTIFY_FROM_ISR` is not,
+        // so an interrupt's notification says nothing on either side.
+        if !from_isr {
+            self.trace.note_exits(self.port.exits());
+            self.trace_task(task, |t, name| Event::TaskNotify {
+                task: t,
+                name,
+                index,
+            });
+        }
+        let mut woke_higher = false;
+        if original == NotifyState::Waiting {
+            let item = Self::state_item(task);
+            if from_isr && self.suspended_depth != 0 {
+                let _ = self.lists.remove(Self::event_item(task));
+                let value = self.lists.value(Self::event_item(task))?;
+                self.lists
+                    .insert(Self::pending_ready_list(), Self::event_item(task), value)?;
+            } else {
+                if self.lists.container(item)?.is_some() {
+                    let _ = self.lists.remove(item);
+                }
+                self.add_task_to_ready_list(task)?;
+            }
+            let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
+            if woken > self.current_priority() {
+                woke_higher = true;
+                if from_isr {
+                    // The C sets `xYieldPendings[ 0 ]` here as well as
+                    // reporting the wake through the caller's flag — so an
+                    // interrupt that discards the flag still gets the
+                    // switch, on the way out of `xTaskIncrementTick`. That
+                    // is why the tick hook runs before the yield-pending
+                    // test and not after it.
+                    self.yield_pending = true;
+                } else {
+                    // taskYIELD_ANY_CORE_IF_USING_PREEMPTION, inside the
+                    // section.
+                    self.port_yield();
+                }
+            }
+        }
+        Ok((ok, woke_higher))
+    }
+
+    /// `xTaskGenericNotifyStateClear`. `None` is the calling task.
+    ///
+    /// # Errors
+    /// As [`Kernel::notify`].
+    pub fn notify_state_clear(&mut self, task: Option<TaskHandle>, index: usize) -> Result<bool> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let target = task.unwrap_or(self.current);
+        self.enter_critical();
+        let cleared = self.notify_state_of(target, index) == NotifyState::Received;
+        if cleared {
+            if let Ok(tcb) = self.tcbs.resolve_mut(target) {
+                if let Some(slot) = tcb.notify_state.get_mut(index) {
+                    *slot = NotifyState::NotWaiting;
+                }
+            }
+        }
+        self.exit_critical();
+        Ok(cleared)
+    }
+
+    /// Whether `task` is part-way through a notification wait — it blocked
+    /// once and has not yet run the half of `xTaskGenericNotifyWait` that
+    /// happens when a task wakes.
+    ///
+    /// A caller that blocks on a notification needs this: the C's wait
+    /// returns *after* the wake, so its second half always runs, and a
+    /// stackless caller that decided not to block again would otherwise
+    /// skip it and leave the slot marked as received for ever.
+    #[must_use]
+    pub fn notify_wait_pending(&self, task: TaskHandle) -> bool {
+        self.notify_blocked(task)
+    }
+
+    /// Whether `task` has a stream-buffer call to resume, and the local it
+    /// left behind. Taking it clears the marker.
+    pub(crate) fn take_stream_resume(&mut self, task: TaskHandle) -> Option<usize> {
+        let tcb = self.tcbs.resolve_mut(task).ok()?;
+        if !tcb.stream_resume {
+            return None;
+        }
+        tcb.stream_resume = false;
+        Some(tcb.stream_local)
+    }
+
+    /// Remember where a preempted stream-buffer call has to start again.
+    pub(crate) fn set_stream_resume(&mut self, task: TaskHandle, local: usize) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.stream_resume = true;
+            tcb.stream_local = local;
+        }
+    }
+
+    fn notify_blocked(&self, task: TaskHandle) -> bool {
+        self.tcbs
+            .resolve(task)
+            .map(|t| t.notify_blocked)
+            .unwrap_or(false)
+    }
+
+    fn set_notify_blocked(&mut self, task: TaskHandle, blocked: bool) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.notify_blocked = blocked;
+        }
+    }
+
+    fn notify_state_of(&self, task: TaskHandle, index: usize) -> NotifyState {
+        self.tcbs
+            .resolve(task)
+            .ok()
+            .and_then(|t| t.notify_state.get(index).copied())
+            .unwrap_or(NotifyState::NotWaiting)
+    }
+
+    fn notified_value_of(&self, task: TaskHandle, index: usize) -> u32 {
+        self.tcbs
+            .resolve(task)
+            .ok()
+            .and_then(|t| t.notified.get(index).copied())
+            .unwrap_or(0)
     }
 
     /// `xTaskGetTickCountFromISR`.
