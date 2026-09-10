@@ -1150,8 +1150,13 @@ where
             if next >= self.next_unblock_time {
                 switch_required = self.wake_due_tasks(next);
             }
+            // `!switch_required` first: when the tick already woke a
+            // task, this can only set what is already set, and asking
+            // costs a TCB resolve for the running priority plus a list
+            // read. Setting a `true` to `true` is not worth either.
             if C::USE_PREEMPTION
                 && C::USE_TIME_SLICING
+                && !switch_required
                 && self
                     .lists
                     .len(Self::ready_list(self.current_priority()))
@@ -1672,15 +1677,21 @@ where
             *flag = false;
         }
         let item = Self::state_item(current);
-        if self.lists.container(item)?.is_some() {
-            let _ = self.lists.remove(item);
-        }
+        // `uxListRemove` already answers `NotActive` for an item that is
+        // in no list, and both it and the container test are one read of
+        // the same node — so asking first was reading it twice. This is
+        // the running task's state item, so it is in the ready list and
+        // the test passed anyway.
+        let _ = self.lists.remove(item);
         if ticks == Self::MAX_DELAY && can_block_indefinitely {
             self.lists.insert_end(Self::suspended_list(), item)?;
             return Ok(());
         }
         let wake_at = now.wrapping_add(ticks) & Self::MAX_DELAY;
-        self.lists.set_value(item, wake_at)?;
+        // `vListInsert` sets the item's value from the one it sorts by, so
+        // both arms below write `wake_at` themselves. Setting it here as
+        // well was a second lookup of the same item to store the same
+        // number into it.
         if wake_at < now {
             self.trace_task(current, |task, name| {
                 Event::MovedTaskToOverflowDelayedList { task, name }
@@ -1950,7 +1961,15 @@ where
     /// The call finished, one way or the other.
     pub(crate) fn end_wait(&mut self, task: TaskHandle) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
-            tcb.wait = WaitFrame::default();
+            // Now that the frame is only set on the path that blocks, most
+            // calls reach here with nothing to clear, and this was writing
+            // a default frame over a default frame. `entry_set` is the
+            // sentinel the C calls `xEntryTimeSet`, and it is the first
+            // thing set — `inherited` is only reached far inside the
+            // blocking path, so it cannot be true while this is false.
+            if tcb.wait.entry_set {
+                tcb.wait = WaitFrame::default();
+            }
         }
     }
 
@@ -2096,8 +2115,10 @@ where
     pub(crate) fn place_on_event_list(&mut self, list: ListId, ticks: u64) -> Result<()> {
         let current = self.current;
         let item = Self::event_item(current);
-        let value = self.lists.value(item)?;
-        self.lists.insert(list, item, value)?;
+        // The item keeps the value its call set; reading it out only to
+        // hand it back made the list read the item twice and write it once
+        // for no change.
+        self.lists.insert_keeping_value(list, item)?;
         self.add_current_task_to_delayed_list(ticks, true)
     }
 
