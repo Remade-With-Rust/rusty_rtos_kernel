@@ -668,3 +668,19 @@ fn three_tasks_are_three() {
     // `<=`, so the last-created task of the highest priority runs first.
     assert!(k.task_priority_get(None) == Ok(1));
 }
+
+/// A queue made before the scheduler starts is empty, and costs the model
+/// checker almost nothing — which is half of why the wall is where it is.
+#[kani::proof]
+#[kani::unwind(40)]
+fn a_queue_starts_empty() {
+    let mut k = match K::new(ProofPort::default(), NoTrace) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let _ = k.create_task("p", 1);
+    let Ok(q) = k.queue_create(1) else {
+        return;
+    };
+    assert!(k.queue_messages_waiting(q) == Ok(0));
+}
