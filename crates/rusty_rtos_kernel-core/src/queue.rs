@@ -760,7 +760,13 @@ where
                 false
             };
             // queueYIELD_IF_USING_PREEMPTION(), inside the section.
-            if woke_higher || (self.lists.is_empty(receivers) != Ok(false) && yield_required) {
+            // `yield_required` first: it is false on every send that is
+            // not a mutex give, and it is a local, so on the common path
+            // the list is not read a second time at all. Both operands are
+            // pure, so the order is free to choose. (The read cannot be
+            // hoisted above the removal above it -- removing the last
+            // waiter is exactly what changes the answer.)
+            if woke_higher || (yield_required && self.lists.is_empty(receivers) != Ok(false)) {
                 self.port_yield();
             }
             self.exit_critical();
