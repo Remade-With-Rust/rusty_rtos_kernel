@@ -25,7 +25,7 @@ use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{
     Queue as QueueKind, QueueHandle, StreamBuffer as StreamKind, Task as TaskKind, TaskHandle,
-    Timer as TimerKind,
+    Timer as TimerKind, TimerHandle,
 };
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
@@ -53,6 +53,15 @@ pub(crate) enum OwedTrace {
     SendFailed(QueueHandle),
     /// `traceQUEUE_RECEIVE_FAILED`.
     ReceiveFailed(QueueHandle),
+    /// `traceTIMER_COMMAND_SEND`, which the C runs on the line *after*
+    /// `xQueueSendToBack` — so a send that made the daemon ready traces
+    /// only once this task has the CPU back.
+    TimerCommandSend {
+        timer: TimerHandle,
+        name: Name,
+        command: i32,
+        value: u64,
+    },
 }
 
 /// `eTaskState`: what a task is doing, derived from the list it is in
@@ -817,8 +826,11 @@ where
     /// As [`Kernel::create_task`].
     pub fn start_scheduler(&mut self) -> Result<StartHandles> {
         let idle = self.create_task("IDLE", 0)?;
-        let timer_queue = self.queue_create(C::TIMER_QUEUE_LENGTH)?;
-        self.timer_queue = timer_queue;
+        // `xTimerCreateTimerTask` opens with `prvCheckForValidListAndQueue`,
+        // which makes the command queue only if no `xTimerCreate` has made
+        // it already.
+        self.check_for_valid_list_and_queue()?;
+        let timer_queue = self.timer_queue;
         let timer = self.create_task("Tmr Svc", C::TIMER_TASK_PRIORITY)?;
         self.next_unblock_time = Self::MAX_DELAY;
         self.running = true;
@@ -935,6 +947,28 @@ where
                     .event(tick, Event::QueueReceiveFailed { queue, name: "" });
                 return true;
             }
+            Some(OwedTrace::TimerCommandSend {
+                timer,
+                name,
+                command,
+                value,
+            }) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace.event(
+                    tick,
+                    Event::TimerCommandSend {
+                        timer,
+                        name: name.as_str(),
+                        command,
+                        value,
+                    },
+                );
+                return true;
+            }
             Some(OwedTrace::None) | None => {}
         }
         if self.owes_yield.get(index).copied() != Some(true) {
@@ -978,6 +1012,20 @@ where
                 OwedTrace::ReceiveFailed(queue) => self
                     .trace
                     .event(tick, Event::QueueReceiveFailed { queue, name: "" }),
+                OwedTrace::TimerCommandSend {
+                    timer,
+                    name,
+                    command,
+                    value,
+                } => self.trace.event(
+                    tick,
+                    Event::TimerCommandSend {
+                        timer,
+                        name: name.as_str(),
+                        command,
+                        value,
+                    },
+                ),
                 OwedTrace::None => {}
             }
             return;

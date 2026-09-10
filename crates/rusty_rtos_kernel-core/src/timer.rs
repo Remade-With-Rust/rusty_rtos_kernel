@@ -21,14 +21,14 @@
 
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
-use rusty_rtos_core::handle::TimerHandle;
+use rusty_rtos_core::handle::{QueueHandle, TaskHandle, TimerHandle};
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::list::ListId;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::trace::{Event, Trace};
 
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, OwedTrace};
 use crate::name::Name;
 use crate::queue::{Position, Ready, Wait};
 
@@ -222,18 +222,19 @@ where
         let handle = self
             .timers
             .try_insert(Timer {
-                name: Name::new(name, C::MAX_TASK_NAME_LEN),
+                // A timer keeps the *pointer* to its name in the C, so it
+                // is never truncated the way a task's is. `Oneshot Timer`
+                // is thirteen characters and `configMAX_TASK_NAME_LEN` is
+                // twelve.
+                name: Name::new(name, crate::NAME_CAPACITY),
                 period,
                 id,
                 callback,
                 status,
             })
             .map_err(|_| Error::Full)?;
-        // `prvInitialiseNewTimer` opens with `prvCheckForValidListAndQueue`,
-        // which is a critical section whether or not the queue already
-        // exists — so it is one exit on every create, not just the first.
-        self.enter_critical();
-        self.exit_critical();
+        // `prvInitialiseNewTimer` opens with `prvCheckForValidListAndQueue`.
+        self.check_for_valid_list_and_queue()?;
         let tick = self.tick;
         let name = self
             .timers
@@ -249,6 +250,34 @@ where
             },
         );
         Ok(handle)
+    }
+
+    /// `prvCheckForValidListAndQueue`: make the command queue if no timer
+    /// has made it yet, inside one critical section either way.
+    ///
+    /// The C makes it lazily, on the first `xTimerCreate` — which for
+    /// `TimerDemo` is *before the scheduler starts*, so the queue is the
+    /// first object in the trace and not the third. Everything the create
+    /// does happens inside the outer section, so the whole thing is one
+    /// outermost exit whether or not it built anything.
+    ///
+    /// # Errors
+    /// As [`Kernel::queue_create`].
+    pub(crate) fn check_for_valid_list_and_queue(&mut self) -> Result<()> {
+        self.enter_critical();
+        let result = if self.timer_queue == QueueHandle::NULL {
+            match self.queue_create(C::TIMER_QUEUE_LENGTH) {
+                Ok(queue) => {
+                    self.timer_queue = queue;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(())
+        };
+        self.exit_critical();
+        result
     }
 
     /// `pvTimerGetTimerID`.
@@ -365,13 +394,26 @@ where
         // `if( xTaskGetSchedulerState() == taskSCHEDULER_RUNNING )` — before
         // the scheduler runs, a command may not block.
         let ticks = if self.is_running() { ticks } else { 0 };
-        let sent = self.post_timer_message(message, ticks)?;
-        match sent {
-            Wait::Blocked => Ok(Wait::Blocked),
-            Ready(ok) => {
-                self.trace_command_send(timer, command, value);
+        // Who to trace against. The C runs `traceTIMER_COMMAND_SEND` on the
+        // line after `xQueueSendToBack`, so a send that made the daemon
+        // ready switches away first and the line runs when this task has
+        // the CPU back — after the `TASK_SWITCHED_IN` that returns it.
+        let caller = self.current();
+        // `traceTIMER_COMMAND_SEND` fires whatever the send returned — and
+        // a full queue is the *point* of TimerDemo's first test, which
+        // starts exactly as many timers as the queue holds and then
+        // requires the next one to fail.
+        match self.post_timer_message(message, ticks) {
+            Ok(Wait::Blocked) => Ok(Wait::Blocked),
+            Ok(Ready(ok)) => {
+                self.trace_command_send_for(caller, timer, command, value);
                 Ok(Ready(ok))
             }
+            Err(Error::Full) => {
+                self.trace_command_send_for(caller, timer, command, value);
+                Ok(Ready(false))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -568,36 +610,93 @@ where
         );
     }
 
+    /// The same line, but owed to `caller` if the send has already handed
+    /// the CPU to the daemon.
+    fn trace_command_send_for(
+        &mut self,
+        caller: TaskHandle,
+        timer: TimerHandle,
+        command: Command,
+        value: u64,
+    ) {
+        let name = self
+            .timers
+            .resolve(timer)
+            .map(|t| t.name)
+            .unwrap_or_default();
+        self.trace_failure_or_owe(
+            caller,
+            OwedTrace::TimerCommandSend {
+                timer,
+                name,
+                command: command.id(),
+                value,
+            },
+        );
+    }
+
     /// Put a message in the ring and its index on the queue.
     fn post_timer_message(&mut self, message: Message, ticks: u64) -> Result<Wait<bool>> {
         let slot = self.stage_timer_message(message);
         match self.queue_send_generic(self.timer_queue, slot, ticks, Position::Back)? {
             Wait::Blocked => Ok(Wait::Blocked),
-            Ready(()) => Ok(Ready(true)),
+            Ready(()) => {
+                self.commit_timer_message();
+                Ok(Ready(true))
+            }
         }
     }
 
     fn post_timer_message_from_isr(&mut self, message: Message) -> Result<(bool, Woken)> {
         let slot = self.stage_timer_message(message);
         match self.queue_send_from_isr(self.timer_queue, slot) {
-            Ok(woken) => Ok((true, woken)),
+            Ok(woken) => {
+                self.commit_timer_message();
+                Ok((true, woken))
+            }
             Err(Error::Full) => Ok((false, Woken::NO)),
             Err(e) => Err(e),
         }
     }
 
-    /// The ring is exactly as long as the command queue, so a message can
-    /// only be overwritten once the queue has refused to hold its index.
+    /// Write the message into the slot the next accepted send will use, and
+    /// answer with that slot — the index the queue will carry.
+    ///
+    /// The C caller holds its `DaemonTaskMessage_t` on its own stack, so a
+    /// send the queue refuses simply loses it and no other message is
+    /// harmed. Here the message lives in a ring the queue carries indices
+    /// into, and the queue's indices are always the run ending just before
+    /// this pointer, so the slot it names is free exactly when the queue
+    /// has room. When it has none the send cannot be accepted either, and
+    /// writing would overwrite a message the daemon has not read yet — the
+    /// oldest one, which is the next it will read.
     fn stage_timer_message(&mut self, message: Message) -> u64 {
         let slot = self.timer_message_next;
-        if let Some(cell) = self.timer_messages.get_mut(slot) {
-            *cell = message;
+        if self.timer_queue_has_room() {
+            if let Some(cell) = self.timer_messages.get_mut(slot) {
+                *cell = message;
+            }
         }
-        self.timer_message_next = slot
+        slot as u64
+    }
+
+    /// The queue took the index, so the message it points at belongs to the
+    /// queue until the daemon reads it.
+    fn commit_timer_message(&mut self) {
+        self.timer_message_next = self
+            .timer_message_next
             .saturating_add(1)
             .checked_rem(C::TIMER_QUEUE_LENGTH)
             .unwrap_or(0);
-        slot as u64
+    }
+
+    /// `uxQueueSpacesAvailable( xTimerQueue ) > 0`, without its critical
+    /// section — this is the kernel reading its own queue, not a task
+    /// asking, so it must cost no sim time.
+    fn timer_queue_has_room(&self) -> bool {
+        self.queues
+            .resolve(self.timer_queue)
+            .is_ok_and(|q| q.waiting < q.length)
     }
 
     // ----------------------------------------------------- the daemon task --
@@ -719,8 +818,7 @@ where
                 name: name.as_str(),
             },
         );
-        let hook = self.tick_hook;
-        self.tick_hook = hook.timer(self, timer, callback, id);
+        H::timer(self, timer, callback, id);
     }
 
     /// `prvInsertTimerInActiveList`: `true` when the timer is already due
@@ -779,8 +877,7 @@ where
 
         if message.command.id() < 0 {
             // A pended function call: the daemon just runs it.
-            let hook = self.tick_hook;
-            self.tick_hook = hook.pended(self, message.function, message.param1, message.value);
+            H::pended(self, message.function, message.param1, message.value);
             return Ok(Ready(true));
         }
 
