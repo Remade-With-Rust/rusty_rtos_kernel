@@ -629,7 +629,7 @@ where
         self.trace.note_exits(self.port.exits());
         self.trace
             .event(tick, Event::QueueReceiveFromIsr { queue, name: "" });
-        let value = self.copy_data_from_queue(queue, false)?;
+        let value = self.copy_data_from_queue(queue, &snapshot, false)?;
         let mut woken = Woken::NO;
         if rx_lock == UNLOCKED {
             let senders = Self::queue_send_list(queue);
@@ -653,7 +653,10 @@ where
     pub fn queue_peek_from_isr(&mut self, queue: QueueHandle) -> Result<u64> {
         let mask = self.port.enter_critical_from_isr();
         let result = match self.queues.resolve(queue) {
-            Ok(q) if q.waiting > 0 => self.copy_data_from_queue(queue, true),
+            Ok(q) if q.waiting > 0 => {
+                let snapshot = *q;
+                self.copy_data_from_queue(queue, &snapshot, true)
+            }
             Ok(_) => Err(Error::Empty),
             Err(e) => Err(e),
         };
@@ -800,6 +803,13 @@ where
 
     /// `prvCopyDataToQueue`; `true` when giving a mutex back lowered the
     /// giver's priority and a yield is therefore wanted.
+    /// `prvCopyDataToQueue`.
+    ///
+    /// This resolves rather than taking the caller's snapshot, and
+    /// [`Kernel::copy_data_from_queue`] does the opposite. That is not an
+    /// inconsistency: both forms were measured on both helpers and they
+    /// disagree, because the writer's caller does not keep its snapshot
+    /// live across the call and the reader's does.
     fn copy_data_to_queue(
         &mut self,
         queue: QueueHandle,
@@ -808,6 +818,14 @@ where
     ) -> Result<bool> {
         let snapshot = *self.queues.resolve(queue)?;
         let mut yield_required = false;
+        // `prvCopyDataToQueue` counts the item in — except on an overwrite
+        // of a queue that already held one, where it decrements first so
+        // the increment cancels and the count stays where it was.
+        //
+        // Decided once, up here, so that each arm below can fold the count
+        // into the resolve it is already making. Deciding it after the arms
+        // is what forced a further resolve for one field.
+        let counted = !(position == Position::Overwrite && snapshot.waiting > 0);
         if snapshot.kind.carries_data() {
             let (index, next_read, next_write) = match position {
                 Position::Back => (
@@ -830,17 +848,22 @@ where
             let q = self.queues.resolve_mut(queue)?;
             q.read_from = next_read;
             q.write_to = next_write;
+            if counted {
+                q.waiting = q.waiting.saturating_add(1);
+            }
         } else if snapshot.kind.is_mutex() {
-            // Giving a mutex back: the holder drops any inherited priority.
+            // Giving a mutex back: the holder drops any inherited
+            // priority. The disinherit touches the holder's TCB, not this
+            // queue, so the resolve after it is still the first one.
             yield_required = self.priority_disinherit(snapshot.holder)?;
-            self.queues.resolve_mut(queue)?.holder = TaskHandle::NULL;
-        }
-        // `prvCopyDataToQueue` counts the item in — except on an overwrite
-        // of a queue that already held one, where it decrements first so
-        // the increment cancels out and the count stays where it was.
-        let overwrote = position == Position::Overwrite && snapshot.waiting > 0;
-        let q = self.queues.resolve_mut(queue)?;
-        if !overwrote {
+            let q = self.queues.resolve_mut(queue)?;
+            q.holder = TaskHandle::NULL;
+            if counted {
+                q.waiting = q.waiting.saturating_add(1);
+            }
+        } else if counted {
+            // A counting or binary semaphore: only the count moves.
+            let q = self.queues.resolve_mut(queue)?;
             q.waiting = q.waiting.saturating_add(1);
         }
         Ok(yield_required)
@@ -899,7 +922,7 @@ where
             return Err(e);
         }
         if snapshot.waiting > 0 {
-            let value = self.copy_data_from_queue(queue, peek)?;
+            let value = self.copy_data_from_queue(queue, &snapshot, peek)?;
             self.trace.note_exits(self.port.exits());
             let tick = self.tick;
             // `xQueuePeek` is its own function in the C with its own trace
@@ -1002,8 +1025,26 @@ where
 
     /// `prvCopyDataFromQueue`, with the peek variant putting the cursor
     /// back as `xQueuePeek` does.
-    fn copy_data_from_queue(&mut self, queue: QueueHandle, peek: bool) -> Result<u64> {
-        let snapshot = *self.queues.resolve(queue)?;
+    /// `prvCopyDataFromQueue`, over a snapshot its caller already took.
+    ///
+    /// Every caller resolves this queue to decide whether there is
+    /// anything to read; this used to resolve it again to do the reading.
+    /// The snapshot cannot be stale — nothing between the two touches this
+    /// queue, and both are inside the same critical section.
+    ///
+    /// The same change to [`Kernel::copy_data_to_queue`] is **refused**,
+    /// and the pair is why this bench exists: threading the snapshot into
+    /// the writer is worth -245,389 Ir inside it and +211,717 in
+    /// `queue_send_generic`, because a `&Queue` argument forces the
+    /// caller's local to be addressable and it stops living in registers.
+    /// Here the caller is `queue_take`, which keeps its snapshot alive
+    /// across the call anyway, so there is no spill to pay for.
+    fn copy_data_from_queue(
+        &mut self,
+        queue: QueueHandle,
+        snapshot: &Queue,
+        peek: bool,
+    ) -> Result<u64> {
         if !snapshot.kind.carries_data() {
             if !peek {
                 let q = self.queues.resolve_mut(queue)?;
@@ -1017,11 +1058,12 @@ where
             .get(snapshot.base.saturating_add(next))
             .copied()
             .unwrap_or(0);
-        let q = self.queues.resolve_mut(queue)?;
-        if peek {
-            // `xQueuePeek` saves and restores `pcReadFrom`.
-            q.read_from = snapshot.read_from;
-        } else {
+        // `xQueuePeek` saves and restores `pcReadFrom` — which is to
+        // say it leaves it exactly as it found it. Writing it back stored
+        // the value already there, and the resolve that reached it was a
+        // whole handle validation for a no-op.
+        if !peek {
+            let q = self.queues.resolve_mut(queue)?;
             q.read_from = next;
             q.waiting = q.waiting.saturating_sub(1);
         }
