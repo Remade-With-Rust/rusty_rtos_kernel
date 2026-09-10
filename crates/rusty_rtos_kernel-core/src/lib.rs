@@ -49,12 +49,16 @@ pub mod name;
 pub mod proofs;
 pub mod queue;
 pub mod stream;
+pub mod system;
 pub mod timer;
 pub mod typed;
 
 pub use kernel::{Kernel, StartHandles, TaskState};
+// The macro-generated `build` names this bound, so it has to be
+// reachable from `$crate` at the call site.
 pub use name::{NAME_CAPACITY, Name};
 pub use queue::{Blocked, Kind as QueueKind, Position, Ready, Wait};
+pub use rusty_rtos_core::hooks::TickHook;
 
 /// Crate version, for manifests and logs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,6 +85,11 @@ pub const fn lists_for(max_priorities: u8, queues: usize, groups: usize) -> usiz
 /// The number of fixed lists that are not a ready list: the two delayed
 /// lists, pending-ready and suspended, and the two timer lists.
 pub const OVERHEAD_LISTS: usize = 6;
+
+/// The tasks a kernel creates for itself whatever the application asks
+/// for: `prvIdleTask` and the timer daemon. A system that declares `n`
+/// tasks needs room for `n + OVERHEAD_TASKS`.
+pub const OVERHEAD_TASKS: usize = 2;
 
 /// The names a scenario or a port wants in scope.
 pub mod prelude {
