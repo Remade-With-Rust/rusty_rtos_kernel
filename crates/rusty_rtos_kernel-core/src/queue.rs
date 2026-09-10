@@ -725,15 +725,16 @@ where
                 return Err(e);
             }
         };
-        // The wait frame is set only once the handle is known good, so a
-        // call with a handle that names nothing leaves the caller exactly
-        // as it found it. That is what `configASSERT( pxQueue )` means in
-        // the C, and it costs nothing here: the resolve was happening
-        // anyway, this only stops the frame being written before it.
-        if let Err(e) = self.begin_wait(caller, queue, ticks) {
-            self.exit_critical();
-            return Err(e);
-        }
+        // The wait frame is set where the C sets it: `xQueueReceive` and
+        // `xQueueGenericSend` call `vTaskInternalSetTimeOutState` only
+        // after finding the queue unusable AND the block time non-zero,
+        // guarded by `xEntryTimeSet`. Setting it up here instead meant
+        // every *successful* call wrote a six-field frame and then had
+        // `end_wait` wipe it on the way out.
+        //
+        // It also has to be after the resolve, so that a handle naming
+        // nothing leaves the caller exactly as it found it -- which is
+        // what `configASSERT( pxQueue )` means in the C.
         // `( uxMessagesWaiting < uxLength ) || ( xCopyPosition == queueOVERWRITE )`
         if snapshot.waiting < snapshot.length || position == Position::Overwrite {
             self.trace.note_exits(self.port.exits());
@@ -772,6 +773,10 @@ where
             self.exit_critical();
             self.end_wait(caller);
             return Ok(Ready(()));
+        }
+        if let Err(e) = self.begin_wait(caller, queue, ticks) {
+            self.exit_critical();
+            return Err(e);
         }
         if self.remaining_ticks(caller) == 0 {
             self.exit_critical();
@@ -918,15 +923,16 @@ where
                 return Err(e);
             }
         };
-        // The wait frame is set only once the handle is known good, so a
-        // call with a handle that names nothing leaves the caller exactly
-        // as it found it. That is what `configASSERT( pxQueue )` means in
-        // the C, and it costs nothing here: the resolve was happening
-        // anyway, this only stops the frame being written before it.
-        if let Err(e) = self.begin_wait(caller, queue, ticks) {
-            self.exit_critical();
-            return Err(e);
-        }
+        // The wait frame is set where the C sets it: `xQueueReceive` and
+        // `xQueueGenericSend` call `vTaskInternalSetTimeOutState` only
+        // after finding the queue unusable AND the block time non-zero,
+        // guarded by `xEntryTimeSet`. Setting it up here instead meant
+        // every *successful* call wrote a six-field frame and then had
+        // `end_wait` wipe it on the way out.
+        //
+        // It also has to be after the resolve, so that a handle naming
+        // nothing leaves the caller exactly as it found it -- which is
+        // what `configASSERT( pxQueue )` means in the C.
         if snapshot.waiting > 0 {
             let value = self.copy_data_from_queue(queue, &snapshot, peek)?;
             self.trace.note_exits(self.port.exits());
@@ -963,6 +969,10 @@ where
             self.exit_critical();
             self.end_wait(caller);
             return Ok(Ready(value));
+        }
+        if let Err(e) = self.begin_wait(caller, queue, ticks) {
+            self.exit_critical();
+            return Err(e);
         }
         if self.remaining_ticks(caller) == 0 {
             self.exit_critical();
@@ -1152,16 +1162,15 @@ where
     fn unlock_queue(&mut self, queue: QueueHandle) -> Result<()> {
         self.enter_critical();
         {
-            let mut tx_lock = self
+            // One resolve for both fields. They were two, and a resolve
+            // is a null test, a bounds check, a generation compare and an
+            // `Option` unwrap -- all of it repeated to reach the same slot.
+            let (mut tx_lock, container) = self
                 .queues
                 .resolve(queue)
-                .map(|q| q.tx_lock)
-                .unwrap_or(UNLOCKED);
-            let container = self
-                .queues
-                .resolve(queue)
-                .map(|q| q.set_container)
-                .unwrap_or(QueueHandle::NULL);
+                .map_or((UNLOCKED, QueueHandle::NULL), |q| {
+                    (q.tx_lock, q.set_container)
+                });
             while tx_lock > LOCKED_UNMODIFIED {
                 if container != QueueHandle::NULL {
                     if self.notify_queue_set_container(queue)? {
