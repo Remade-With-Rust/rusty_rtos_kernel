@@ -201,22 +201,31 @@ where
         Ok(self.buffers.resolve(buffer)?.spaces_available())
     }
 
-    /// `xStreamBufferIsEmpty`.
+    /// `xStreamBufferIsEmpty`: head and tail in the same place.
     ///
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn stream_buffer_is_empty(&self, buffer: StreamBufferHandle) -> Result<bool> {
-        Ok(self.buffers.resolve(buffer)?.bytes_in_buffer() == 0)
+        let b = self.buffers.resolve(buffer)?;
+        Ok(b.head == b.tail)
     }
 
-    /// `xStreamBufferIsFull`: true when one more trigger level would not
-    /// fit, which is the C's test and not the same as "no space at all".
+    /// `xStreamBufferIsFull`: no room for another message.
+    ///
+    /// For a message buffer "another message" means at least one more byte
+    /// than its length prefix, so a buffer with exactly a prefix's worth of
+    /// room left is already full. A stream buffer compares against zero.
     ///
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn stream_buffer_is_full(&self, buffer: StreamBufferHandle) -> Result<bool> {
         let b = self.buffers.resolve(buffer)?;
-        Ok(b.spaces_available() <= b.trigger.saturating_sub(1))
+        let prefix = if b.is_message {
+            Self::MESSAGE_LENGTH_BYTES
+        } else {
+            0
+        };
+        Ok(b.spaces_available() <= prefix)
     }
 
     /// `xStreamBufferSetTriggerLevel`.
