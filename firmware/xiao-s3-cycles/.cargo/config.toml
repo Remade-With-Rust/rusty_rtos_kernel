@@ -1,0 +1,14 @@
+# The Xtensa target has no prebuilt sysroot on the esp toolchain, so `core`
+# is built from source. No `alloc`: this cell allocates nothing.
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "link-arg=-nostartfiles",
+]
+
+[unstable]
+build-std = ["core"]

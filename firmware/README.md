@@ -19,6 +19,13 @@ Naming: `<board>-<demo>/`, for example `lm3s6965-qemu-flash/` or
 | ESP32-C6 / P4 | `esp-hal` + `rusty_rtos_port-riscv` | `riscv32imac-unknown-none-elf` / `riscv32imafc-unknown-none-elf` |
 | ESP32 / ESP32-S3 | `esp-hal` (esp toolchain) + `rusty_rtos_port-xtensa` | `xtensa-esp32-none-elf` / `xtensa-esp32s3-none-elf` |
 
+## The cells
+
+| cell | what it claims | needs |
+|---|---|---|
+| [`xiao-s3-signing`](xiao-s3-signing) | **what the kernel costs a real Janus workload**: a scheduling round is 8,313 ns / 1,995 cycles, 88 ppm of a P-256 signature (K5a) | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
+| [`xiao-s3-cycles`](xiao-s3-cycles) | **K3's cycle rows on silicon**: a tick is 131 cycles, a switch 623, an ISR wake 949 — `ccount` at one cycle of resolution, with the instrument's own tax measured and subtracted. No C arm: that half of the clause is blocked on ESP-IDF | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
+
 Rules:
 
 - Depend on this repo's crates by **path** (`../../crates/rusty_rtos_kernel`) inside a

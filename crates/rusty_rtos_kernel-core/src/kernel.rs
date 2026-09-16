@@ -46,6 +46,38 @@ use crate::{OVERHEAD_LISTS, items_for, lists_for};
 /// A trace line owed by a task that was switched out before it could
 /// emit one. Only the queue failure paths can owe one: they are the only
 /// places FreeRTOS traces *after* leaving a critical section.
+/// Why `vTaskSwitchContext` could not choose a task to run.
+///
+/// # Law 3: no silent failures
+///
+/// Every variant here was, until 2026-09-11, a bare `return` — the scheduler
+/// declining to switch and saying nothing. Three of them are impossible in a
+/// healthy kernel and the fourth is what the C asserts on
+/// (`configASSERT( uxTopPriority )`), so reaching any of them means an
+/// invariant has already broken somewhere else.
+///
+/// They cost a multi-flash hardware hunt on the day the Xtensa port first
+/// ran a stacked task: every ready list had emptied, the kernel kept
+/// quietly running whoever was current, and nothing said so. A counter and
+/// a reason turn that into one printed line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Stall {
+    /// The scheduler chose normally.
+    #[default]
+    None,
+    /// No ready task at ANY priority. The idle task keeps priority 0
+    /// non-empty, so reaching this means the idle task is gone — which is
+    /// exactly what `configASSERT( uxTopPriority )` fires on.
+    NoReadyTask,
+    /// A ready list refused to answer at all.
+    ListError,
+    /// The chosen priority's list had nothing to rotate to, having just
+    /// reported itself non-empty.
+    EmptyRotation,
+    /// The chosen list item named no live task.
+    UnknownTask,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwedTrace {
     /// Nothing owed.
@@ -71,6 +103,15 @@ pub(crate) enum OwedTrace {
         bits: u32,
         timed_out: bool,
     },
+    /// `prvAddNewTaskToReadyList`, the second half of `xTaskCreate`.
+    ///
+    /// A create costs three outermost exits before it reaches this — two
+    /// `pvPortMalloc`s and the port's `pthread_create` section — and a tick
+    /// can land on any of them. The C is a real thread, so it simply stops
+    /// there and the new task is not on a ready list until the creator runs
+    /// again. This is that pause, and it is the only owed item that is not
+    /// purely a trace line: it carries the ready-list insertion too.
+    AddNewTaskToReadyList { task: TaskHandle, priority: u8 },
 }
 
 /// `eTaskState`: what a task is doing, derived from the list it is in
@@ -271,6 +312,19 @@ pub struct Kernel<
     yield_pending: bool,
     /// `uxCurrentNumberOfTasks`.
     task_count: usize,
+    /// How many times the scheduler could not choose a task, and why the
+    /// FIRST time. See [`Stall`].
+    stalls: u32,
+    first_stall: Stall,
+    /// A task that deleted ITSELF and whose slot the idle task has not
+    /// reclaimed yet — the C's `xTasksWaitingTermination`, which only ever
+    /// holds the running task, because any other task is freed on the spot.
+    ///
+    /// One slot is enough, and that is a property rather than a guess: a
+    /// self-deleting task is off every ready list and yields immediately, so
+    /// a second self-delete cannot happen until a switch has occurred, and
+    /// the switch is where this is reaped.
+    awaiting_reap: Option<TaskHandle>,
     /// Which of the two delayed lists is `pxDelayedTaskList` right now.
     delayed_swapped: bool,
     /// `xNumOfOverflows`.
@@ -396,6 +450,9 @@ where
             next_unblock_time: Self::MAX_DELAY,
             yield_pending: false,
             task_count: 0,
+            stalls: 0,
+            first_stall: Stall::None,
+            awaiting_reap: None,
             delayed_swapped: false,
             overflows: 0,
             started: [false; TASKS],
@@ -547,6 +604,52 @@ where
         self.pended_ticks
     }
 
+    /// The item ids in `priority`'s ready list, in order, into `out`.
+    ///
+    /// Returns how many were written. The companion to
+    /// [`Kernel::ready_cursor`]: when a ready task is never chosen, the
+    /// cursor says whether the rotation moved and this says what it was
+    /// moving THROUGH.
+    pub fn ready_items(&self, priority: u8, out: &mut [u16]) -> usize {
+        let mut n = 0;
+        for item in self.lists.iter(Self::ready_list(priority)) {
+            let Some(slot) = out.get_mut(n) else {
+                break;
+            };
+            *slot = item;
+            n = n.saturating_add(1);
+        }
+        n
+    }
+
+    /// Where the round-robin cursor sits in `priority`'s ready list.
+    ///
+    /// A diagnostic, paired with [`Kernel::ready_len`]: a ready task that
+    /// is never chosen is either not in the list the scheduler looks at,
+    /// or the cursor is not moving. These two answer both halves.
+    #[must_use]
+    pub fn ready_cursor(&self, priority: u8) -> u16 {
+        self.lists
+            .cursor_of(Self::ready_list(priority))
+            .unwrap_or(0)
+    }
+
+    /// The live handle in arena slot `index`, if that slot holds a task.
+    ///
+    /// The generation is the point: a bare index names a SLOT, and a slot
+    /// outlives the tasks that occupy it, so an index is not a task. This
+    /// answers the handle, which is.
+    ///
+    /// It exists so a diagnostic can walk every task without knowing any
+    /// of their names -- `task_get_handle` needs the name it is looking
+    /// for, and a crash report is exactly the case where you do not have
+    /// one.
+    #[must_use]
+    pub fn task_at(&self, index: usize) -> Option<TaskHandle> {
+        let index = u16::try_from(index).ok()?;
+        self.tcbs.handle_at(index)
+    }
+
     /// A task's name.
     ///
     /// # Errors
@@ -657,6 +760,34 @@ where
         self.lists.len(Self::ready_list(priority))
     }
 
+    /// Record that the scheduler could not choose.
+    ///
+    /// Counts every occurrence and keeps the FIRST reason: the first is the
+    /// diagnosis and the rest are consequences.
+    fn note_stall(&mut self, why: Stall) {
+        self.stalls = self.stalls.saturating_add(1);
+        if self.first_stall == Stall::None {
+            self.first_stall = why;
+        }
+    }
+
+    /// How many times the scheduler could not choose a task.
+    ///
+    /// **Non-zero means an invariant broke.** A healthy kernel never stalls:
+    /// the idle task is always ready. A firmware that prints this alongside
+    /// its own counters turns a hang into a sentence.
+    #[must_use]
+    pub const fn stalls(&self) -> u32 {
+        self.stalls
+    }
+
+    /// Why the scheduler first failed to choose. [`Stall::None`] if it never
+    /// has.
+    #[must_use]
+    pub const fn first_stall(&self) -> Stall {
+        self.first_stall
+    }
+
     // ------------------------------------------------------------ tracing --
 
     pub(crate) fn trace_task<F>(&mut self, task: TaskHandle, make: F)
@@ -738,7 +869,23 @@ where
     pub(crate) fn port_yield(&mut self) {
         self.enter_critical();
         self.port.count_yield();
-        self.switch_context();
+        if P::COMMITS_SWITCH {
+            // A STACKED port. Raise its switching exception and leave
+            // `current` where it is: the exception will call
+            // `switch_context` itself, so the decision and the register
+            // swap happen together and nothing runs in between as a task
+            // the kernel has already moved on from.
+            //
+            // The exception cannot fire yet -- `exit_critical` below is
+            // what unmasks -- so the kernel is consistent at the moment it
+            // is taken.
+            self.port.yield_now();
+        } else {
+            // A STACKLESS kernel: moving `current` IS the switch, because
+            // no task owns a stack. This is the path every corpus
+            // architecture takes, and it is unchanged.
+            self.switch_context();
+        }
         self.exit_critical();
     }
 
@@ -755,8 +902,23 @@ where
     /// [`Error::Full`] when the task arena is full (the C
     /// `errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY`).
     pub fn create_task(&mut self, name: &str, priority: u8) -> Result<TaskHandle> {
+        let caller = self.current;
         // configASSERT( uxPriority < configMAX_PRIORITIES ), then C clamps.
         let priority = priority.min(C::MAX_PRIORITIES.saturating_sub(1));
+        // `prvCreateTask` takes the stack and then the TCB from the heap
+        // before anything is initialised — `portSTACK_GROWTH` is negative on
+        // the oracle's port, which fixes that order — and `pvPortMallocStack`
+        // *is* `pvPortMalloc` with the MPU wrappers off. On heap_3 each one
+        // suspends the scheduler, so a create costs two outermost exits.
+        //
+        // Every scenario before `death` created its tasks BEFORE
+        // `vTaskStartScheduler`, and the sim port counts no exits there (the
+        // C patch counts only on a FreeRTOS thread), so this cost was
+        // invisible to the whole corpus. `death` is the first scenario that
+        // creates a task with the scheduler running, and the first that can
+        // tell the difference.
+        self.account_for_allocation();
+        self.account_for_allocation();
         let tcb = Tcb {
             name: Name::new(name, C::MAX_TASK_NAME_LEN),
             priority,
@@ -784,6 +946,29 @@ where
         let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(priority));
         self.lists
             .set_value(Self::event_item(handle), event_value)?;
+        // `prvInitialiseNewTask` ends by calling `pxPortInitialiseStack`,
+        // which on the oracle's Posix port wraps `pthread_create` in a
+        // critical section — one more exit, and a PORT cost rather than a
+        // kernel one, which is why it has a flag of its own.
+        if C::PORT_STACK_INIT_CRITICAL {
+            self.enter_critical();
+            self.exit_critical();
+        }
+        // Any of the three exits above can release a tick that switches the
+        // creator out. In the C the creator is a thread and simply STOPS
+        // there: `prvAddNewTaskToReadyList` has not run, so the new task is
+        // on no ready list and `traceTASK_CREATE` has not fired. Running it
+        // now would put both events on the wrong side of the switch — which
+        // is precisely how `death` first diverged.
+        if self.current != caller {
+            if let Some(slot) = self.owed_trace.get_mut(usize::from(caller.index())) {
+                *slot = OwedTrace::AddNewTaskToReadyList {
+                    task: handle,
+                    priority,
+                };
+            }
+            return Ok(handle);
+        }
         self.add_new_task_to_ready_list(handle, priority)?;
         Ok(handle)
     }
@@ -890,19 +1075,27 @@ where
                     if top == 0 {
                         // The C `configASSERT( uxTopPriority )`. The idle
                         // task keeps priority 0 non-empty, so reaching here
-                        // means it is gone; keep the current task rather
-                        // than index out of range.
+                        // means it is gone. The kernel keeps the current
+                        // task rather than indexing out of range -- and now
+                        // SAYS so, because carrying on quietly is how this
+                        // costs an afternoon on a board.
+                        self.note_stall(Stall::NoReadyTask);
                         return;
                     }
                     top = top.saturating_sub(1);
                 }
-                Err(_) => return,
+                Err(_) => {
+                    self.note_stall(Stall::ListError);
+                    return;
+                }
             }
         }
         let Ok(Some(item)) = self.lists.next_round_robin(Self::ready_list(top)) else {
+            self.note_stall(Stall::EmptyRotation);
             return;
         };
         let Ok(next) = self.task_of_state_item(item) else {
+            self.note_stall(Stall::UnknownTask);
             return;
         };
         self.top_ready_priority = top;
@@ -1008,6 +1201,13 @@ where
                 );
                 return true;
             }
+            Some(OwedTrace::AddNewTaskToReadyList { task, priority }) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let _ = self.add_new_task_to_ready_list(task, priority);
+                return true;
+            }
             Some(OwedTrace::None) | None => {}
         }
         if self.owes_yield.get(index).copied() != Some(true) {
@@ -1077,7 +1277,11 @@ where
                         timed_out,
                     },
                 ),
-                OwedTrace::None => {}
+                // Not reachable through this function: `create_task` owes
+                // its second half directly, because that half is not a
+                // trace line — it inserts into a ready list — and it must
+                // run INSIDE the section this one has already left.
+                OwedTrace::AddNewTaskToReadyList { .. } | OwedTrace::None => {}
             }
             return;
         }
@@ -1566,6 +1770,65 @@ where
         Ok(cleared)
     }
 
+    /// `ulNotifiedValue[ index ]` for a task. `None` is the calling task.
+    ///
+    /// The C reaches this through `xTaskNotifyAndQuery`, which hands back
+    /// the value a notification is about to REPLACE, and through
+    /// `ulTaskNotifyValueClear`. Neither could be implemented without it:
+    /// `xTaskNotifyAndQuery` is `xTaskGenericNotify` with a
+    /// `pulPreviousNotificationValue` out-parameter, and `TaskNotify.c:373`
+    /// asserts on what comes back. The field existed; only the way to read
+    /// it was missing, which is the kind of gap a C ABI finds and a Rust
+    /// face never does.
+    ///
+    /// # Errors
+    /// `InvalidArgument` if `index` is outside the notification array, or
+    /// the resolve error if the handle is stale.
+    pub fn notify_value(&mut self, task: Option<TaskHandle>, index: usize) -> Result<u32> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let target = task.unwrap_or(self.current);
+        self.enter_critical();
+        let value = self
+            .tcbs
+            .resolve(target)
+            .map(|tcb| tcb.notified.get(index).copied().unwrap_or(0));
+        self.exit_critical();
+        value
+    }
+
+    /// `ulTaskGenericNotifyValueClear`: clear `bits` in the task's
+    /// notification value and answer what it was BEFORE the clear.
+    ///
+    /// # Errors
+    /// As [`Kernel::notify_value`].
+    pub fn notify_value_clear(
+        &mut self,
+        task: Option<TaskHandle>,
+        index: usize,
+        bits: u32,
+    ) -> Result<u32> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let target = task.unwrap_or(self.current);
+        self.enter_critical();
+        let before = match self.tcbs.resolve_mut(target) {
+            Ok(tcb) => match tcb.notified.get_mut(index) {
+                Some(slot) => {
+                    let was = *slot;
+                    *slot &= !bits;
+                    Ok(was)
+                }
+                None => Err(Error::InvalidArgument),
+            },
+            Err(e) => Err(e),
+        };
+        self.exit_critical();
+        before
+    }
+
     /// Whether `task` is part-way through a notification wait — it blocked
     /// once and has not yet run the half of `xTaskGenericNotifyWait` that
     /// happens when a task wakes.
@@ -1885,6 +2148,32 @@ where
                 let _ = self.lists.remove(event);
             }
             self.lists.insert_end(Self::suspended_list(), item)?;
+            // `vTaskSuspend`, `tasks.c`:
+            //
+            // ```c
+            // if( pxTCB->ucNotifyState[ x ] == taskWAITING_NOTIFICATION )
+            // {
+            //     /* The task was blocked to wait for a notification, but
+            //      * is now suspended, so no notification was received. */
+            //     pxTCB->ucNotifyState[ x ] = taskNOT_WAITING_NOTIFICATION;
+            // }
+            // ```
+            //
+            // Not tidying: `eTaskGetState` calls a task on the suspended
+            // list BLOCKED rather than SUSPENDED if any of its notification
+            // slots is still waiting, so leaving the flag set makes a
+            // suspended task report as blocked for ever.
+            // `TaskNotify.c:498` asserts exactly that, in a timer callback
+            // that suspends a task which is waiting for a notification --
+            // and a task that reports the wrong state there is a task the
+            // rest of that test never resumes correctly.
+            if let Ok(tcb) = self.tcbs.resolve_mut(target) {
+                for slot in &mut tcb.notify_state {
+                    if *slot == NotifyState::Waiting {
+                        *slot = NotifyState::NotWaiting;
+                    }
+                }
+            }
         }
         self.exit_critical();
         // A second, separate critical section — two outermost exits, which
@@ -1954,7 +2243,144 @@ where
 
     // -------------------------------------------------------- priorities --
 
-    /// `vTaskPrioritySet`. `None` is the calling task.
+    /// `vTaskDelete`. `None` deletes the calling task.
+    ///
+    /// # Two paths, and the C picks between them for a reason
+    ///
+    /// Deleting *another* task frees its TCB on the spot. Deleting the
+    /// **running** task cannot: the caller is still executing out of it. The
+    /// C parks such a task on `xTasksWaitingTermination` and lets the idle
+    /// task reclaim it, which is what `prvCheckTasksWaitingTermination` is
+    /// for — so [`Kernel::check_tasks_waiting_termination`] is where the
+    /// deferred half lands here, called from the idle body at the same point
+    /// in the same loop.
+    ///
+    /// # The frees are outside the critical section, and they cost exits
+    ///
+    /// `prvDeleteTCB` runs **after** `taskEXIT_CRITICAL()` and frees twice —
+    /// `vPortFreeStack( pxStack )` then `vPortFree( pxTCB )`. On the oracle's
+    /// heap every free suspends the scheduler, so a delete is one exit for
+    /// its own section plus two for the frees, in that order. Folding the
+    /// frees into the section, or forgetting them, moves every later tick.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn task_delete(&mut self, task: Option<TaskHandle>) -> Result<()> {
+        // `prvGetTCBFromHandle`: NULL is the calling task.
+        let target = task.unwrap_or(self.current);
+        self.tcbs.resolve(target)?;
+
+        self.enter_critical();
+        // `uxListRemove( &( pxTCB->xStateListItem ) )`. The C follows this
+        // with `taskRESET_READY_PRIORITY`, which is an EMPTY MACRO under the
+        // oracle's `configUSE_PORT_OPTIMISED_TASK_SELECTION 0` — there is no
+        // priority bitmap to clear, and `vTaskSwitchContext` rediscovers the
+        // top priority by walking down. Nothing to model.
+        let state = Self::state_item(target);
+        if matches!(self.lists.container(state), Ok(Some(_))) {
+            let _ = self.lists.remove(state);
+        }
+        // `if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )`
+        // — a task blocked on a queue is on two lists, and both must let go.
+        let event = Self::event_item(target);
+        if matches!(self.lists.container(event), Ok(Some(_))) {
+            let _ = self.lists.remove(event);
+        }
+        // `uxTaskNumber++` is not modelled: it exists so kernel-aware
+        // debuggers can tell the task lists changed, and nothing the trace
+        // records reads it.
+
+        // `xSchedulerRunning != pdFALSE && taskTASK_IS_RUNNING_OR_SCHEDULED_
+        // _TO_YIELD( pxTCB )`, which at `configNUMBER_OF_CORES 1` is exactly
+        // `pxTCB == pxCurrentTCB`.
+        let defer = self.running && target == self.current;
+        if defer {
+            // `vListInsertEnd( &xTasksWaitingTermination, ... )` and
+            // `++uxDeletedTasksWaitingCleanUp`. The count is NOT decremented
+            // here — the idle task does that when it reaps.
+            self.awaiting_reap = Some(target);
+            self.trace_task(target, |task, name| Event::TaskDelete { task, name });
+        } else {
+            self.task_count = self.task_count.saturating_sub(1);
+            self.trace_task(target, |task, name| Event::TaskDelete { task, name });
+            self.reset_next_task_unblock_time();
+        }
+        self.exit_critical();
+
+        // `if( xDeleteTCBInIdleTask != pdTRUE ) { prvDeleteTCB( pxTCB ); }`,
+        // outside the section.
+        if !defer {
+            self.delete_tcb(target);
+        }
+
+        // `taskYIELD_WITHIN_API()`. The C guards this with
+        // `xSchedulerRunning && pxTCB == pxCurrentTCB`, which is the same
+        // condition that chose the deferred path.
+        if defer {
+            self.port_yield();
+        }
+        Ok(())
+    }
+
+    /// `prvDeleteTCB`: two frees, and on the oracle's heap each one suspends
+    /// the scheduler, so each is one outermost exit.
+    fn delete_tcb(&mut self, task: TaskHandle) {
+        // `vPortFreeStack( pxTCB->pxStack )`.
+        self.account_for_allocation();
+        // `vPortFree( pxTCB )`.
+        self.account_for_allocation();
+        let _ = self.tcbs.remove(task);
+
+        // The index is now free for reuse, so mark the task UNSTARTED.
+        //
+        // The C frees the TCB and a later `xTaskCreate` gets fresh memory,
+        // so a new task cannot inherit anything. Our arena hands back the
+        // same index, and the per-index bookkeeping — owed exits, an owed
+        // yield, an owed trace line — is keyed on that index, not on the
+        // TCB. Without this a task deleted while it still owed the tail of
+        // a call bequeaths that debt to its successor, and the successor
+        // pays an exit it never incurred: exactly how `death`'s second
+        // cycle first diverged, one exit early, 1,100 lines after the first
+        // cycle had matched perfectly.
+        //
+        // Clearing this ONE flag is the whole fix, and deliberately so.
+        // `hand_over` already empties all three of those on a task's first
+        // switch-in, and a reused index is a first switch-in again. Zeroing
+        // them here as well would work and would be worse: two places that
+        // must agree about what a fresh task owes, and a gate that cannot
+        // catch either one being dropped because the other still covers it.
+        if let Some(slot) = self.started.get_mut(usize::from(task.index())) {
+            *slot = false;
+        }
+    }
+
+    /// `prvCheckTasksWaitingTermination`, called from the idle task.
+    ///
+    /// # This must cost NOTHING when nothing is pending
+    ///
+    /// The C's body is `while( uxDeletedTasksWaitingCleanUp > 0 )`, so an
+    /// idle loop with no deleted task takes no critical section and pays no
+    /// exit. That is what lets this be wired into the idle body without
+    /// disturbing a single scenario in the corpus — and it is the property
+    /// the corpus is checking when it stays byte-identical.
+    ///
+    /// At most one task can be pending: only the *running* task defers, and
+    /// it yields before it can return, so a second deferred delete cannot
+    /// happen until this has run.
+    pub fn check_tasks_waiting_termination(&mut self) {
+        let Some(task) = self.awaiting_reap else {
+            return;
+        };
+        // The C takes the section per reaped task, decrements both counts
+        // inside it, and calls `prvDeleteTCB` outside.
+        self.enter_critical();
+        self.awaiting_reap = None;
+        self.task_count = self.task_count.saturating_sub(1);
+        self.exit_critical();
+        self.delete_tcb(task);
+    }
+
+    /// `vTaskPrioritySet`. `None` is the calling task.    /// `vTaskPrioritySet`. `None` is the calling task.
     ///
     /// # Errors
     /// [`Error::Gone`] for a stale handle.

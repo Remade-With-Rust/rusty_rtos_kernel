@@ -53,7 +53,7 @@ pub mod system;
 pub mod timer;
 pub mod typed;
 
-pub use kernel::{Kernel, StartHandles, TaskState};
+pub use kernel::{Kernel, Stall, StartHandles, TaskState};
 // The macro-generated `build` names this bound, so it has to be
 // reachable from `$crate` at the call site.
 pub use name::{NAME_CAPACITY, Name};

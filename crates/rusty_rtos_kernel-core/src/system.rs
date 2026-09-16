@@ -361,6 +361,49 @@ mod tests {
         fn set_in_tick_entry(&self, _yes: bool) {}
     }
 
+    /// A [`TestPort`] that COUNTS the switches it was asked for.
+    ///
+    /// `TestPort::yield_now` is empty, which is right for tests about what
+    /// the kernel computes and useless for a test about whether it asked
+    /// for a switch at all. Those are different questions and the second
+    /// one has no other instrument.
+    #[derive(Debug, Default)]
+    pub struct CountingPort {
+        nesting: core::cell::Cell<u32>,
+        yields: core::cell::Cell<u32>,
+    }
+
+    impl Port for CountingPort {
+        /// Count the kernel ASKING for a switch, not one style of taking it.
+        ///
+        /// The first version of this counted `yield_now`, and measured the
+        /// wrong thing: `Port::COMMITS_SWITCH` defaults to `false`, so
+        /// `port_yield` calls `switch_context` itself and never reaches
+        /// `yield_now` at all. The test read zero and looked like a kernel
+        /// defect. `count_yield` is on the unconditional path, so it
+        /// answers "did the kernel decide a switch was needed" whichever
+        /// way the port takes it — which is the question.
+        fn count_yield(&self) {
+            self.yields.set(self.yields.get().saturating_add(1));
+        }
+        fn yield_now(&self) {}
+        fn yield_from_isr(&self, _woken: Woken) {}
+        fn enter_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_add(1));
+        }
+        fn exit_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_sub(1));
+        }
+        fn set_interrupt_mask_from_isr(&self) -> u32 {
+            0
+        }
+        fn clear_interrupt_mask_from_isr(&self, _saved: u32) {}
+        fn in_isr(&self) -> bool {
+            false
+        }
+        fn set_in_tick_entry(&self, _yes: bool) {}
+    }
+
     #[derive(Debug, Default)]
     pub struct NoTrace;
 
@@ -381,6 +424,237 @@ mod tests {
 
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// `configUSE_TIME_SLICING`: two READY tasks of the same priority
+    /// must take turns.
+    ///
+    /// Fixed priority says what happens between DIFFERENT priorities and
+    /// nothing at all about two tasks at the same one. The C fills that in
+    /// twice over: `xTaskIncrementTick` asks for a switch whenever more
+    /// than one task is ready at the running task's priority, and
+    /// `taskSELECT_HIGHEST_PRIORITY_TASK` then takes the NEXT entry rather
+    /// than the head.
+    ///
+    /// Without it a task that never blocks starves its equal-priority
+    /// peers completely — not slowly, completely — and the failure looks
+    /// like somebody else's demo being broken. `rusty_rtos-capi`'s host
+    /// cell found it that way: two demo files whose tasks sit at the same
+    /// priority, one of them getting 13.5 million turns and the other
+    /// ZERO.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct SliceConfig;
+
+    impl Config for SliceConfig {
+        type Tick = Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        // The daemon sits BELOW the two tasks under test. Nothing drives
+        // it here, so at its usual priority it would simply be the current
+        // task for ever and the test would measure the daemon.
+        const TIMER_TASK_PRIORITY: u8 = 0;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        // The point of this config: the default, stated out loud.
+        const USE_TIME_SLICING: bool = true;
+        const USE_PREEMPTION: bool = true;
+    }
+
+    /// Built from the const generics directly rather than through
+    /// `system!`, because that macro declares its tasks for you and this
+    /// test needs to create them itself.
+    type SliceKernel = crate::Kernel<
+        SliceConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        5,
+        { crate::items_for(5, 1) },
+        { crate::lists_for(SliceConfig::MAX_PRIORITIES, 1, 1) },
+        1,
+        1,
+        1,
+        8,
+        1,
+        1,
+    >;
+
+    /// The same declaration driven by a port that COUNTS switch requests,
+    /// with room for a queue of our own beside the timer daemon's.
+    ///
+    /// `QUEUES` is 2 and `SLOTS` 8 for exactly that reason: the timer queue
+    /// is created by `Kernel::new` and takes the first of each, so a test
+    /// that makes its own queue needs the second.
+    type CountingKernel = crate::Kernel<
+        SliceConfig,
+        CountingPort,
+        NoTrace,
+        NoTickHook,
+        5,
+        { crate::items_for(5, 1) },
+        { crate::lists_for(SliceConfig::MAX_PRIORITIES, 2, 1) },
+        2,
+        8,
+        1,
+        8,
+        1,
+        1,
+    >;
+
+    /// Tick a kernel whose two equal-priority tasks never block, and count
+    /// how many ticks each of them was the current task for.
+    fn turns_over(ticks: u32) -> (u32, u32) {
+        let mut k =
+            SliceKernel::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let a = k.create_task("a", 2).expect("task a");
+        let b = k.create_task("b", 2).expect("task b");
+        k.start_scheduler().expect("start");
+
+        let (mut for_a, mut for_b) = (0u32, 0u32);
+        for _ in 0..ticks {
+            if k.increment_tick() {
+                k.switch_context();
+            }
+            let now = k.current();
+            if now == a {
+                for_a = for_a.saturating_add(1);
+            } else if now == b {
+                for_b = for_b.saturating_add(1);
+            }
+        }
+        (for_a, for_b)
+    }
+
+    // A third test belongs here and is not written yet: equal-priority
+    // rotation with a HIGHER-priority task cutting in between selections,
+    // which is the shape every real system has. Two attempts at it were
+    // withdrawn because they measured their own call pattern rather than
+    // the scheduler -- `delay` yields as part of its contract, so a loop
+    // that calls `delay` and then `switch_context` makes two selections
+    // and can only sample after the second.
+    //
+    // What is known: driven directly, `switch_context` alternates
+    // correctly between two equal-priority tasks with a third cutting in
+    // (observed at the list, cursor 0 -> 1 -> 0). What is not known is why
+    // `rusty_rtos_port/firmware/host-kernel` sees one of a pair get ZERO
+    // turns in exactly that shape. That cell fails today and is the live
+    // reproduction; this is the note that says so rather than a test that
+    // asserts something unproven.
+
+    #[test]
+    fn two_ready_tasks_of_equal_priority_take_turns() {
+        let (a, b) = turns_over(200);
+        assert!(a > 0, "task a never ran: {a} vs {b}");
+        assert!(b > 0, "task b never ran: {a} vs {b}");
+    }
+
+    /// `queueYIELD_IF_USING_PREEMPTION`: a send that readies a
+    /// HIGHER-priority receiver must ask for a switch.
+    ///
+    /// This is the whole of `TimerDemo.c:469`, with no C anywhere near it.
+    /// That demo stops a timer and asserts on the next line that the timer
+    /// is inactive, and its own comment says why it may: "this will appear
+    /// to happen immediately to this task because this task is running at
+    /// a priority below the timer service task". `xTimerStop` is a send to
+    /// the daemon's queue, so the assertion is really this test.
+    ///
+    /// It has two halves and the second is the one that bites. A send must
+    /// ask for a switch when it wakes a higher-priority receiver — AND the
+    /// receiver has to be WAITING ON THE QUEUE for there to be anything to
+    /// wake. A daemon that polls its queue with a zero block time is
+    /// parked nowhere, so the send finds no waiter, asks for nothing, and
+    /// being higher priority buys it precisely nothing. Both halves are
+    /// asserted below, because the first one passing is what makes the
+    /// second one's absence invisible.
+    #[test]
+    fn a_send_that_wakes_a_higher_priority_receiver_asks_for_a_switch() {
+        let mut k = CountingKernel::new(CountingPort::default(), NoTrace)
+            .expect("the declared geometry adds up");
+        let hi = k.create_task("hi", 2).expect("task hi");
+        let lo = k.create_task("lo", 1).expect("task lo");
+        let q = k.queue_create(4).expect("a queue");
+        k.start_scheduler().expect("start");
+
+        // The high-priority task waits ON the queue, which is what makes
+        // it a waiter rather than merely a ready task of higher priority.
+        assert_eq!(k.current(), hi, "the higher priority task runs first");
+        assert!(
+            matches!(k.queue_receive(q, 100), Ok(crate::queue::Wait::Blocked)),
+            "an empty queue with a block time must park the receiver"
+        );
+        k.switch_context();
+        assert_eq!(k.current(), lo, "with hi parked, lo runs");
+
+        // Now the send, from the LOWER-priority task.
+        let before = k.port().yields.get();
+        assert!(matches!(
+            k.queue_send(q, 7, 0),
+            Ok(crate::queue::Wait::Ready(()))
+        ));
+        let asked = k.port().yields.get().saturating_sub(before);
+        assert_eq!(
+            asked, 1,
+            "a send that readies a higher-priority receiver must ask for a switch"
+        );
+    }
+
+    /// The other half: a receiver that did NOT wait cannot be woken, so
+    /// the send asks for nothing — which is correct, and is exactly the
+    /// trap a polling daemon falls into.
+    ///
+    /// Recorded as an assertion rather than a comment because it is the
+    /// behaviour a reader will otherwise call a bug in the send path,
+    /// having found the send not yielding. The send is right; the caller
+    /// that polls instead of waiting is wrong.
+    #[test]
+    fn a_send_asks_for_nothing_when_the_higher_priority_task_never_waited() {
+        let mut k = CountingKernel::new(CountingPort::default(), NoTrace)
+            .expect("the declared geometry adds up");
+        let _hi = k.create_task("hi", 2).expect("task hi");
+        let _lo = k.create_task("lo", 1).expect("task lo");
+        let q = k.queue_create(4).expect("a queue");
+        k.start_scheduler().expect("start");
+
+        // `hi` polls. A zero block time on an empty queue is `Empty`, NOT
+        // `Blocked` — and the difference is the whole point: `Blocked`
+        // means "I have been parked and will be woken", `Empty` means
+        // "there was nothing there and I was not parked". A poller gets
+        // the second, so there is nothing for a later send to wake.
+        assert!(
+            matches!(
+                k.queue_receive(q, 0),
+                Err(rusty_rtos_core::error::Error::Empty)
+            ),
+            "a zero-wait receive on an empty queue reports Empty, not Blocked"
+        );
+        k.switch_context();
+
+        let before = k.port().yields.get();
+        assert!(matches!(
+            k.queue_send(q, 7, 0),
+            Ok(crate::queue::Wait::Ready(()))
+        ));
+        assert_eq!(
+            k.port().yields.get(),
+            before,
+            "there was no waiter to wake, so nothing should have been asked for"
+        );
+    }
+
+    #[test]
+    fn neither_equal_priority_task_starves_the_other() {
+        let (a, b) = turns_over(200);
+        // A round robin gives them one tick each in turn. Allowing a 4x
+        // imbalance is generous; a scheduler that never rotates gives one
+        // of them zero, which is what this is here to catch.
+        let (lo, hi) = (a.min(b), a.max(b));
+        assert!(
+            lo.saturating_mul(4) >= hi,
+            "one starved the other: {a} against {b}"
+        );
     }
 
     /// **The geometry is the declaration**, arithmetic and all.

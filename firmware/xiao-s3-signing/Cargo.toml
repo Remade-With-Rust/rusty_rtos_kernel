@@ -1,0 +1,39 @@
+# A firmware example, so its own cargo project and its own workspace.
+[package]
+name = "xiao-s3-signing"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The thing under test, by path. No default features: no_std, no allocator.
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+
+# The workload, and it is NOT ours: the same crate and the same major
+# version `rusty_esp_mid-core` signs with, so the curve arithmetic under
+# measurement is the one the Janus baseline measured.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+
+esp-hal = { version = "=1.2.1", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32s3"] }
+esp-println = { version = "=0.18.0", default-features = false, features = [
+    "esp32s3",
+    "jtag-serial",
+] }
+esp-backtrace = { version = "=0.20.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
+[workspace]

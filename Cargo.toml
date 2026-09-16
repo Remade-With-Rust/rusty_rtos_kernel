@@ -45,7 +45,7 @@ rusty_rtos_kernel-core = { path = "crates/rusty_rtos_kernel-core", version = "0.
 # its own. Inside the Kairos umbrella folder `kairos patches` writes a
 # `.cargo/config.toml` that patches the URL to the sibling checkout, so local
 # edits are visible without a push.
-rusty_rtos_core = { version = "0.1.0", git = "https://github.com/Remade-With-Rust/rusty_rtos_core", default-features = false }
+rusty_rtos_core = { version = "0.1.0", default-features = false }
 
 [profile.release]
 # use-protection-please H-05: overflow checks stay on in release; LTO and

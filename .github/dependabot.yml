@@ -1,0 +1,25 @@
+# Dependency freshness, human-in-the-loop (hardening gate H-14).
+#
+# Weekly, and it opens a PR rather than pushing: every Kairos package pins its
+# house dependencies EXACTLY on purpose, and several pins carry a reason in the
+# manifest beside them. An automatic merge would discard that reasoning, so the
+# bot's job is to tell us a pin has moved and a human's job is to decide.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    # A sibling's version is decided by the release, not by a bot.
+    ignore:
+      - dependency-name: "rusty_rtos*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

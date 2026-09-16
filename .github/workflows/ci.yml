@@ -7,15 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Sibling Kairos repos are consumed by git URL and are PRIVATE until each is
-  # market-ready. Cargo fetches them through the git CLI, which honours the
-  # token rewrite below. Set the repository secret KAIROS_GIT_TOKEN to a
-  # fine-grained PAT (or GitHub App token) with read access to the siblings;
-  # `kairos secrets` fans it out. Without it every job that fetches a private
-  # sibling is red — a conditional auth step that silently skips is a red CI
-  # that looks like flakiness, so the step names itself in the log.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  KAIROS_GIT_TOKEN: ${{ secrets.KAIROS_GIT_TOKEN }}
+  # No token, and that is the point.
+  #
+  # Sibling Kairos crates used to be consumed by git URL from PRIVATE repos, so
+  # every job needed a PAT to fetch them. They are crates.io versions now --
+  # `cargo publish` refuses a git dependency -- so there is nothing private to
+  # fetch and nothing to authorise. The mission plan's §2.11 bar asks for "CI
+  # green without a token"; this is what makes that true rather than aspirational.
 
 jobs:
   host:
@@ -27,10 +25,6 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Authorise private sibling fetches
-        if: ${{ env.KAIROS_GIT_TOKEN != '' }}
-        shell: bash
-        run: git config --global url."https://x-access-token:${KAIROS_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -43,10 +37,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Authorise private sibling fetches
-        if: ${{ env.KAIROS_GIT_TOKEN != '' }}
-        shell: bash
-        run: git config --global url."https://x-access-token:${KAIROS_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-deny
       # The permissive-only, no-C posture deny.toml states, checked on every
@@ -66,10 +56,6 @@ jobs:
           - riscv32imafc-unknown-none-elf   # ESP32-P4 class
     steps:
       - uses: actions/checkout@v4
-      - name: Authorise private sibling fetches
-        if: ${{ env.KAIROS_GIT_TOKEN != '' }}
-        shell: bash
-        run: git config --global url."https://x-access-token:${KAIROS_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

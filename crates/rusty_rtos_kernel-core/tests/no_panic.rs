@@ -486,7 +486,7 @@ fn hammer(seed: u64, calls: u32) -> Worked {
                 let _ = k.event_group_delete(group);
             }
             _ => {
-                let _ = k.process_one_timer_command();
+                let _ = k.process_one_timer_command(0);
             }
         }
 

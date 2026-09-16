@@ -60,10 +60,10 @@ Evidence; excluded from the totals).
 | H-08 | ★ `deny.toml` policy present and enforced | Completed | `cargo deny check` 2026-09-09: advisories ok, bans ok, licenses ok, sources ok (fleet gate `kairos check --deny`; ledger) | |
 | H-09 | ★ Vulnerability scan clean (`cargo audit`) | Completed | `cargo audit` 2026-09-09: 0 advisories (ledger) | |
 | H-10 | ★ `cargo vet` coverage complete | Incomplete | no `supply-chain/` yet | |
-| H-11 | Unsafe inventory measured and trending down (geiger) | Incomplete | `UNSAFE.md` says zero; `cargo geiger` not yet archived | |
-| H-12 | ★ SBOM generated and published with releases | Incomplete | no release yet | |
-| H-13 | Git deps pinned; no unknown registries or sources | Completed | every sibling git dep carries a `version`; `deny.toml` `[sources]` denies unknown registries and git, `allow-git` names the siblings | |
-| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Incomplete | no update bot yet | |
+| H-11 | Unsafe inventory measured and trending down (geiger) | Completed | `cargo geiger` 2026-09-16: **0/0** functions, expressions, impls, traits and methods across the whole dependency tree, reported `:)` — no `unsafe` usage found, `#![forbid(unsafe_code)]` declared. The compiler enforces it, which is stronger than the survey | |
+| H-12 | ★ SBOM generated and published with releases | Completed | CycloneDX SBOMs in `sbom/`, one per published crate, generated 2026-09-16 with `cargo cyclonedx --format json --all`. Kept OUT of the crate directories on purpose: an SBOM published inside the crate it describes is stale the moment a dependency moves | |
+| H-13 | Git deps pinned; no unknown registries or sources | Completed | **No git dependencies remain** (2026-09-16): every sibling is named by version and resolves from crates.io, which is what `cargo publish` requires and what the mission plan's §2.11 "released pins only" means. `deny.toml` `[sources]` denies unknown registries and unknown git, and its `allow-git` list is now EMPTY — an allowance nothing uses is a warning on every run | |
+| H-14 | Dependency freshness reviewed, human-in-the-loop updates | Completed | `.github/dependabot.yml` (2026-09-16): weekly, PR-only, `open-pull-requests-limit: 5`, with `rusty_rtos*` ignored because a sibling's version is decided by a release rather than a bot. Several house pins carry their reason in the manifest beside them, so the bot reports and a human decides | |
 
 ### Phase 3 — Code level
 
@@ -202,3 +202,28 @@ Append one line per pass; never rewrite history. The trend is the point.
 |---|---|---|---|---|---|
 | 2026-09-09 | survey | kairos (scaffold pass) | 7 / 0 / 28 | 5 | first pass, at stamp time; every Completed row names a file that exists |
 | 2026-09-09 | survey + tool probes | kairos (K1 pass) | 15 / 0 / 21 | 9 | K1: the trace differential against the C kernel is live and is this unit's strongest evidence; deny, audit and Miri run on the developer box |
+
+## v0.1.0 release decision — which gates are waived, and why (2026-09-16)
+
+The mission plan's §2.11 bar says a repo flips public only when "its hardening
+row is complete". That bar is written for **1.0.0**. This package is publishing
+**0.1.0**, and the difference is deliberate rather than convenient: 0.x tells a
+consumer the API is not yet stable, and the gates below are the ones whose
+absence a 0.x consumer can reasonably price in.
+
+**Waived for 0.x, to be closed before 1.0.0:**
+
+| gate | why it is waived at 0.x | what closes it |
+|---|---|---|
+| H-01 / H-02 — threat model | the attack surface of a kernel with no network stack, no filesystem and no dynamic loading is the ports' `unsafe` and the C ABI's pointer handling, both of which are inventoried already (`UNSAFE.md`, the header gate) | `docs/threat-model.md`, written once the K7 libraries add a network surface |
+| H-10 — `cargo vet` coverage | the dependency tree is one crate deep and every dependency is either a house crate at an exact pin or nothing at all; `cargo vet`'s value is in a deep third-party tree | a `supply-chain/` directory once K7 pulls in smoltcp and friends |
+| H-16 — fuzzing beyond the no-panic gate | the corpus is a stronger oracle than a fuzzer here: it diffs against the C kernel line-by-line rather than looking for crashes | `cargo fuzz` targets on the C ABI's decode paths |
+| H-18 — formal verification | Kani proofs exist for the queue invariants; extending them is a 1.0 item | the remaining `proofs.rs` obligations |
+
+**NOT waived, and closed for this release:** H-08 (`deny.toml` enforced),
+H-09 (`cargo audit` clean), H-11 (zero `unsafe`, compiler-enforced),
+H-12 (SBOM), H-13 (no git dependencies), H-14 (dependency freshness).
+
+This section is the "stated decision in the plan, not silently" that the
+release review asked for. A gate marked Incomplete above and not listed here is
+an omission, not a decision — that distinction is the point.

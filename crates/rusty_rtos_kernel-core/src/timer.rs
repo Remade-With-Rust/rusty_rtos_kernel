@@ -862,10 +862,32 @@ where
     /// one and says whether there is more, because a callback in the middle
     /// of that loop can block and the daemon has to be able to come back.
     ///
+    /// # The block time is not a convenience
+    ///
+    /// `ticks` is how long the daemon is willing to WAIT on the queue, and
+    /// passing zero has a consequence beyond promptness: a daemon that
+    /// polls is never on the queue's receive list, so a task posting a
+    /// command finds no waiter to remove and `queue_send_generic` does not
+    /// call `port_yield`. The daemon is higher priority and still does not
+    /// run, because nothing asked for a switch.
+    ///
+    /// That is visible from the C. `TimerDemo.c` stops a timer and asserts
+    /// on the next line that it is inactive, and its comment says it may:
+    /// "this will appear to happen immediately to this task because this
+    /// task is running at a priority below the timer service task". With a
+    /// polling daemon the assertion fails, and nothing else in the corpus
+    /// notices.
+    ///
+    /// So a caller acting as the daemon should pass what
+    /// `prvProcessTimerOrBlockTask` computes — the time to the next expiry,
+    /// or the maximum delay when no timer is active. Zero is correct only
+    /// for a caller that is draining the queue rather than serving it, such
+    /// as a trace-exact state machine that schedules the wait itself.
+    ///
     /// # Errors
     /// As the queue receive.
-    pub fn process_one_timer_command(&mut self) -> Result<Wait<bool>> {
-        let slot = match self.queue_receive(self.timer_queue, 0) {
+    pub fn process_one_timer_command(&mut self, ticks: u64) -> Result<Wait<bool>> {
+        let slot = match self.queue_receive(self.timer_queue, ticks) {
             Ok(Ready(slot)) => slot,
             Ok(Wait::Blocked) => return Ok(Wait::Blocked),
             Err(_) => return Ok(Ready(false)),

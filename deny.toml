@@ -47,4 +47,4 @@ unknown-git = "deny"
 # A house crate taken by git URL (thoth by tag, rusty_json_turbo, remade_ffmpeg_rs)
 # is added here with its URL when it is added to a manifest, never ahead of it:
 # an allow-git entry nothing uses is a cargo-deny warning on every run.
-allow-git = ["https://github.com/Remade-With-Rust/rusty_rtos_core"]
+allow-git = []

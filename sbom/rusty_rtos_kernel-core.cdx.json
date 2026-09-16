@@ -1,0 +1,107 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.3",
+  "version": 1,
+  "serialNumber": "urn:uuid:a1881d68-5eff-4f85-8766-c79cd0f35691",
+  "metadata": {
+    "timestamp": "2026-09-16T12:18:51.113524400Z",
+    "tools": [
+      {
+        "vendor": "CycloneDX",
+        "name": "cargo-cyclonedx",
+        "version": "0.5.9"
+      }
+    ],
+    "authors": [
+      {
+        "name": "Remade With Rust"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "path+file:///F:/coding/rusty_RTOS/rusty_rtos_kernel/crates/rusty_rtos_kernel-core#0.1.0",
+      "author": "Remade With Rust",
+      "name": "rusty_rtos_kernel-core",
+      "version": "0.1.0",
+      "description": "The pure no_std core of rusty_rtos_kernel: types, traits and algorithms with no CPU, no allocator and no operating system. forbid(unsafe).",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rusty_rtos_kernel-core@0.1.0?download_url=file://.",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/rusty_rtos_kernel-core"
+        },
+        {
+          "type": "website",
+          "url": "https://www.mata.network/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/Remade-With-Rust/rusty_rtos_kernel"
+        }
+      ],
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "path+file:///F:/coding/rusty_RTOS/rusty_rtos_kernel/crates/rusty_rtos_kernel-core#0.1.0 bin-target-0",
+          "name": "rusty_rtos_kernel_core",
+          "version": "0.1.0",
+          "purl": "pkg:cargo/rusty_rtos_kernel-core@0.1.0?download_url=file://.#src/lib.rs"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "cdx:rustc:sbom:target:triple",
+        "value": "x86_64-pc-windows-msvc"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "path+file:///F:/coding/rusty_RTOS/rusty_rtos_core/crates/rusty_rtos_core#0.1.0",
+      "author": "Remade With Rust",
+      "name": "rusty_rtos_core",
+      "version": "0.1.0",
+      "description": "The shared vocabulary of the Kairos family (FreeRTOS remade in Rust): ticks, priorities, generational handles, an index-linked remake of list.c, one Copy error, the Config trait, and the Port / Heap / Trace / Hooks seams. No pointers, no allocator, no arch. forbid(unsafe).",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rusty_rtos_core@0.1.0?download_url=file://F:\\coding\\rusty_RTOS\\rusty_rtos_core\\crates\\rusty_rtos_core",
+      "externalReferences": [
+        {
+          "type": "documentation",
+          "url": "https://docs.rs/rusty_rtos_core"
+        },
+        {
+          "type": "website",
+          "url": "https://www.mata.network/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/Remade-With-Rust/rusty_rtos_core"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "path+file:///F:/coding/rusty_RTOS/rusty_rtos_core/crates/rusty_rtos_core#0.1.0"
+    },
+    {
+      "ref": "path+file:///F:/coding/rusty_RTOS/rusty_rtos_kernel/crates/rusty_rtos_kernel-core#0.1.0",
+      "dependsOn": [
+        "path+file:///F:/coding/rusty_RTOS/rusty_rtos_core/crates/rusty_rtos_core#0.1.0"
+      ]
+    }
+  ]
+}
