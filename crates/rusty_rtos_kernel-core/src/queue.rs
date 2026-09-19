@@ -899,7 +899,7 @@ where
             q.read_from = next_read;
             q.write_to = next_write;
             if counted {
-                q.waiting = q.waiting.saturating_add(1);
+                q.waiting = q.waiting.wrapping_add(1);
             }
         } else if snapshot.kind.is_mutex() {
             // Giving a mutex back: the holder drops any inherited
@@ -909,12 +909,12 @@ where
             let q = self.queues.resolve_mut(queue)?;
             q.holder = TaskHandle::NULL;
             if counted {
-                q.waiting = q.waiting.saturating_add(1);
+                q.waiting = q.waiting.wrapping_add(1);
             }
         } else if counted {
             // A counting or binary semaphore: only the count moves.
             let q = self.queues.resolve_mut(queue)?;
-            q.waiting = q.waiting.saturating_add(1);
+            q.waiting = q.waiting.wrapping_add(1);
         }
         Ok(yield_required)
     }
@@ -1139,7 +1139,7 @@ where
         {
             let q = self.queues.resolve_mut(mutex)?;
             if q.holder == caller {
-                q.recursions = q.recursions.saturating_add(1);
+                q.recursions = q.recursions.wrapping_add(1);
                 return Ok(Ready(()));
             }
         }
@@ -1147,7 +1147,7 @@ where
             Blocked => Ok(Blocked),
             Ready(()) => {
                 let q = self.queues.resolve_mut(mutex)?;
-                q.recursions = q.recursions.saturating_add(1);
+                q.recursions = q.recursions.wrapping_add(1);
                 Ok(Ready(()))
             }
         }
@@ -1352,7 +1352,12 @@ where
 
 /// The next index in a ring of `length`.
 const fn wrap_next(index: usize, length: usize) -> usize {
-    let next = index.saturating_add(1);
+    // `wrapping_add`, and it is the SAME function, not an approximation
+    // of it: at `usize::MAX` saturating yields `usize::MAX`, which is
+    // `>= length`, so the caller gets 0 -- and wrapping yields 0, which is
+    // `< length`, so the caller gets 0 as well. Every other index agrees
+    // without argument.
+    let next = index.wrapping_add(1);
     if next >= length { 0 } else { next }
 }
 

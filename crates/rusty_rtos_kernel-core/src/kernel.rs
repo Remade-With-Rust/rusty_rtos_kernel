@@ -2519,7 +2519,7 @@ where
 
     /// `vTaskSuspendAll`.
     pub fn suspend_all(&mut self) {
-        self.suspended_depth = self.suspended_depth.saturating_add(1);
+        self.suspended_depth = self.suspended_depth.wrapping_add(1);
     }
 
     /// Move everything an ISR readied onto the ready lists.
@@ -2826,7 +2826,7 @@ where
     /// `pvTaskIncrementMutexHeldCount`.
     pub(crate) fn increment_mutexes_held(&mut self, task: TaskHandle) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
-            tcb.mutexes_held = tcb.mutexes_held.saturating_add(1);
+            tcb.mutexes_held = tcb.mutexes_held.wrapping_add(1);
         }
     }
 
