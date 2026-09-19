@@ -1,0 +1,32 @@
+# --- GitHub Linguist: what is this project's code ---------------------------
+#
+# Every crate that ships from this repository is PURE RUST. Checked, not
+# asserted: no crate under `crates/` has a build script, a `cc` or `bindgen`
+# build-dependency, or a `links` key, so nothing here compiles C into a
+# published artefact.
+#
+# The C, assembly, shell and Python below are the DIFFERENTIAL ORACLE, the
+# benchmarks, the firmware examples' ABI gate and the release scripts. The
+# pinned C is built as a dev-only reference and its trace is checked in --
+# that harness is how every number in the README was measured, so it stays in
+# the repository, but it is not what this project is written in.
+#
+# `linguist-detectable=false` rather than `linguist-vendored`: these files are
+# ours, they are simply not the language of the product.
+
+oracle/**            linguist-detectable=false
+bench/**             linguist-detectable=false
+
+*.sh                 linguist-detectable=false
+*.py                 linguist-detectable=false
+
+firmware/**/*.c      linguist-detectable=false
+firmware/**/*.h      linguist-detectable=false
+firmware/**/*.S      linguist-detectable=false
+hosted/**/*.c        linguist-detectable=false
+hosted/**/*.h        linguist-detectable=false
+seam/*.c             linguist-detectable=false
+
+# `memory.x` is a linker script. Linguist reads a bare `.x` as RPC, which is
+# how "RPC" appeared in the language bar of four of these repositories.
+*.x                  linguist-language=Linker Script
