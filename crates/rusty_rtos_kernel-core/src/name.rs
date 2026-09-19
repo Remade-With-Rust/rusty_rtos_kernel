@@ -62,9 +62,19 @@ impl Name {
     }
 
     /// The name as it will be printed.
+    ///
+    /// In line on purpose, and with the clamp below: a trace prints two
+    /// names on every context switch, and out of line each one paid a call
+    /// and a frame to hand back a slice of a field the caller already had.
     #[must_use]
+    #[inline(always)]
     pub fn as_str(&self) -> &str {
-        let end = usize::from(self.len);
+        // `Name::new` is the only constructor and it writes a `len` no
+        // larger than the buffer, so the clamp changes no value. It says so
+        // to the compiler, which otherwise carries a bounds check and an
+        // `Option` into every read of a name -- and a trace prints two of
+        // them on every context switch.
+        let end = usize::from(self.len).min(NAME_CAPACITY);
         let slice = self.bytes.get(..end).unwrap_or(&[]);
         str::from_utf8(slice).unwrap_or("")
     }
