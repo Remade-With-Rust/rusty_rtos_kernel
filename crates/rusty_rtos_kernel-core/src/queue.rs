@@ -1128,11 +1128,15 @@ where
     /// [`Error::Empty`] on timeout; [`Error::Gone`] for a stale handle.
     pub fn mutex_take_recursive(&mut self, mutex: QueueHandle, ticks: u64) -> Result<Wait<()>> {
         let caller = self.current;
-        let holder = self.queues.resolve(mutex)?.holder;
-        if holder == caller {
+        // One resolve reads the holder and counts the re-entry.
+        // `resolve_mut` runs the same four checks and answers the same
+        // errors, so asking twice only asked twice.
+        {
             let q = self.queues.resolve_mut(mutex)?;
-            q.recursions = q.recursions.saturating_add(1);
-            return Ok(Ready(()));
+            if q.holder == caller {
+                q.recursions = q.recursions.saturating_add(1);
+                return Ok(Ready(()));
+            }
         }
         match self.semaphore_take(mutex, ticks)? {
             Blocked => Ok(Blocked),
@@ -1150,11 +1154,12 @@ where
     /// [`Error::NotActive`] when the caller does not hold the mutex.
     pub fn mutex_give_recursive(&mut self, mutex: QueueHandle) -> Result<()> {
         let caller = self.current;
-        if self.queues.resolve(mutex)?.holder != caller {
-            return Err(Error::NotActive);
-        }
+        // One resolve, as in the take above.
         let remaining = {
             let q = self.queues.resolve_mut(mutex)?;
+            if q.holder != caller {
+                return Err(Error::NotActive);
+            }
             q.recursions = q.recursions.saturating_sub(1);
             q.recursions
         };
