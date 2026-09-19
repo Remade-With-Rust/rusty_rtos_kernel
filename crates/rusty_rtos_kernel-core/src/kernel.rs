@@ -809,19 +809,27 @@ where
     where
         F: for<'a> FnOnce(TaskHandle, &'a str) -> Event<'a>,
     {
+        // `tcbs` and `trace` are different fields, so the name can be read
+        // where it lives rather than copied onto the stack to end a borrow
+        // that never had to end.
+        //
         // A sink that never reads the name pays for neither the lookup nor
         // the UTF-8 validation that turning one into a `&str` costs.
-        let name = if T::WANTS_NAMES {
-            self.tcbs.get(task).map(|t| t.name).unwrap_or_default()
-        } else {
-            Name::default()
-        };
-        let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
-        self.trace.event(
+        let Self {
+            tcbs,
+            trace,
+            port,
             tick,
-            make(task, if T::WANTS_NAMES { name.as_str() } else { "" }),
-        );
+            ..
+        } = self;
+        let name = if T::WANTS_NAMES {
+            tcbs.get(task).map(|t| t.name.as_str()).unwrap_or("")
+        } else {
+            ""
+        };
+        let tick = *tick;
+        trace.note_exits(port.exits());
+        trace.event(tick, make(task, name));
     }
 
     pub(crate) fn priority_value(raw: u8) -> Priority {
