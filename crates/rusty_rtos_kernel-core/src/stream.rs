@@ -757,6 +757,14 @@ where
     }
 
     /// `prvWriteBytesToBuffer`: the ring wrap, in two `memcpy`s.
+    ///
+    /// The index arithmetic here is `wrapping_*`, because the geometry has
+    /// already bounded every term: `head` is below `length`, `base + length`
+    /// is at most `BYTES`, `first` is `min(len, upto)` so `len - first`
+    /// cannot go below zero, and `head + first` is at most `length` -- which
+    /// the fold on the line after turns back into 0, exactly as `wrap_next`
+    /// does. Each index then passes through a `get_mut` that refuses
+    /// anything the ring does not own.
     fn write_bytes(&mut self, b: &StreamBuffer, data: &[u8], head: usize) -> usize {
         // The two copies the doc above describes, and the two the C makes.
         // Taken only when the payload fits the ring once -- which is the only
@@ -764,35 +772,35 @@ where
         // refused before this -- so a payload that would wrap more than once
         // still walks the original loop and behaves exactly as it did.
         if data.len() <= b.length {
-            let upto = b.length.saturating_sub(head);
+            let upto = b.length.wrapping_sub(head);
             let first = data.len().min(upto);
-            let from = b.base.saturating_add(head);
+            let from = b.base.wrapping_add(head);
             if let (Some(dst), Some(src)) = (
-                self.bytes.get_mut(from..from.saturating_add(first)),
+                self.bytes.get_mut(from..from.wrapping_add(first)),
                 data.get(..first),
             ) {
                 dst.copy_from_slice(src);
             }
-            let rest = data.len().saturating_sub(first);
+            let rest = data.len().wrapping_sub(first);
             if rest > 0 {
                 if let (Some(dst), Some(src)) = (
-                    self.bytes.get_mut(b.base..b.base.saturating_add(rest)),
+                    self.bytes.get_mut(b.base..b.base.wrapping_add(rest)),
                     data.get(first..),
                 ) {
                     dst.copy_from_slice(src);
                 }
                 return rest;
             }
-            let next = head.saturating_add(first);
+            let next = head.wrapping_add(first);
             return if next >= b.length { 0 } else { next };
         }
 
         let mut head = head;
         for byte in data {
-            if let Some(slot) = self.bytes.get_mut(b.base.saturating_add(head)) {
+            if let Some(slot) = self.bytes.get_mut(b.base.wrapping_add(head)) {
                 *slot = *byte;
             }
-            head = head.saturating_add(1);
+            head = head.wrapping_add(1);
             if head >= b.length {
                 head = 0;
             }
@@ -801,30 +809,32 @@ where
     }
 
     /// `prvReadBytesFromBuffer`.
+    ///
+    /// Bounded as [`Kernel::write_bytes`] is, and for the same reasons.
     fn read_bytes(&mut self, b: &StreamBuffer, out: &mut [u8], tail: usize) -> usize {
         // The mirror of `write_bytes`: two copies rather than a byte at a
         // time, taken only when the request fits the ring once.
         if out.len() <= b.length {
-            let upto = b.length.saturating_sub(tail);
+            let upto = b.length.wrapping_sub(tail);
             let first = out.len().min(upto);
-            let from = b.base.saturating_add(tail);
+            let from = b.base.wrapping_add(tail);
             if let (Some(dst), Some(src)) = (
                 out.get_mut(..first),
-                self.bytes.get(from..from.saturating_add(first)),
+                self.bytes.get(from..from.wrapping_add(first)),
             ) {
                 dst.copy_from_slice(src);
             }
-            let rest = out.len().saturating_sub(first);
+            let rest = out.len().wrapping_sub(first);
             if rest > 0 {
                 if let (Some(dst), Some(src)) = (
                     out.get_mut(first..),
-                    self.bytes.get(b.base..b.base.saturating_add(rest)),
+                    self.bytes.get(b.base..b.base.wrapping_add(rest)),
                 ) {
                     dst.copy_from_slice(src);
                 }
                 return rest;
             }
-            let next = tail.saturating_add(first);
+            let next = tail.wrapping_add(first);
             return if next >= b.length { 0 } else { next };
         }
 
@@ -832,10 +842,10 @@ where
         for slot in out.iter_mut() {
             *slot = self
                 .bytes
-                .get(b.base.saturating_add(tail))
+                .get(b.base.wrapping_add(tail))
                 .copied()
                 .unwrap_or(0);
-            tail = tail.saturating_add(1);
+            tail = tail.wrapping_add(1);
             if tail >= b.length {
                 tail = 0;
             }
