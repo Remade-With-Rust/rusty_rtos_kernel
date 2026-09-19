@@ -1999,6 +1999,10 @@ where
     }
 
     /// The wake loop inside `xTaskIncrementTick`.
+    // Out of line: this walks the delayed list and runs only when a tick
+    // reaches the next unblock time, but `increment_tick` runs on EVERY tick
+    // and was carrying a frame sized for the walk regardless.
+    #[inline(never)]
     fn wake_due_tasks(&mut self, now: u64) -> bool {
         let mut switch_required = false;
         loop {
@@ -2043,6 +2047,9 @@ where
     }
 
     /// `taskSWITCH_DELAYED_LISTS()`.
+    // Out of line for the same reason: the overflow swap happens when the
+    // tick count wraps, which is once in a very long while.
+    #[inline(never)]
     fn switch_delayed_lists(&mut self) {
         self.delayed_swapped = !self.delayed_swapped;
         self.overflows = self.overflows.wrapping_add(1);
