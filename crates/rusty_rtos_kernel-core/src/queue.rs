@@ -392,7 +392,7 @@ where
         let spaces = self
             .queues
             .resolve(queue)
-            .map(|q| q.length.saturating_sub(q.waiting));
+            .map(|q| q.length.wrapping_sub(q.waiting));
         self.exit_critical();
         spaces
     }
@@ -892,7 +892,10 @@ where
                     snapshot.write_to,
                 ),
             };
-            if let Some(slot) = self.slots.get_mut(snapshot.base.saturating_add(index)) {
+            // `base + index` is below `base + length`, which the geometry
+            // put inside `SLOTS`; and the `get_mut` refuses anything it is
+            // not, so nothing rests on the arithmetic either way.
+            if let Some(slot) = self.slots.get_mut(snapshot.base.wrapping_add(index)) {
                 *slot = value;
             }
             let q = self.queues.resolve_mut(queue)?;
@@ -1118,7 +1121,7 @@ where
         let next = wrap_next(snapshot.read_from, snapshot.length);
         let value = self
             .slots
-            .get(snapshot.base.saturating_add(next))
+            .get(snapshot.base.wrapping_add(next))
             .copied()
             .unwrap_or(0);
         // `xQueuePeek` saves and restores `pcReadFrom` — which is to
