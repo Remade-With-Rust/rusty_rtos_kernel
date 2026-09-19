@@ -594,11 +594,16 @@ where
 
     fn trace_command_send(&mut self, timer: TimerHandle, command: Command, value: u64) {
         let tick = self.tick;
-        let name = self
-            .timers
-            .resolve(timer)
-            .map(|t| t.name)
-            .unwrap_or_default();
+        // A sink that never reads a name pays for neither the resolve nor
+        // the copy of the whole `Name` that goes with it.
+        let name = if T::WANTS_NAMES {
+            self.timers
+                .resolve(timer)
+                .map(|t| t.name)
+                .unwrap_or_default()
+        } else {
+            Name::default()
+        };
         self.trace.note_exits(self.port.exits());
         self.trace.event(
             tick,
@@ -620,11 +625,16 @@ where
         command: Command,
         value: u64,
     ) {
-        let name = self
-            .timers
-            .resolve(timer)
-            .map(|t| t.name)
-            .unwrap_or_default();
+        // A sink that never reads a name pays for neither the resolve nor
+        // the copy of the whole `Name` that goes with it.
+        let name = if T::WANTS_NAMES {
+            self.timers
+                .resolve(timer)
+                .map(|t| t.name)
+                .unwrap_or_default()
+        } else {
+            Name::default()
+        };
         self.trace_failure_or_owe(
             caller,
             OwedTrace::TimerCommandSend {
