@@ -359,6 +359,12 @@ pub struct Kernel<
     /// sim time, and the tally is paid here when the task runs again. That
     /// is what puts a sim tick where the C one lands.
     owed_exits: [u32; TASKS],
+    /// Does this task owe anything at all? A conservative hint: set by
+    /// every writer of the three fields above, cleared only by
+    /// [`Kernel::resume_pending`] once it has checked all three. Wrong in
+    /// the `true` direction costs one slow path; it is never wrong the
+    /// other way, because every writer raises it.
+    owes_anything: [bool; TASKS],
     /// The task whose abandoned frame is running right now, if any.
     unwinding: Option<TaskHandle>,
     /// `vApplicationTickHook`, held by value so it can borrow the kernel.
@@ -458,6 +464,7 @@ where
             started: [false; TASKS],
             owes_yield: [false; TASKS],
             owed_exits: [0; TASKS],
+            owes_anything: [false; TASKS],
             unwinding: None,
             tick_hook,
             delay_aborted: [false; TASKS],
@@ -967,6 +974,7 @@ where
                     priority,
                 };
             }
+            self.owe(caller);
             return Ok(handle);
         }
         self.add_new_task_to_ready_list(handle, priority)?;
@@ -1116,6 +1124,13 @@ where
         self.settle_unwind();
         let index = usize::from(self.current.index());
 
+        // One load and one test for the overwhelmingly common case. The
+        // combined check below is the fallback, and it is what clears the hint
+        // -- so a hint left standing costs one slow path and then goes away.
+        if !self.owes_anything.get(index).copied().unwrap_or(true) {
+            return false;
+        }
+
         // Almost every call answers "nothing owed", and the sequence below
         // reaches that answer in three stages -- a compare, a match over
         // `OwedTrace`, then another compare -- each reachable only after the
@@ -1127,6 +1142,9 @@ where
             )
             && self.owes_yield.get(index).copied() != Some(true)
         {
+            if let Some(flag) = self.owes_anything.get_mut(index) {
+                *flag = false;
+            }
             return false;
         }
         // First the stack unwinds — the sections the task had open when it
@@ -1257,6 +1275,9 @@ where
             // same debt.
             *slot = slot.saturating_add(owed);
         }
+        if owed > 0 {
+            self.owe(task);
+        }
     }
 
     /// Emit a queue failure line now, or owe it if a tick switched the
@@ -1309,6 +1330,18 @@ where
         if let Some(slot) = self.owed_trace.get_mut(usize::from(caller.index())) {
             *slot = owed;
         }
+        self.owe(caller);
+    }
+
+    /// Raise the hint that `task` owes something.
+    ///
+    /// Called by every writer of `owed_trace`, `owes_yield` and `owed_exits`.
+    /// Missing one would let `resume_pending` skip work that was really owed,
+    /// which the conformance differential would show as a missing trace line.
+    fn owe(&mut self, task: TaskHandle) {
+        if let Some(flag) = self.owes_anything.get_mut(usize::from(task.index())) {
+            *flag = true;
+        }
     }
 
     /// Record that `task` was preempted before the `portYIELD()` at the end
@@ -1317,6 +1350,7 @@ where
         if let Some(flag) = self.owes_yield.get_mut(usize::from(task.index())) {
             *flag = true;
         }
+        self.owe(task);
     }
 
     /// Hand the CPU from `outgoing` to `incoming`: what `prvSwitchThread`
