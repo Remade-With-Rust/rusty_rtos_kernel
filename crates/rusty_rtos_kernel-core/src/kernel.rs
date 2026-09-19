@@ -2507,6 +2507,53 @@ where
         self.suspended_depth = self.suspended_depth.saturating_add(1);
     }
 
+    /// Move everything an ISR readied onto the ready lists.
+    ///
+    /// Out of line because it is the rare half of [`Kernel::resume_all`]: the
+    /// pending list is empty on essentially every call, and inlining this made
+    /// every one of those calls carry a frame sized for the walk.
+    #[inline(never)]
+    fn drain_pending_ready(&mut self) {
+        let mut moved_any = false;
+        while self.lists.is_empty(Self::pending_ready_list()) == Ok(false) {
+            let Ok(Some(item)) = self.lists.head(Self::pending_ready_list()) else {
+                break;
+            };
+            let Ok(task) = self.task_of_event_item(item) else {
+                break;
+            };
+            let _ = self.lists.remove(Self::event_item(task));
+            let _ = self.lists.remove(Self::state_item(task));
+            if self.add_task_to_ready_list(task).is_err() {
+                break;
+            }
+            moved_any = true;
+            let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
+            if woken > self.current_priority() {
+                self.yield_pending = true;
+            }
+        }
+        if moved_any {
+            self.reset_next_task_unblock_time();
+        }
+    }
+
+    /// Run the ticks that landed while the scheduler was suspended.
+    ///
+    /// Out of line for the same reason as its sibling: `pended_ticks` is zero
+    /// on essentially every call.
+    #[inline(never)]
+    fn unwind_pended_ticks(&mut self) {
+        let mut pended = self.pended_ticks;
+        while pended > 0 {
+            if self.increment_tick() {
+                self.yield_pending = true;
+            }
+            pended = pended.saturating_sub(1);
+        }
+        self.pended_ticks = 0;
+    }
+
     /// `xTaskResumeAll`; `true` when it yielded on the caller's behalf.
     pub fn resume_all(&mut self) -> bool {
         let mut already_yielded = false;
@@ -2514,37 +2561,11 @@ where
         {
             self.suspended_depth = self.suspended_depth.saturating_sub(1);
             if self.suspended_depth == 0 && self.task_count > 0 {
-                let mut moved_any = false;
-                while self.lists.is_empty(Self::pending_ready_list()) == Ok(false) {
-                    let Ok(Some(item)) = self.lists.head(Self::pending_ready_list()) else {
-                        break;
-                    };
-                    let Ok(task) = self.task_of_event_item(item) else {
-                        break;
-                    };
-                    let _ = self.lists.remove(Self::event_item(task));
-                    let _ = self.lists.remove(Self::state_item(task));
-                    if self.add_task_to_ready_list(task).is_err() {
-                        break;
-                    }
-                    moved_any = true;
-                    let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-                    if woken > self.current_priority() {
-                        self.yield_pending = true;
-                    }
-                }
-                if moved_any {
-                    self.reset_next_task_unblock_time();
+                if self.lists.is_empty(Self::pending_ready_list()) == Ok(false) {
+                    self.drain_pending_ready();
                 }
                 if self.pended_ticks > 0 {
-                    let mut pended = self.pended_ticks;
-                    while pended > 0 {
-                        if self.increment_tick() {
-                            self.yield_pending = true;
-                        }
-                        pended = pended.saturating_sub(1);
-                    }
-                    self.pended_ticks = 0;
+                    self.unwind_pended_ticks();
                 }
                 if self.yield_pending {
                     if C::USE_PREEMPTION {
