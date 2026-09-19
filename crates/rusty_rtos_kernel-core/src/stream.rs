@@ -59,29 +59,37 @@ impl StreamBuffer {
     ///
     /// The C adds the length before subtracting the tail so the unsigned
     /// arithmetic cannot go below zero, then folds the extra length back
-    /// out. Saturating spellings keep that shape without an overflow check
-    /// the C does not have.
+    /// out. These are the C's own operations, and they need no checks for
+    /// the same reason the C's do not.
+    ///
+    /// `head` and `tail` are kept below `length` by the wrap arithmetic that
+    /// writes them, and `length` is at least 1. So `length + head` is at
+    /// most `2 * length - 1` and cannot overflow; `length + head - tail` is
+    /// at least `head + 1` and cannot underflow; and the fold only runs when
+    /// `count >= length`, where `count` is at most `2 * length - 1`, so it
+    /// lands back inside `0..length`.
     pub(crate) const fn bytes_in_buffer(&self) -> usize {
-        let mut count = self
-            .length
-            .saturating_add(self.head)
-            .saturating_sub(self.tail);
+        let mut count = self.length.wrapping_add(self.head).wrapping_sub(self.tail);
         if count >= self.length {
-            count = count.saturating_sub(self.length);
+            count = count.wrapping_sub(self.length);
         }
         count
     }
 
     /// `xStreamBufferSpacesAvailable`: one less than the gap, because the
     /// ring keeps a spare byte so full and empty do not look alike.
+    ///
+    /// Bounded as [`StreamBuffer::bytes_in_buffer`] is, with one more step:
+    /// `length + tail - head` is at least 1, because `head` is at most
+    /// `length - 1`, so taking the spare byte off it cannot underflow.
     pub(crate) const fn spaces_available(&self) -> usize {
         let mut space = self
             .length
-            .saturating_add(self.tail)
-            .saturating_sub(self.head)
-            .saturating_sub(1);
+            .wrapping_add(self.tail)
+            .wrapping_sub(self.head)
+            .wrapping_sub(1);
         if space >= self.length {
-            space = space.saturating_sub(self.length);
+            space = space.wrapping_sub(self.length);
         }
         space
     }
