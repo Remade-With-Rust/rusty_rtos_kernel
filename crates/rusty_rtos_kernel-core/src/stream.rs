@@ -452,8 +452,14 @@ where
                     bytes: written,
                 },
             );
-            let bytes = self.buffers.resolve(buffer)?.bytes_in_buffer();
-            if self.buffers.resolve(buffer)?.meets_trigger(bytes) {
+            // One resolve, not two: nothing moves between the byte count and
+            // the trigger test, and both read the same buffer. The block ends
+            // the borrow before the completion call needs `self` mutably.
+            let trigger = {
+                let b = self.buffers.resolve(buffer)?;
+                b.meets_trigger(b.bytes_in_buffer())
+            };
+            if trigger {
                 self.send_completed(buffer)?;
             }
         }
@@ -484,8 +490,14 @@ where
             // `traceSTREAM_BUFFER_SEND_FROM_ISR` is a different macro from
             // `traceSTREAM_BUFFER_SEND`, and the harness hooks only the
             // latter — so an interrupt's send says nothing on either side.
-            let bytes = self.buffers.resolve(buffer)?.bytes_in_buffer();
-            if self.buffers.resolve(buffer)?.meets_trigger(bytes) {
+            // One resolve, not two: nothing moves between the byte count and
+            // the trigger test, and both read the same buffer. The block ends
+            // the borrow before the completion call needs `self` mutably.
+            let trigger = {
+                let b = self.buffers.resolve(buffer)?;
+                b.meets_trigger(b.bytes_in_buffer())
+            };
+            if trigger {
                 woken = self.send_completed_from_isr(buffer)?;
             }
         }
