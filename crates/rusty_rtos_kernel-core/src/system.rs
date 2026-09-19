@@ -316,7 +316,7 @@ mod tests {
     use rusty_rtos_core::isr::Woken;
     use rusty_rtos_core::port::Port;
     use rusty_rtos_core::tick::Bits32;
-    use rusty_rtos_core::trace::{Event, Trace};
+    use rusty_rtos_core::trace::{Event, Scheduling, Trace};
 
     use crate::typed::Sent;
 
@@ -335,6 +335,93 @@ mod tests {
         const TIMER_QUEUE_LENGTH: usize = 1;
         const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
         const USE_TIME_SLICING: bool = false;
+    }
+
+    /// [`TestConfig`] with `configUSE_TICKLESS_IDLE` on, and nothing else
+    /// changed — so a difference between the two is the tickless path and
+    /// cannot be anything else.
+    pub struct TicklessConfig;
+
+    impl Config for TicklessConfig {
+        type Tick = Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        const USE_TIME_SLICING: bool = false;
+        const USE_TICKLESS_IDLE: bool = true;
+    }
+
+    /// A port that takes every whole window it is offered — the most
+    /// aggressive sleep there is, and so the hardest case for the kernel to
+    /// stay correct across.
+    #[derive(Debug, Default)]
+    pub struct SleepyPort {
+        nesting: core::cell::Cell<u32>,
+        /// Ticks this port has been asked to sleep, in total.
+        pub slept: core::cell::Cell<u64>,
+        /// Times it was asked at all.
+        pub sleeps: core::cell::Cell<u64>,
+    }
+
+    impl Port for SleepyPort {
+        fn yield_now(&self) {}
+        fn yield_from_isr(&self, _woken: Woken) {}
+        fn enter_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_add(1));
+        }
+        fn exit_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_sub(1));
+        }
+        fn set_interrupt_mask_from_isr(&self) -> u32 {
+            0
+        }
+        fn clear_interrupt_mask_from_isr(&self, _saved: u32) {}
+        fn in_isr(&self) -> bool {
+            false
+        }
+        fn set_in_tick_entry(&self, _yes: bool) {}
+
+        fn suppress_ticks_and_sleep(&self, expected_idle_ticks: u64) -> u64 {
+            self.sleeps.set(self.sleeps.get().saturating_add(1));
+            self.slept
+                .set(self.slept.get().saturating_add(expected_idle_ticks));
+            expected_idle_ticks
+        }
+    }
+
+    /// A port that OVERSLEEPS, to prove the kernel clamps rather than
+    /// trusting it.
+    #[derive(Debug, Default)]
+    pub struct OversleepingPort {
+        nesting: core::cell::Cell<u32>,
+    }
+
+    impl Port for OversleepingPort {
+        fn yield_now(&self) {}
+        fn yield_from_isr(&self, _woken: Woken) {}
+        fn enter_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_add(1));
+        }
+        fn exit_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_sub(1));
+        }
+        fn set_interrupt_mask_from_isr(&self) -> u32 {
+            0
+        }
+        fn clear_interrupt_mask_from_isr(&self, _saved: u32) {}
+        fn in_isr(&self) -> bool {
+            false
+        }
+        fn set_in_tick_entry(&self, _yes: bool) {}
+
+        fn suppress_ticks_and_sleep(&self, expected_idle_ticks: u64) -> u64 {
+            expected_idle_ticks.saturating_mul(4).saturating_add(9)
+        }
     }
 
     #[derive(Debug, Default)]
@@ -421,6 +508,232 @@ mod tests {
     }
 
     type K = demo::Kernel<TestPort, NoTrace, NoTickHook>;
+
+    // ---- tickless idle ---------------------------------------------------
+
+    crate::system! {
+        mod sleepy use TicklessConfig;
+        tasks { worker: 1 }
+        queues { mark: u8; 1 }
+    }
+
+    crate::system! {
+        mod awake use TestConfig;
+        tasks { worker: 1 }
+        queues { mark: u8; 1 }
+    }
+
+    /// A sink that keeps the shape of a trace: every event, with the tick it
+    /// carried. Comparing two of these compares two schedules.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Recorder {
+        pub lines: std::vec::Vec<(u64, &'static str)>,
+    }
+
+    impl Trace for Recorder {
+        fn event(&mut self, tick: u64, event: Event<'_>) {
+            self.lines.push((tick, event.name()));
+        }
+    }
+
+    /// `worker` delays, leaving only the idle task ready — which is the
+    /// precondition tickless idle exists for.
+    const DELAY: u64 = 10;
+
+    /// Both declarations build what they declare.
+    ///
+    /// The tests that matter below start a scheduler, and `System::build` and
+    /// a started scheduler cannot both have the one queue slot a declaration
+    /// reserves -- `system!` sizes `QUEUES` with "no spare", and the timer
+    /// daemon needs it. So they create the one task they need by hand, and
+    /// this is where the generated builders are exercised.
+    #[test]
+    fn both_tickless_declarations_build_what_they_declare() {
+        let mut asleep = sleepy_kernel();
+        let slept = sleepy::System::build(&mut asleep).expect("the tickless declaration builds");
+
+        let mut ticking =
+            awake::Kernel::<TestPort, NoTrace, NoTickHook>::new(TestPort::default(), NoTrace)
+                .expect("the declared geometry adds up");
+        let ticked = awake::System::build(&mut ticking).expect("the ticking declaration builds");
+
+        // The two declarations are the same text over two configurations, so
+        // they must hand back the same handle for the same task. If they did
+        // not, the arms of the invariance test below would be comparing two
+        // different systems and the comparison would mean nothing.
+        assert_eq!(
+            slept.worker, ticked.worker,
+            "identical declarations gave different task handles"
+        );
+        let _ = (&slept.mark, &ticked.mark);
+    }
+
+    /// A kernel with tickless on and a port that takes every window.
+    fn sleepy_kernel() -> sleepy::Kernel<SleepyPort, Scheduling<Recorder>, NoTickHook> {
+        sleepy::Kernel::new(SleepyPort::default(), Scheduling::new(Recorder::default()))
+            .expect("the declared geometry adds up")
+    }
+
+    /// The port asks for the whole window, and the kernel winds the clock
+    /// over it — all but the last tick, which is left pended so the delayed
+    /// task is woken by the same code that would have woken it.
+    #[test]
+    fn a_sleeping_port_is_asked_for_the_whole_idle_window() {
+        let mut k = sleepy_kernel();
+        k.create_task("worker", 1).expect("worker");
+        let started = k.start_scheduler().expect("start");
+        // The timer daemon is created READY at `TIMER_TASK_PRIORITY`, and
+        // in a running system it blocks on its command queue immediately.
+        // Nothing runs it here, so park it: a task ready above the idle
+        // priority is precisely what `expected_idle_time` refuses to sleep
+        // through, and leaving it ready would test that refusal instead of
+        // the sleep.
+        k.suspend(Some(started.timer))
+            .expect("park the timer daemon");
+        k.delay(DELAY).expect("the worker delays");
+
+        let before = k.tick_count();
+        k.idle_suppress_ticks();
+
+        assert_eq!(k.port().sleeps.get(), 1, "the port was asked once");
+        assert_eq!(
+            k.port().slept.get(),
+            DELAY,
+            "it was offered the whole window"
+        );
+        // Nine ticks were STEPPED and the tenth was left pended, and then
+        // `resume_all` unwound it through `increment_tick` -- which is what
+        // wakes the delayed task, by the same code that would have woken it
+        // had the kernel ticked all ten. So the clock lands on the wake
+        // either way, and that is the whole reason the schedule survives.
+        assert_eq!(
+            k.tick_count(),
+            before.saturating_add(DELAY),
+            "the clock did not land on the worker's wake"
+        );
+    }
+
+    /// The `configUSE_TICKLESS_IDLE` gate: the same port, the same script,
+    /// a configuration with it off, and the port is never asked.
+    #[test]
+    fn tickless_off_never_asks_the_port_to_sleep() {
+        let mut k =
+            awake::Kernel::<SleepyPort, NoTrace, NoTickHook>::new(SleepyPort::default(), NoTrace)
+                .expect("the declared geometry adds up");
+        k.create_task("worker", 1).expect("worker");
+        let started = k.start_scheduler().expect("start");
+        // The timer daemon is created READY at `TIMER_TASK_PRIORITY`, and
+        // in a running system it blocks on its command queue immediately.
+        // Nothing runs it here, so park it: a task ready above the idle
+        // priority is precisely what `expected_idle_time` refuses to sleep
+        // through, and leaving it ready would test that refusal instead of
+        // the sleep.
+        k.suspend(Some(started.timer))
+            .expect("park the timer daemon");
+        k.delay(DELAY).expect("the worker delays");
+
+        let before = k.tick_count();
+        k.idle_suppress_ticks();
+
+        assert_eq!(k.port().sleeps.get(), 0, "the port was asked");
+        assert_eq!(k.tick_count(), before, "the clock moved");
+    }
+
+    /// A port that oversleeps is a port bug, and the kernel refuses to wind
+    /// the clock past the wake it would lose. The C `configASSERT`s this;
+    /// a kernel that forbids panicking has to clamp instead.
+    #[test]
+    fn the_kernel_clamps_a_port_that_oversleeps() {
+        let mut k = sleepy::Kernel::<OversleepingPort, NoTrace, NoTickHook>::new(
+            OversleepingPort::default(),
+            NoTrace,
+        )
+        .expect("the declared geometry adds up");
+        k.create_task("worker", 1).expect("worker");
+        let started = k.start_scheduler().expect("start");
+        // The timer daemon is created READY at `TIMER_TASK_PRIORITY`, and
+        // in a running system it blocks on its command queue immediately.
+        // Nothing runs it here, so park it: a task ready above the idle
+        // priority is precisely what `expected_idle_time` refuses to sleep
+        // through, and leaving it ready would test that refusal instead of
+        // the sleep.
+        k.suspend(Some(started.timer))
+            .expect("park the timer daemon");
+        k.delay(DELAY).expect("the worker delays");
+
+        let before = k.tick_count();
+        k.idle_suppress_ticks();
+
+        // The port claimed `4 * DELAY + 9` = 49 ticks. Unclamped the clock
+        // would be 49 ticks on and the worker's wake would have been stepped
+        // straight past; clamped it lands on the wake exactly, like a port
+        // that behaved.
+        assert_eq!(
+            k.tick_count(),
+            before.saturating_add(DELAY),
+            "a port claiming four times its window moved the clock past the wake"
+        );
+    }
+
+    /// ★ The claim the whole mission rests on.
+    ///
+    /// Two kernels, identical but for `configUSE_TICKLESS_IDLE`, run the
+    /// same script. One sleeps through the idle window; the other ticks
+    /// through it. Their traces differ — that is the point, and it is why a
+    /// byte-diff cannot gate a tickless port. Their SCHEDULES do not.
+    ///
+    /// `Scheduling` is the projection that says so, and this is it applied
+    /// to a kernel that really did suppress its ticks rather than to a trace
+    /// file standing in for one.
+    #[test]
+    fn the_schedule_is_the_same_with_and_without_tickless() {
+        let target = DELAY.saturating_add(2);
+
+        let mut asleep = sleepy_kernel();
+        asleep.create_task("worker", 1).expect("worker");
+        let started = asleep.start_scheduler().expect("start");
+        asleep
+            .suspend(Some(started.timer))
+            .expect("park the timer daemon");
+        asleep.delay(DELAY).expect("the worker delays");
+        asleep.idle_suppress_ticks();
+        while asleep.tick_count() < target {
+            if asleep.increment_tick() {
+                asleep.switch_context();
+            }
+        }
+
+        let mut ticking = awake::Kernel::<TestPort, Scheduling<Recorder>, NoTickHook>::new(
+            TestPort::default(),
+            Scheduling::new(Recorder::default()),
+        )
+        .expect("the declared geometry adds up");
+        ticking.create_task("worker", 1).expect("worker");
+        let started = ticking.start_scheduler().expect("start");
+        ticking
+            .suspend(Some(started.timer))
+            .expect("park the timer daemon");
+        ticking.delay(DELAY).expect("the worker delays");
+        ticking.idle_suppress_ticks();
+        while ticking.tick_count() < target {
+            if ticking.increment_tick() {
+                ticking.switch_context();
+            }
+        }
+
+        assert!(
+            asleep.port().sleeps.get() > 0,
+            "the sleeping arm never slept, so this proves nothing"
+        );
+
+        let slept_schedule = asleep.into_trace().into_inner();
+        let ticked_schedule = ticking.into_trace().into_inner();
+
+        assert_eq!(
+            slept_schedule, ticked_schedule,
+            "sleeping through the idle window moved the schedule"
+        );
+    }
 
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")

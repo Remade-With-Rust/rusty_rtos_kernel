@@ -922,6 +922,105 @@ where
         self.exit_critical();
     }
 
+    // ---- tickless idle --------------------------------------------------
+
+    /// `tskIDLE_PRIORITY`.
+    const IDLE_PRIORITY: u8 = 0;
+
+    /// `prvGetExpectedIdleTime`: how long nothing is due, in ticks.
+    ///
+    /// Zero whenever the answer would be unsafe to sleep on -- something
+    /// above the idle priority is running, another idle-priority task is
+    /// ready to share the slice, or a higher-priority task is ready. The
+    /// last of those cannot happen with preemption on, and the C keeps the
+    /// test anyway because a cooperative build reaches it.
+    fn expected_idle_time(&self) -> u64 {
+        // The C spells these as three arms so each carries its own reason;
+        // they answer zero alike, so here they are one short-circuit chain
+        // in the same order:
+        //
+        //  - something above the idle priority is running;
+        //  - another idle-priority task is ready to share the slice, so the
+        //    very next tick has to be processed;
+        //  - a higher-priority task is ready, which only a cooperative
+        //    build can reach and which the C tests for anyway.
+        let due = self.current_priority() > Self::IDLE_PRIORITY
+            || self.ready_len(Self::IDLE_PRIORITY).unwrap_or(0) > 1
+            || self.top_ready_priority > Self::IDLE_PRIORITY;
+
+        if due {
+            0
+        } else {
+            self.next_unblock_time.saturating_sub(self.tick)
+        }
+    }
+
+    /// `vTaskStepTick`: wind the tick count forward over a suppressed period.
+    ///
+    /// Note this does *not* call the tick hook for each stepped tick, which
+    /// is the C's own note and the reason a tickless trace has no heartbeat
+    /// in it.
+    ///
+    /// The C `configASSERT`s that the jump does not pass the next unblock
+    /// time. This clamps instead: a port that overslept is a port bug, and
+    /// winding the clock past a task's wake would lose the wake entirely,
+    /// where losing the extra sleep is recoverable. `forbid(unsafe)` buys
+    /// nothing if the kernel panics on a misbehaving port.
+    ///
+    /// Landing exactly on the next unblock time leaves the last tick pended
+    /// rather than stepped, so `increment_tick` runs it when the scheduler
+    /// resumes and the delayed task is woken by the same code that would
+    /// have woken it.
+    pub fn step_tick(&mut self, ticks_to_jump: u64) {
+        let room = self.next_unblock_time.saturating_sub(self.tick);
+        let mut jump = ticks_to_jump.min(room);
+
+        if self.tick.saturating_add(jump) == self.next_unblock_time && jump > 0 {
+            self.pended_ticks = self.pended_ticks.saturating_add(1);
+            jump = jump.saturating_sub(1);
+        }
+
+        self.tick = self.tick.wrapping_add(jump) & Self::MAX_DELAY;
+    }
+
+    /// The `configUSE_TICKLESS_IDLE` block of `prvIdleTask`.
+    ///
+    /// Compiled away entirely when the configuration leaves tickless idle
+    /// off, which is the default and is why every existing scenario is
+    /// byte-identical with this in the tree.
+    ///
+    /// The shape is the C's, including the part that looks redundant: the
+    /// expected idle time is sampled once WITHOUT the scheduler suspended,
+    /// and again with it. The first answer is not necessarily valid and the
+    /// C takes it anyway, because suspending and resuming the scheduler on
+    /// every pass of the idle task costs more than a sample that is
+    /// sometimes wasted.
+    pub fn idle_suppress_ticks(&mut self) {
+        if !C::USE_TICKLESS_IDLE {
+            return;
+        }
+
+        if self.expected_idle_time() < C::EXPECTED_IDLE_TIME_BEFORE_SLEEP {
+            return;
+        }
+
+        self.suspend_all();
+        let expected = self.expected_idle_time();
+        if expected >= C::EXPECTED_IDLE_TIME_BEFORE_SLEEP {
+            let tick = self.tick;
+            self.trace.note_exits(self.port.exits());
+            self.trace.event(tick, Event::LowPowerIdleBegin);
+
+            let slept = self.port.suppress_ticks_and_sleep(expected);
+            self.step_tick(slept);
+
+            let tick = self.tick;
+            self.trace.note_exits(self.port.exits());
+            self.trace.event(tick, Event::LowPowerIdleEnd);
+        }
+        let _ = self.resume_all();
+    }
+
     /// `portYIELD()` as the Posix port spells it: a critical section around
     /// the context switch, so a tick raised during it lands on the way out.
     pub(crate) fn port_yield(&mut self) {
