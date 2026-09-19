@@ -632,7 +632,7 @@ where
                 break;
             };
             *slot = item;
-            n = n.saturating_add(1);
+            n = n.wrapping_add(1);
         }
         n
     }
@@ -1002,7 +1002,7 @@ where
     fn add_new_task_to_ready_list(&mut self, task: TaskHandle, priority: u8) -> Result<()> {
         self.enter_critical();
         {
-            self.task_count = self.task_count.saturating_add(1);
+            self.task_count = self.task_count.wrapping_add(1);
             if self.current.is_null() {
                 self.current = task;
             } else if !self.running {
@@ -1107,7 +1107,8 @@ where
                         self.note_stall(Stall::NoReadyTask);
                         return;
                     }
-                    top = top.saturating_sub(1);
+                    // At least 1: the arm above returns at zero.
+                    top = top.wrapping_sub(1);
                 }
                 Err(_) => {
                     self.note_stall(Stall::ListError);
