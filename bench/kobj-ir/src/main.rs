@@ -53,6 +53,7 @@ fn main() {
     let mut sets = 0u64;
     let mut clears = 0u64;
     let mut reads = 0u64;
+    let mut waits = 0u64;
     let mut takes = 0u64;
     let mut gives = 0u64;
 
@@ -66,6 +67,14 @@ fn main() {
             }
             if k.event_group_bits(g).is_ok() {
                 reads = reads.wrapping_add(1);
+            }
+            // A non-blocking wait, both ways round: the condition met and
+            // not met, which are the two arms of the wait path.
+            if k.event_group_wait_bits(g, bits, false, false, 0).is_ok() {
+                waits = waits.wrapping_add(1);
+            }
+            if k.event_group_wait_bits(g, !bits, false, true, 0).is_ok() {
+                waits = waits.wrapping_add(1);
             }
             if k.event_group_clear_bits(g, bits).is_ok() {
                 clears = clears.wrapping_add(1);
@@ -105,6 +114,6 @@ fn main() {
     let events = k.into_trace().events;
     println!("checksum {events}");
     println!(
-        "rounds {ROUNDS} sets {sets} clears {clears} reads {reads} takes {takes} gives {gives} events {events}"
+        "rounds {ROUNDS} sets {sets} clears {clears} reads {reads} waits {waits} takes {takes} gives {gives} events {events}"
     );
 }
