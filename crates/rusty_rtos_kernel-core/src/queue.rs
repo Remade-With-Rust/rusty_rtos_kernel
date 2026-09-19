@@ -743,6 +743,12 @@ where
     ///
     /// # Errors
     /// [`Error::Full`] on timeout; [`Error::Gone`] for a stale handle.
+    /// In line on purpose, for the same reason as
+    /// [`Kernel::queue_take`]: seven instructions of prologue and ten of
+    /// epilogue on every one of khot-ir's 48,000 sends, so that `xQueueSend`
+    /// and its siblings could pass four arguments through unchanged. This
+    /// one pays on every instrument, `kernel-ir` included.
+    #[inline(always)]
     pub fn queue_send_generic(
         &mut self,
         queue: QueueHandle,
