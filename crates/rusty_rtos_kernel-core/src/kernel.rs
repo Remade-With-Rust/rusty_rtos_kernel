@@ -2818,17 +2818,23 @@ where
     /// `xTaskPriorityDisinherit`: giving the mutex back drops the
     /// inherited priority. `true` when a yield is wanted.
     pub(crate) fn priority_disinherit(&mut self, holder: TaskHandle) -> Result<bool> {
-        if holder.is_null() || !self.tcbs.contains(holder) {
+        if holder.is_null() {
             return Ok(false);
         }
-        let (priority, base, held) = {
-            let tcb = self.tcbs.resolve(holder)?;
-            (tcb.priority, tcb.base_priority, tcb.mutexes_held)
+        // One lookup where there were three: `contains` asked the arena
+        // whether the holder is there, `resolve` asked again to read its
+        // three fields, and `resolve_mut` asked a third time to put one back
+        // -- with nothing but a subtraction in between. A holder the arena
+        // does not have still answers `Ok(false)`, which is what `contains`
+        // was for.
+        let (priority, base, remaining) = match self.tcbs.resolve_mut(holder) {
+            Ok(tcb) => {
+                let remaining = tcb.mutexes_held.saturating_sub(1);
+                tcb.mutexes_held = remaining;
+                (tcb.priority, tcb.base_priority, remaining)
+            }
+            Err(_) => return Ok(false),
         };
-        let remaining = held.saturating_sub(1);
-        if let Ok(tcb) = self.tcbs.resolve_mut(holder) {
-            tcb.mutexes_held = remaining;
-        }
         if priority == base || remaining != 0 {
             return Ok(false);
         }
