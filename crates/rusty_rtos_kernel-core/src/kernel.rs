@@ -801,10 +801,19 @@ where
     where
         F: for<'a> FnOnce(TaskHandle, &'a str) -> Event<'a>,
     {
-        let name = self.tcbs.get(task).map(|t| t.name).unwrap_or_default();
+        // A sink that never reads the name pays for neither the lookup nor
+        // the UTF-8 validation that turning one into a `&str` costs.
+        let name = if T::WANTS_NAMES {
+            self.tcbs.get(task).map(|t| t.name).unwrap_or_default()
+        } else {
+            Name::default()
+        };
         let tick = self.tick;
         self.trace.note_exits(self.port.exits());
-        self.trace.event(tick, make(task, name.as_str()));
+        self.trace.event(
+            tick,
+            make(task, if T::WANTS_NAMES { name.as_str() } else { "" }),
+        );
     }
 
     pub(crate) fn priority_value(raw: u8) -> Priority {

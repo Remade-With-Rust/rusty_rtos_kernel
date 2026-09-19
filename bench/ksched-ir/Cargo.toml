@@ -1,0 +1,23 @@
+# Instruction counts for the scheduler, per operation.
+#
+# A deterministic counter, not a clock: on this workload a clock measures the
+# box. The conformance corpus is mostly scaffolding and trace; this is not.
+[package]
+name = "ksched-ir"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+
+[workspace]
