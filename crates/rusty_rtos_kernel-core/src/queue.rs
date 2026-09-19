@@ -68,8 +68,16 @@ pub enum Position {
 /// What a queue is underneath (`ucQueueType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    // ORDER IS LOAD-BEARING, and only for the two predicates below. The kinds
+    // that carry data are first and the two mutex kinds are last, so
+    // `carries_data` and `is_mutex` are each a range the compiler can test
+    // with one comparison instead of two. Nothing reads a discriminant, so
+    // the order carries no other meaning.
     /// A queue of values.
     Queue,
+    /// A queue set: a queue whose items are the handles of the queues in
+    /// it. `xQueueSelectFromSet` is a receive from this one.
+    Set,
     /// A binary or counting semaphore: a queue with a zero-size item, so
     /// only the count matters.
     Semaphore,
@@ -78,9 +86,6 @@ pub enum Kind {
     Mutex,
     /// A recursive mutex: as above, and the holder may take it again.
     RecursiveMutex,
-    /// A queue set: a queue whose items are the handles of the queues in
-    /// it. `xQueueSelectFromSet` is a receive from this one.
-    Set,
 }
 
 impl Kind {
