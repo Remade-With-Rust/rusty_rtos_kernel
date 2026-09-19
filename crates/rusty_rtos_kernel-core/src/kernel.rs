@@ -2113,14 +2113,15 @@ where
             return Ok(false);
         }
         let item = Self::state_item(task);
-        if self.lists.container(item)?.is_some() {
-            let _ = self.lists.remove(item);
-        }
+        // `remove` is its own guard, as above.
+        let _ = self.lists.remove(item);
         self.enter_critical();
         {
             let event = Self::event_item(task);
-            if self.lists.container(event)?.is_some() {
-                let _ = self.lists.remove(event);
+            // `remove` answers `NotActive` when the item is in no list, so
+            // it is its own guard -- and `is_ok` is exactly "something was
+            // removed", which is what the flag below depends on.
+            if self.lists.remove(event).is_ok() {
                 if let Some(flag) = self.delay_aborted.get_mut(usize::from(task.index())) {
                     *flag = true;
                 }
@@ -2204,9 +2205,9 @@ where
             }
             self.trace_task(target, |task, name| Event::TaskSuspend { task, name });
             let item = Self::state_item(target);
-            if self.lists.container(item)?.is_some() {
-                let _ = self.lists.remove(item);
-            }
+            // `remove` is its own guard: it answers `NotActive` for an item
+            // in no list, and the result was discarded either way.
+            let _ = self.lists.remove(item);
             let event = Self::event_item(target);
             if self.lists.container(event)?.is_some() {
                 let _ = self.lists.remove(event);
