@@ -839,25 +839,48 @@ where
     /// [`Kernel::MESSAGE_LENGTH_BYTES`] bytes of the ring.
     fn write_length_prefix(&mut self, b: &StreamBuffer, length: usize, head: usize) -> usize {
         let bytes = (length as u64).to_le_bytes();
-        let mut head = head;
-        for i in 0..Self::MESSAGE_LENGTH_BYTES {
-            let byte = bytes.get(i).copied().unwrap_or(0);
-            if let Some(slot) = self.bytes.get_mut(b.base.saturating_add(head)) {
-                *slot = byte;
-            }
-            head = head.saturating_add(1);
-            if head >= b.length {
-                head = 0;
-            }
-        }
-        head
+        // The prefix is bytes in the ring like any other, and `write_bytes`
+        // already wraps in two copies -- this loop was a third hand-rolled
+        // version of the same walk.
+        let prefix = bytes.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&bytes);
+        self.write_bytes(b, prefix, head)
     }
 
     /// The message length back out, and where the message starts.
     fn read_length_prefix(&self, b: &StreamBuffer, tail: usize) -> (usize, usize) {
         let mut raw = [0_u8; 8];
+        let want = Self::MESSAGE_LENGTH_BYTES;
+
+        // Two reads rather than a byte at a time, the way the write side now
+        // writes it. `read_bytes` would do this, but it needs `&mut self` and
+        // this does not have it.
+        if want <= b.length {
+            let upto = b.length.saturating_sub(tail);
+            let first = want.min(upto);
+            let from = b.base.saturating_add(tail);
+            if let (Some(dst), Some(src)) = (
+                raw.get_mut(..first),
+                self.bytes.get(from..from.saturating_add(first)),
+            ) {
+                dst.copy_from_slice(src);
+            }
+            let rest = want.saturating_sub(first);
+            if rest > 0 {
+                if let (Some(dst), Some(src)) = (
+                    raw.get_mut(first..want),
+                    self.bytes.get(b.base..b.base.saturating_add(rest)),
+                ) {
+                    dst.copy_from_slice(src);
+                }
+                return (u64::from_le_bytes(raw) as usize, rest);
+            }
+            let next = tail.saturating_add(first);
+            let next = if next >= b.length { 0 } else { next };
+            return (u64::from_le_bytes(raw) as usize, next);
+        }
+
         let mut tail = tail;
-        for i in 0..Self::MESSAGE_LENGTH_BYTES {
+        for i in 0..want {
             let byte = self
                 .bytes
                 .get(b.base.saturating_add(tail))
