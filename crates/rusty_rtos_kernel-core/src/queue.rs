@@ -965,6 +965,22 @@ where
     /// passes `false`, a peek `true`, and a semaphore take `false`. As a
     /// parameter it cost an argument to set up and a branch at each of the
     /// ten places this function and its copy helper consult it.
+    /// In line on purpose, into all three of `xQueueReceive`, `xQueuePeek`
+    /// and `xSemaphoreTake`.
+    ///
+    /// Out of line it charged eight instructions of prologue and ten of
+    /// epilogue to every take -- 48,000 of them in `khot-ir`, which is 7.6%
+    /// of that instrument -- so that three wrappers could each hand it two
+    /// arguments and return its result unchanged. LLVM declined on size; the
+    /// frame is the reason to overrule that.
+    ///
+    /// The cost is stated rather than hidden: `kernel-ir` pays 214,804 for
+    /// the larger wrappers. Splitting the body from the symbol does not
+    /// recover it -- outlining at the semaphore site alone leaves `kernel-ir`
+    /// 262,828 up and gives back 427,983 of `khot-ir`'s win, and outlining at
+    /// the receive site leaves it 190,238 up and gives back 1,104,183 -- so
+    /// the regression is the wrappers growing, not any one call site.
+    #[inline(always)]
     fn queue_take<const PEEK: bool>(
         &mut self,
         queue: QueueHandle,
