@@ -848,13 +848,19 @@ where
 
     /// `prvCopyDataToQueue`; `true` when giving a mutex back lowered the
     /// giver's priority and a yield is therefore wanted.
-    /// `prvCopyDataToQueue`.
     ///
     /// This resolves rather than taking the caller's snapshot, and
     /// [`Kernel::copy_data_from_queue`] does the opposite. That is not an
     /// inconsistency: both forms were measured on both helpers and they
     /// disagree, because the writer's caller does not keep its snapshot
     /// live across the call and the reader's does.
+    ///
+    /// In line on purpose. `queue_send_generic` is its only caller, and out
+    /// of line it paid a call and a frame on all 48,000 sends to move one
+    /// value into a slot the caller had already resolved. Its reader twin
+    /// was already being inlined by LLVM; this one was over the size
+    /// threshold and was not.
+    #[inline(always)]
     fn copy_data_to_queue(
         &mut self,
         queue: QueueHandle,
