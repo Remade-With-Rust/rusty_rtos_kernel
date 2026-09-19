@@ -1115,6 +1115,20 @@ where
     pub fn resume_pending(&mut self) -> bool {
         self.settle_unwind();
         let index = usize::from(self.current.index());
+
+        // Almost every call answers "nothing owed", and the sequence below
+        // reaches that answer in three stages -- a compare, a match over
+        // `OwedTrace`, then another compare -- each reachable only after the
+        // one before. The same three loads, but one branch instead of three.
+        if self.owed_exits.get(index).copied().unwrap_or(0) == 0
+            && matches!(
+                self.owed_trace.get(index).copied(),
+                Some(OwedTrace::None) | None
+            )
+            && self.owes_yield.get(index).copied() != Some(true)
+        {
+            return false;
+        }
         // First the stack unwinds — the sections the task had open when it
         // was switched out, and whatever its abandoned frame opened after
         // that — and only then does the statement after the yield run.
@@ -1226,6 +1240,13 @@ where
     /// so this is called once, at the top of [`Kernel::resume_pending`],
     /// which is the first thing the runner does.
     fn settle_unwind(&mut self) {
+        // Nothing to settle is the common case by a wide margin, and `take()`
+        // writes `None` back even then -- a store, on every call, to clear a
+        // slot that was already clear. Peeking first leaves the store for the
+        // calls that actually have something to clear.
+        if self.unwinding.is_none() {
+            return;
+        }
         let Some(task) = self.unwinding.take() else {
             return;
         };
