@@ -865,14 +865,40 @@ where
     pub fn exit_critical(&mut self) {
         self.port.exit_critical();
         if self.port.take_pending_tick() {
-            self.tick_from_isr();
+            self.tick_on_exit();
         }
+    }
+
+    /// The tick as [`Kernel::exit_critical`] reaches it, deliberately out of
+    /// line.
+    ///
+    /// `exit_critical` is inlined into every queue walker and every demo
+    /// step, and the tick is its rare arm -- 8,000 of 48,000 sends in
+    /// `khot-ir` raise one, and 38,013 ticks across 18 scenarios in
+    /// `kernel-ir`. Left in line it put `increment_tick` and
+    /// `switch_context` inside all of those frames.
+    ///
+    /// Taking it out is worth 233,207 on `kernel-ir` and costs the four
+    /// kernel micro-instruments 9,650 between them, which is about what one
+    /// extra call layer costs at their call counts.
+    ///
+    /// The other half was refuted: `#[inline(always)]` on
+    /// [`Kernel::tick_from_isr`] itself costs `khot-ir` 178,245 while saving
+    /// the three lighter instruments 82,642, and stacked on top of this
+    /// outlining it still costs `khot-ir` 12,001, `ksched-ir` 7,555 and
+    /// `kipc-ir` 2,000 for nothing `kernel-ir` did not already have. So the
+    /// body keeps LLVM's own choice and only this call site is pinned.
+    #[inline(never)]
+    fn tick_on_exit(&mut self) {
+        self.tick_from_isr();
     }
 
     /// `vPortSystemTickHandler`: the tick, from interrupt context.
     ///
     /// A silicon port calls this from its timer interrupt. The sim reaches
-    /// it from [`Kernel::exit_critical`] and from the idle hook.
+    /// it from [`Kernel::exit_critical`] -- through [`Kernel::tick_on_exit`],
+    /// which is where the reason for this attribute is written down -- and
+    /// from the idle hook.
     pub fn tick_from_isr(&mut self) {
         self.port.set_in_tick_entry(true);
         self.port.count_tick();
