@@ -927,7 +927,7 @@ where
     /// [`Error::Empty`] when the block time expires with the queue still
     /// empty; [`Error::Gone`] for a stale handle.
     pub fn queue_receive(&mut self, queue: QueueHandle, ticks: u64) -> Result<Wait<u64>> {
-        self.queue_take(queue, ticks, false)
+        self.queue_take::<false>(queue, ticks)
     }
 
     /// `xQueuePeek`: read the head without removing it.
@@ -935,7 +935,7 @@ where
     /// # Errors
     /// As [`Kernel::queue_receive`].
     pub fn queue_peek(&mut self, queue: QueueHandle, ticks: u64) -> Result<Wait<u64>> {
-        self.queue_take(queue, ticks, true)
+        self.queue_take::<true>(queue, ticks)
     }
 
     /// `xSemaphoreTake`, which is `xQueueSemaphoreTake`: a receive with no
@@ -944,7 +944,7 @@ where
     /// # Errors
     /// [`Error::Empty`] on timeout; [`Error::Gone`] for a stale handle.
     pub fn semaphore_take(&mut self, semaphore: QueueHandle, ticks: u64) -> Result<Wait<()>> {
-        match self.queue_take(semaphore, ticks, false)? {
+        match self.queue_take::<false>(semaphore, ticks)? {
             Blocked => Ok(Blocked),
             Ready(_) => Ok(Ready(())),
         }
@@ -952,7 +952,15 @@ where
 
     /// The shared body of `xQueueReceive`, `xQueuePeek` and
     /// `xQueueSemaphoreTake` — one pass of the C `for(;;)`.
-    fn queue_take(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
+    /// `PEEK` is a const because it is one at every call site: a receive
+    /// passes `false`, a peek `true`, and a semaphore take `false`. As a
+    /// parameter it cost an argument to set up and a branch at each of the
+    /// ten places this function and its copy helper consult it.
+    fn queue_take<const PEEK: bool>(
+        &mut self,
+        queue: QueueHandle,
+        ticks: u64,
+    ) -> Result<Wait<u64>> {
         let caller = self.current;
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
@@ -973,19 +981,19 @@ where
         // nothing leaves the caller exactly as it found it -- which is
         // what `configASSERT( pxQueue )` means in the C.
         if snapshot.waiting > 0 {
-            let value = self.copy_data_from_queue(queue, &snapshot, peek)?;
+            let value = self.copy_data_from_queue(queue, &snapshot, PEEK)?;
             self.trace.note_exits(self.port.exits());
             let tick = self.tick;
             // `xQueuePeek` is its own function in the C with its own trace
             // macro; `xQueueSemaphoreTake` shares `xQueueReceive`'s.
-            let event = if peek {
+            let event = if PEEK {
                 Event::QueuePeek { queue, name: "" }
             } else {
                 Event::QueueReceive { queue, name: "" }
             };
             self.trace.event(tick, event);
-            if peek {
-                // A peek wakes another *receiver*, not a sender: the item
+            if PEEK {
+                // A PEEK wakes another *receiver*, not a sender: the item
                 // is still there.
                 let receivers = Self::queue_receive_list(queue);
                 if self.lists.is_empty(receivers) == Ok(false)
@@ -1016,8 +1024,8 @@ where
         if self.remaining_ticks(caller) == 0 {
             self.exit_critical();
             // `traceQUEUE_PEEK_FAILED` is not one of the harness's hooks,
-            // so a failed peek says nothing on either side.
-            if !peek {
+            // so a failed PEEK says nothing on either side.
+            if !PEEK {
                 self.trace_failure_or_owe(caller, OwedTrace::ReceiveFailed(queue));
             }
             self.end_wait(caller);
@@ -1039,7 +1047,7 @@ where
                     self.priority_disinherit_after_timeout(holder, highest)?;
                     self.exit_critical();
                 }
-                if !peek {
+                if !PEEK {
                     self.trace_failure_or_owe(caller, OwedTrace::ReceiveFailed(queue));
                 }
                 self.end_wait(caller);
@@ -1048,7 +1056,7 @@ where
             return Ok(Blocked);
         }
         if self.is_queue_empty(queue) {
-            let event = if peek {
+            let event = if PEEK {
                 Event::BlockingOnQueuePeek { queue, name: "" }
             } else {
                 Event::BlockingOnQueueReceive { queue, name: "" }
