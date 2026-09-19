@@ -1334,6 +1334,10 @@ where
 
     /// Emit a queue failure line now, or owe it if a tick switched the
     /// caller out of the call that was about to emit it.
+    /// In line on purpose, at all seven call sites. It is reached 46,671
+    /// times in kernel-ir and every one of them paid a call and a frame to
+    /// choose between two events the caller had already decided between.
+    #[inline(always)]
     pub(crate) fn trace_failure_or_owe(&mut self, caller: TaskHandle, owed: OwedTrace) {
         if self.current == caller {
             let tick = self.tick;
