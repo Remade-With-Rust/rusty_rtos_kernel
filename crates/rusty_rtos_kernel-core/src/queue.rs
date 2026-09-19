@@ -1142,7 +1142,10 @@ where
         if !snapshot.kind.carries_data() {
             if !peek {
                 let q = self.queues.resolve_mut(queue)?;
-                q.waiting = q.waiting.saturating_sub(1);
+                // Wrapping: all three callers reach here under
+                // `waiting > 0`, and the doc above says the snapshot they
+                // tested cannot be stale, so there is an item to take.
+                q.waiting = q.waiting.wrapping_sub(1);
             }
             return Ok(0);
         }
@@ -1159,7 +1162,8 @@ where
         if !peek {
             let q = self.queues.resolve_mut(queue)?;
             q.read_from = next;
-            q.waiting = q.waiting.saturating_sub(1);
+            // Wrapping, for the same reason as the branch above.
+            q.waiting = q.waiting.wrapping_sub(1);
         }
         Ok(value)
     }
@@ -1259,7 +1263,9 @@ where
                     if self.notify_queue_set_container(queue)? {
                         self.missed_yield();
                     }
-                    tx_lock = tx_lock.saturating_sub(1);
+                    // Wrapping: the loop runs only while this is above
+                    // `LOCKED_UNMODIFIED`, so one off it stays in range.
+                    tx_lock = tx_lock.wrapping_sub(1);
                     continue;
                 }
                 let receivers = Self::queue_receive_list(queue);
@@ -1269,7 +1275,8 @@ where
                 if self.remove_from_event_list(receivers)? {
                     self.missed_yield();
                 }
-                tx_lock = tx_lock.saturating_sub(1);
+                // Wrapping: bounded by the loop, as above.
+                tx_lock = tx_lock.wrapping_sub(1);
             }
             if let Ok(q) = self.queues.resolve_mut(queue) {
                 q.tx_lock = UNLOCKED;
@@ -1291,7 +1298,8 @@ where
                 if self.remove_from_event_list(senders)? {
                     self.missed_yield();
                 }
-                rx_lock = rx_lock.saturating_sub(1);
+                // Wrapping: bounded by the loop, as above.
+                rx_lock = rx_lock.wrapping_sub(1);
             }
             if let Ok(q) = self.queues.resolve_mut(queue) {
                 q.rx_lock = UNLOCKED;
