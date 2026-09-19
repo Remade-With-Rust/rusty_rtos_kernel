@@ -865,6 +865,10 @@ where
     }
 
     /// The message length back out, and where the message starts.
+    /// Bounded as [`Kernel::read_bytes`] is, and converted for the same
+    /// reasons: `tail` is below `length`, `base + length` is at most
+    /// `BYTES`, `first` is `min(want, upto)`, and every index passes through
+    /// a `get` that refuses anything the ring does not own.
     fn read_length_prefix(&self, b: &StreamBuffer, tail: usize) -> (usize, usize) {
         let mut raw = [0_u8; 8];
         let want = Self::MESSAGE_LENGTH_BYTES;
@@ -873,26 +877,26 @@ where
         // writes it. `read_bytes` would do this, but it needs `&mut self` and
         // this does not have it.
         if want <= b.length {
-            let upto = b.length.saturating_sub(tail);
+            let upto = b.length.wrapping_sub(tail);
             let first = want.min(upto);
-            let from = b.base.saturating_add(tail);
+            let from = b.base.wrapping_add(tail);
             if let (Some(dst), Some(src)) = (
                 raw.get_mut(..first),
-                self.bytes.get(from..from.saturating_add(first)),
+                self.bytes.get(from..from.wrapping_add(first)),
             ) {
                 dst.copy_from_slice(src);
             }
-            let rest = want.saturating_sub(first);
+            let rest = want.wrapping_sub(first);
             if rest > 0 {
                 if let (Some(dst), Some(src)) = (
                     raw.get_mut(first..want),
-                    self.bytes.get(b.base..b.base.saturating_add(rest)),
+                    self.bytes.get(b.base..b.base.wrapping_add(rest)),
                 ) {
                     dst.copy_from_slice(src);
                 }
                 return (u64::from_le_bytes(raw) as usize, rest);
             }
-            let next = tail.saturating_add(first);
+            let next = tail.wrapping_add(first);
             let next = if next >= b.length { 0 } else { next };
             return (u64::from_le_bytes(raw) as usize, next);
         }
@@ -901,13 +905,13 @@ where
         for i in 0..want {
             let byte = self
                 .bytes
-                .get(b.base.saturating_add(tail))
+                .get(b.base.wrapping_add(tail))
                 .copied()
                 .unwrap_or(0);
             if let Some(slot) = raw.get_mut(i) {
                 *slot = byte;
             }
-            tail = tail.saturating_add(1);
+            tail = tail.wrapping_add(1);
             if tail >= b.length {
                 tail = 0;
             }
