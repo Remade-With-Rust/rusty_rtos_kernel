@@ -365,6 +365,13 @@ pub struct Kernel<
     /// the `true` direction costs one slow path; it is never wrong the
     /// other way, because every writer raises it.
     owes_anything: [bool; TASKS],
+    /// Does this task have a wait frame set?
+    ///
+    /// A mirror of its `wait.entry_set`, so [`Kernel::end_wait`] can
+    /// answer "nothing to clear" -- which is almost every call -- without
+    /// resolving the TCB to find out. Two writers, the same two that move
+    /// the flag itself.
+    wait_set: [bool; TASKS],
     /// The task whose abandoned frame is running right now, if any.
     unwinding: Option<TaskHandle>,
     /// `vApplicationTickHook`, held by value so it can borrow the kernel.
@@ -465,6 +472,7 @@ where
             owes_yield: [false; TASKS],
             owed_exits: [0; TASKS],
             owes_anything: [false; TASKS],
+            wait_set: [false; TASKS],
             unwinding: None,
             tick_hook,
             delay_aborted: [false; TASKS],
@@ -2622,11 +2630,27 @@ where
                 inherited: false,
             };
         }
+        // The frame is set either way on this path -- either it was written
+        // just now, or it was already this queue's.
+        if let Some(flag) = self.wait_set.get_mut(usize::from(task.index())) {
+            *flag = true;
+        }
         Ok(())
     }
 
     /// The call finished, one way or the other.
     pub(crate) fn end_wait(&mut self, task: TaskHandle) {
+        // Almost every call arrives with no frame to clear, and the mirror
+        // says so in one byte where resolving the TCB to read `entry_set`
+        // cost an arena lookup. Out of range reads as SET, so an impossible
+        // index still takes the slow path below.
+        let at = usize::from(task.index());
+        if !self.wait_set.get(at).copied().unwrap_or(true) {
+            return;
+        }
+        if let Some(flag) = self.wait_set.get_mut(at) {
+            *flag = false;
+        }
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
             // Now that the frame is only set on the path that blocks, most
             // calls reach here with nothing to clear, and this was writing
