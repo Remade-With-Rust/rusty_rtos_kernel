@@ -6,13 +6,12 @@
 [![docs.rs](https://docs.rs/rusty_rtos_kernel/badge.svg)](https://docs.rs/rusty_rtos_kernel)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-The **Kairos scheduler** — FreeRTOS's kernel remade in Rust. Tasks, the tick,
+The Kairos scheduler: FreeRTOS's kernel remade in Rust. Tasks, the tick,
 queues, semaphores, mutexes with priority inheritance, task notifications,
-software timers, event groups, and stream and message buffers. No C, no FFI,
-`#![forbid(unsafe_code)]`, `no_std`, MIT OR Apache-2.0.
+software timers, event groups, and stream and message buffers. No C, no FFI.
 
-Its correctness claim is not a test suite. It is a **line-by-line diff against
-the C kernel's own execution trace**.
+Its correctness claim is not a test suite. It is a line-by-line diff against
+the C kernel's own execution trace.
 
 - **Proven**: 19 conformance scenarios produce traces **byte-identical** to the
   C kernel's for 100,000 ticks each, on four architectures — and the same
