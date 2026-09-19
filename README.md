@@ -189,6 +189,12 @@ FreeRTOS remade in memory-safe Rust, as independent packages that expose the API
 a FreeRTOS developer already knows and prove every scheduling decision against
 the C kernel's own trace. `rusty_rtos_kernel` is the scheduler at the centre of it.
 
+**Where this sits for Mata.** Kairos is the real-time layer on the device
+itself, and [`rusty_rtos_mqtt`](https://github.com/Remade-With-Rust/rusty_rtos_mqtt) is the way out of it.
+Paired with the **MATA distributed cloud**, robotics and sensor data has two
+routes — read it on the machine, or reach it through the cloud — with the same
+memory-safe crates at both ends.
+
 The family:
 [`rusty_rtos_core`](https://crates.io/crates/rusty_rtos_core) (the shared vocabulary),
 [`rusty_rtos_kernel`](https://crates.io/crates/rusty_rtos_kernel) (the scheduler),
@@ -207,9 +213,18 @@ the rest of **[github.com/remade-with-rust](https://github.com/remade-with-rust)
 
 <!-- ORG BOILERPLATE — keep identical across repos -->
 
-[Mata Network](https://www.mata.network) builds sovereign, self-hostable
-infrastructure. **Remade With Rust** is our open-source home for the
-permissively-licensed building blocks that work depends on.
+**[Mata Network](https://www.mata.network/)** builds sovereign, self-hostable
+privacy infrastructure — *"stop sacrificing your privacy for convenience"*:
+wallet & identity, a password manager, a contact manager, and a browser
+extension that stops your information leaking as you browse.
+
+**Remade With Rust** is our open-source home for the permissively-licensed
+building blocks that work depends on — including
+[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs) (the
+FFmpeg alternative) and [FFAI](https://github.com/Remade-With-Rust/FFAI) (the
+AI media toolkit).
+
+→ **[www.mata.network](https://www.mata.network/)**
 
 <!-- /ORG BOILERPLATE -->
 
