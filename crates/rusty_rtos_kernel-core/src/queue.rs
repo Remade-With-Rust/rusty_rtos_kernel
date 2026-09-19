@@ -498,7 +498,8 @@ where
                 name: "",
             },
         );
-        let mut woke = self.copy_data_to_queue(set, u64::from(queue.to_raw()), Position::Back)?;
+        let mut woke =
+            self.copy_data_to_queue(set, &container, u64::from(queue.to_raw()), Position::Back)?;
         if tx_lock == UNLOCKED {
             let receivers = Self::queue_receive_list(set);
             if self.lists.is_empty(receivers) == Ok(false)
@@ -576,7 +577,7 @@ where
         self.trace
             .event(tick, Event::QueueSendFromIsr { queue, name: "" });
         let previously_waiting = snapshot.waiting;
-        let _ = self.copy_data_to_queue(queue, value, position)?;
+        let _ = self.copy_data_to_queue(queue, &snapshot, value, position)?;
         let mut woken = Woken::NO;
         if tx_lock == UNLOCKED {
             if snapshot.set_container != QueueHandle::NULL {
@@ -769,7 +770,7 @@ where
             let tick = self.tick;
             self.trace.event(tick, Event::QueueSend { queue, name: "" });
             let previously_waiting = snapshot.waiting;
-            let yield_required = self.copy_data_to_queue(queue, value, position)?;
+            let yield_required = self.copy_data_to_queue(queue, &snapshot, value, position)?;
             if snapshot.set_container != QueueHandle::NULL {
                 // A queue in a set announces the arrival there, not here.
                 // An overwrite of an item that was already present is not an
@@ -852,10 +853,15 @@ where
     fn copy_data_to_queue(
         &mut self,
         queue: QueueHandle,
+        snapshot: &Queue,
         value: u64,
         position: Position,
     ) -> Result<bool> {
-        let snapshot = *self.queues.resolve(queue)?;
+        // The snapshot comes from the caller, which has already resolved this
+        // handle -- and nothing between that resolve and this call can reach
+        // the arena. Resolving again here made every send pay for the same
+        // four checks twice. `copy_data_from_queue` has always taken its
+        // snapshot this way.
         let mut yield_required = false;
         // `prvCopyDataToQueue` counts the item in — except on an overwrite
         // of a queue that already held one, where it decrements first so
