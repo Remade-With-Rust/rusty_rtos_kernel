@@ -2151,6 +2151,12 @@ where
     #[inline(never)]
     fn wake_due_tasks(&mut self, now: u64) -> bool {
         let mut switch_required = false;
+        // Hoisted: see the note at the bottom of the loop.
+        let running = if C::USE_PREEMPTION {
+            self.current_priority()
+        } else {
+            0
+        };
         loop {
             let delayed = self.delayed_list();
             if self.lists.is_empty(delayed) != Ok(false) {
@@ -2183,9 +2189,21 @@ where
             if self.add_task_to_ready_list(task).is_err() {
                 return switch_required;
             }
-            if C::USE_PREEMPTION {
+            // `!switch_required` FIRST, and the running priority read once
+            // for the whole drain.
+            //
+            // Both of these cost a TCB resolve -- a generation check, a
+            // bounds check and an `Option` -- and this loop runs once per
+            // task the tick wakes. `self.current` cannot move while the
+            // drain is running (nothing here switches), so the running
+            // priority is a loop invariant that was being re-derived on
+            // every lap. And once a switch is already required, asking again
+            // can only set a `true` to `true`, which is not worth the
+            // resolve it costs -- the same reasoning `increment_tick`
+            // already applies one level up.
+            if C::USE_PREEMPTION && !switch_required {
                 let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-                if woken > self.current_priority() {
+                if woken > running {
                     switch_required = true;
                 }
             }
