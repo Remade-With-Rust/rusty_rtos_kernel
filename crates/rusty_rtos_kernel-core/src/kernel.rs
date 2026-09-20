@@ -3270,3 +3270,283 @@ where
         Ok(false)
     }
 }
+
+// ================================================================ tests ==
+
+/// `kernel.rs` is corpus-oracled BY DESIGN (`docs/HOLES.md` H3), and these
+/// do not change that. They exist for the mutants that survived BOTH
+/// oracles — measured, 80 of 415 viable — because the corpus and the unit
+/// suite each cannot reach them:
+///
+/// * the corpus runs `PosixDemoConfig` for 2,000 ticks, so the TICK
+///   OVERFLOW arms of `delay_until` never execute. Nine survivors sat
+///   there, and the only way to reach them is to choose a
+///   `previous_wake` near the maximum rather than to simulate 2^32 ticks;
+/// * the diagnostic accessors (`task_at`, `ready_items`, `ready_cursor`)
+///   and the geometry guard in `with_tick_hook` are called by no scenario
+///   at all — they are also on H2's list of APIs with no differential, so
+///   two independent methods agree on the same surface.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use rusty_rtos_core::config::Config;
+    use rusty_rtos_core::hooks::NoTickHook;
+
+    use crate::system::tests::{NoTrace, TestConfig, TestPort};
+
+    type K = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::items_for(4, 0) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+    >;
+
+    fn kernel() -> K {
+        K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// A kernel with one task of our own running, so the calls that act on
+    /// "the current task" have one.
+    fn running() -> K {
+        let mut k = kernel();
+        k.create_task("t", 1).expect("a task");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "t" {
+                return k;
+            }
+            k.switch_context();
+        }
+        panic!("the task never reached the CPU");
+    }
+
+    /// `vTaskDelayUntil` with no overflow: a deadline still ahead delays,
+    /// and one already passed does NOT.
+    ///
+    /// ```c
+    /// else if( ( xTimeIncrement > ( xConstTickCount - *pxPreviousWakeTime ) ) ... )
+    /// ```
+    ///
+    /// The second half is the one that matters and the one a naive test
+    /// misses: a task that overran its period must NOT sleep a whole extra
+    /// one, it must return immediately and say it did not delay.
+    #[test]
+    fn delay_until_skips_a_deadline_that_has_already_passed() {
+        let mut k = running();
+
+        // now is 0; the deadline is 20 ticks away, so it delays.
+        let mut previous = 0_u64;
+        assert_eq!(k.delay_until(&mut previous, 20), Ok(true));
+        assert_eq!(previous, 20, "the wake time advances by the period");
+
+        // Run the clock well past the next deadline.
+        for _ in 0..60_u32 {
+            k.tick_from_isr();
+        }
+
+        // now is 60 and the deadline was 40: already gone.
+        let mut previous = 20_u64;
+        assert_eq!(
+            k.delay_until(&mut previous, 20),
+            Ok(false),
+            "the period was overrun, so it must not sleep another one"
+        );
+        assert_eq!(
+            previous, 40,
+            "and the wake time STILL advances, or the task never catches up"
+        );
+    }
+
+    /// The tick-overflow arm, which the corpus cannot reach in 2,000 ticks.
+    ///
+    /// ```c
+    /// if( xConstTickCount < *pxPreviousWakeTime ) {
+    ///     if( ( xTimeToWake < *pxPreviousWakeTime ) && ( xTimeToWake > xConstTickCount ) )
+    /// ```
+    ///
+    /// Both halves are needed: the wake time must have wrapped TOO, and it
+    /// must still be ahead of the wrapped-around now. Reaching it needs a
+    /// `previous_wake` near the maximum, not 2^32 ticks of simulation.
+    #[test]
+    fn delay_until_handles_a_wake_time_that_wrapped_with_the_tick() {
+        let mut k = running();
+        let max = K::MAX_DELAY;
+
+        // A few ticks, so `now` is small and positive.
+        for _ in 0..5_u32 {
+            k.tick_from_isr();
+        }
+
+        // previous_wake sits just below the maximum; the period carries the
+        // wake time over the top, to 9. now is 5, so 9 is still ahead.
+        let mut previous = max.wrapping_sub(10);
+        assert_eq!(
+            k.delay_until(&mut previous, 20),
+            Ok(true),
+            "wrapped, and still in the future: it must delay"
+        );
+        assert_eq!(previous, 9, "the wake time wrapped with the tick");
+
+        // Same wrap, but the wake time is already behind a larger now.
+        let mut k = running();
+        for _ in 0..40_u32 {
+            k.tick_from_isr();
+        }
+        let mut previous = max.wrapping_sub(10);
+        assert_eq!(
+            k.delay_until(&mut previous, 20),
+            Ok(false),
+            "wrapped, and now is already past it: it must NOT delay"
+        );
+    }
+
+    /// `task_at` walks the arena by SLOT, which is how a debugger or a
+    /// health check enumerates tasks without holding handles.
+    #[test]
+    fn task_at_enumerates_live_slots_and_stops_at_the_end() {
+        let mut k = kernel();
+        let a = k.create_task("a", 1).expect("a task");
+
+        assert_eq!(k.task_at(0), Some(a), "slot zero is the first task");
+        assert_eq!(
+            k.task_at(usize::from(u16::MAX)),
+            None,
+            "past the arena is None, not a handle"
+        );
+        assert_eq!(
+            k.task_at(usize::from(u16::MAX) + 1),
+            None,
+            "and an index that does not even fit a u16 is None, not a panic"
+        );
+    }
+
+    /// `ready_items` fills the caller's buffer and answers how many it
+    /// wrote, stopping at the buffer's end rather than running past it.
+    #[test]
+    fn ready_items_fills_what_it_can_and_counts_what_it_filled() {
+        let mut k = kernel();
+        k.create_task("a", 1).expect("a");
+        k.create_task("b", 1).expect("b");
+
+        let mut out = [0_u16; 8];
+        let n = k.ready_items(1, &mut out);
+        assert_eq!(n, 2, "two tasks are ready at priority 1");
+
+        // A buffer too small must be filled to its end and no further.
+        let mut small = [0_u16; 1];
+        assert_eq!(
+            k.ready_items(1, &mut small),
+            1,
+            "it wrote one, because one is all there was room for"
+        );
+
+        // An empty priority writes nothing.
+        let mut out = [0_u16; 8];
+        assert_eq!(k.ready_items(0, &mut out), 0);
+    }
+
+    /// `ready_cursor` is the diagnostic that answers "did the round robin
+    /// move", so it must report the list it was asked about.
+    #[test]
+    fn ready_cursor_reports_the_list_it_was_asked_about() {
+        let mut k = kernel();
+        k.create_task("a", 1).expect("a");
+        k.create_task("b", 1).expect("b");
+
+        let before = k.ready_cursor(1);
+        k.switch_context();
+        let after = k.ready_cursor(1);
+        assert_ne!(after, before, "a switch moved the cursor at priority 1");
+        assert_eq!(
+            k.ready_cursor(0),
+            k.ready_cursor(0),
+            "and an untouched priority answers the same thing twice"
+        );
+    }
+
+    /// `with_tick_hook`'s geometry guard, which is the only thing standing
+    /// between a mis-declared kernel and a silently wrong one.
+    ///
+    /// `ITEMS` and `LISTS` are derived constants; if a caller writes them
+    /// by hand and gets them wrong, every list index is off. The guard
+    /// refuses, and these are the arms of it.
+    #[test]
+    fn the_geometry_guard_refuses_a_kernel_that_does_not_add_up() {
+        // ITEMS too small for the declared tasks and timers.
+        type WrongItems = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            2,
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        >;
+        assert!(
+            WrongItems::new(TestPort::default(), NoTrace).is_err(),
+            "ITEMS must be items_for(TASKS, TIMERS)"
+        );
+
+        // LISTS not derived from the priorities, queues and groups.
+        type WrongLists = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            { crate::items_for(4, 0) },
+            2,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        >;
+        assert!(
+            WrongLists::new(TestPort::default(), NoTrace).is_err(),
+            "LISTS must be lists_for(MAX_PRIORITIES, QUEUES, GROUPS)"
+        );
+
+        // A kernel with no room for a single task.
+        type NoTasks = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            0,
+            { crate::items_for(0, 0) },
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        >;
+        assert!(
+            NoTasks::new(TestPort::default(), NoTrace).is_err(),
+            "TASKS == 0 cannot even hold the idle task"
+        );
+
+        // And the geometry that DOES add up is accepted, or the three
+        // assertions above would pass for the wrong reason.
+        assert!(K::new(TestPort::default(), NoTrace).is_ok());
+    }
+}
