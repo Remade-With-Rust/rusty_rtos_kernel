@@ -50,6 +50,7 @@ fn main() {
     let mutex = k.mutex_create().ok();
     let recursive = k.mutex_create_recursive().ok();
 
+    let mut blocks = 0u64;
     let mut sets = 0u64;
     let mut clears = 0u64;
     let mut reads = 0u64;
@@ -78,6 +79,30 @@ fn main() {
             }
             if k.event_group_clear_bits(g, bits).is_ok() {
                 clears = clears.wrapping_add(1);
+            }
+        }
+
+        // ---- BLOCK, which nothing here used to do ----------------------
+        //
+        // Every wait above passes 0 as its timeout, so the event group is
+        // exercised only where the condition is already decided. The
+        // blocking path is a different animal: the waiter goes on the
+        // group's event list with the bits it wants and its wait mode
+        // ENCODED IN THE LIST ITEM's value, and a later setter has to walk
+        // that list and decide, per waiter, whether the new bits satisfy it.
+        //
+        // Waiting on a bit that is never set reaches all of it, every round.
+        if let Some(g) = group {
+            let never = 1u32 << 30;
+            // `matches!(.., Wait::Blocked)`, not `is_ok()`. This returns
+            // `Result<Wait<u32>>`, so `is_ok()` counts a wait that answered
+            // IMMEDIATELY just as happily as one that parked -- which is
+            // exactly the thing this instrument was added to stop doing.
+            if matches!(
+                k.event_group_wait_bits(g, never, false, false, 2),
+                Ok(Wait::Blocked)
+            ) {
+                blocks = blocks.wrapping_add(1);
             }
         }
 
@@ -114,6 +139,6 @@ fn main() {
     let events = k.into_trace().events;
     println!("checksum {events}");
     println!(
-        "rounds {ROUNDS} sets {sets} clears {clears} reads {reads} waits {waits} takes {takes} gives {gives} events {events}"
+        "rounds {ROUNDS} blocks {blocks} sets {sets} clears {clears} reads {reads} waits {waits} takes {takes} gives {gives} events {events}"
     );
 }

@@ -57,6 +57,11 @@ fn main() {
     let message = k.message_buffer_create(64).ok();
     let timer = k.timer_create("t", 10, true, 0, 0).ok();
 
+    // A stream buffer nothing ever fills, so a receive with a real timeout
+    // parks the caller instead of answering it.
+    let starved = k.stream_buffer_create(64, 1).ok();
+
+    let mut blocks = 0u64;
     let mut notifies = 0u64;
     let mut takes = 0u64;
     let mut sends = 0u64;
@@ -102,6 +107,26 @@ fn main() {
             }
         }
 
+        // ---- BLOCK, which nothing here used to do ----------------------
+        //
+        // Every notification and stream-buffer call above passes 0 as its
+        // timeout, so both are exercised only where they answer at once. The
+        // blocking path is the one with the machinery: a notification waiter
+        // parks on the DELAYED list alone (a task waiting on a notification
+        // is on no event list at all, which is its own special case in
+        // `eTaskGetState`), while a stream-buffer waiter parks on an event
+        // list AND the delayed list, and the timeout unlinks both.
+        //
+        // Two different shapes, and neither had an instrument.
+        if matches!(k.notify_wait(0, 0, 0, 2), Ok(Wait::Blocked)) {
+            blocks = blocks.wrapping_add(1);
+        }
+        if let Some(b) = starved {
+            if matches!(k.stream_buffer_receive(b, &mut sink, 3), Ok(Wait::Blocked)) {
+                blocks = blocks.wrapping_add(1);
+            }
+        }
+
         // Timer commands, which travel through the timer queue.
         if let Some(t) = timer {
             if k.timer_start(t, 0).is_ok() {
@@ -118,6 +143,6 @@ fn main() {
     let events = k.into_trace().events;
     println!("checksum {events}");
     println!(
-        "rounds {ROUNDS} notifies {notifies} takes {takes} sends {sends} receives {receives} commands {commands} events {events}"
+        "rounds {ROUNDS} notifies {notifies} takes {takes} sends {sends} receives {receives} blocks {blocks} commands {commands} events {events}"
     );
 }

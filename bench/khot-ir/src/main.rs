@@ -44,6 +44,7 @@ fn main() {
         return;
     };
 
+    let mut blocks = 0u64;
     let mut sends = 0u64;
     let mut receives = 0u64;
     let mut takes = 0u64;
@@ -70,6 +71,12 @@ fn main() {
     };
     let Ok(sem) = k.semaphore_create_counting(8, 0) else {
         println!("semaphore refused");
+        return;
+    };
+    // A queue nothing ever sends to, so a receive with a real timeout parks
+    // the caller instead of answering it.
+    let Ok(starved) = k.queue_create(2) else {
+        println!("starved queue refused");
         return;
     };
 
@@ -102,6 +109,25 @@ fn main() {
             }
         }
 
+        // ---- BLOCK, which nothing here used to do ----------------------
+        //
+        // Every queue and semaphore call above passes 0 as its timeout, so
+        // the queue is exercised only on the path where it answers
+        // immediately. The other path is the one with the machinery in it:
+        // `vTaskPlaceOnEventList` puts the caller on an event list sorted by
+        // PRIORITY, `prvAddCurrentTaskToDelayedList` puts it on the delayed
+        // list sorted by wake time, and the timeout has to unlink BOTH.
+        //
+        // A receive from a queue nobody fills reaches all of it, every
+        // round, deterministically. The semaphore take is the same machinery
+        // with no payload and a different waiter list.
+        if matches!(k.queue_receive(starved, 3), Ok(Wait::Blocked)) {
+            blocks = blocks.wrapping_add(1);
+        }
+        if matches!(k.semaphore_take(sem, 2), Ok(Wait::Blocked)) {
+            blocks = blocks.wrapping_add(1);
+        }
+
         // A tick every round, which is where the delayed lists and the
         // time-slice decision get walked.
         if round % 2 == 0 {
@@ -113,6 +139,6 @@ fn main() {
     let events = k.into_trace().events;
     println!("checksum {events}");
     println!(
-        "rounds {ROUNDS} sends {sends} receives {receives} gives {gives} takes {takes} ticks {ticks} events {events}"
+        "rounds {ROUNDS} sends {sends} receives {receives} gives {gives} takes {takes} blocks {blocks} ticks {ticks} events {events}"
     );
 }
