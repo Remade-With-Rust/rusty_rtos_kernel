@@ -3549,4 +3549,96 @@ mod tests {
         // assertions above would pass for the wrong reason.
         assert!(K::new(TestPort::default(), NoTrace).is_ok());
     }
+    /// `prvGetExpectedIdleTime`, arm one: something above the idle
+    /// priority is running, so there is no window to sleep through.
+    ///
+    /// The three arms are a short-circuit chain and each is separately
+    /// constructible, which is how they get pinned one at a time. A `>`
+    /// turned `>=` in any of them would let the kernel sleep through work
+    /// that is ready NOW.
+    #[test]
+    fn expected_idle_time_is_zero_while_anything_outranks_the_idle_task() {
+        let mut k = kernel();
+        k.create_task("hi", 1).expect("a task above idle");
+        k.start_scheduler().expect("start");
+
+        assert!(
+            k.current_priority() > 0,
+            "the task above idle is the one running"
+        );
+        assert_eq!(
+            k.expected_idle_time(),
+            0,
+            "something outranks idle, so the window is zero"
+        );
+    }
+
+    /// Arm two: another task shares the idle priority, so the very next
+    /// tick has to be processed to give it its slice.
+    #[test]
+    fn expected_idle_time_is_zero_when_another_idle_task_wants_the_slice() {
+        let mut k = kernel();
+        k.create_task("a", 0).expect("a task AT the idle priority");
+        k.start_scheduler().expect("start");
+
+        assert!(
+            k.ready_len(0).unwrap_or(0) > 1,
+            "the idle task and ours are both ready at priority 0"
+        );
+        assert_eq!(
+            k.expected_idle_time(),
+            0,
+            "a shared slice cannot be slept through"
+        );
+    }
+
+    /// And with none of the three arms true, the window is the time to the
+    /// next unblock -- which is the number the whole tickless feature
+    /// rests on.
+    #[test]
+    fn expected_idle_time_is_the_window_to_the_next_unblock() {
+        let mut k = running();
+        k.delay(30).expect("park our task for thirty ticks");
+
+        // Only the idle task is ready now, and nothing outranks it.
+        assert_eq!(k.current_priority(), 0, "the idle task is running");
+        assert_eq!(k.ready_len(0).unwrap_or(0), 1, "and it is alone at zero");
+        assert_eq!(
+            k.expected_idle_time(),
+            30,
+            "so the port may sleep right up to the next unblock"
+        );
+    }
+
+    /// `ulTaskNotifyValueClear`'s reader half, and `xTaskNotifyAndQuery`'s:
+    /// it answers the slot it was ASKED for, for the task it was asked
+    /// about.
+    ///
+    /// Pinned with a value that is neither 0 nor 1, because those are what
+    /// the surviving mutants replaced it with.
+    #[test]
+    fn notify_value_answers_the_slot_it_was_asked_for() {
+        use crate::kernel::NotifyAction;
+
+        let mut k = running();
+        let me = k.current();
+        k.notify(me, 0, 0xabcd_1234, NotifyAction::Overwrite)
+            .expect("notify");
+
+        assert_eq!(
+            k.notify_value(Some(me), 0),
+            Ok(0xabcd_1234),
+            "the value that was set, not zero and not one"
+        );
+        assert_eq!(
+            k.notify_value(None, 0),
+            Ok(0xabcd_1234),
+            "None means the CURRENT task"
+        );
+        assert!(
+            k.notify_value(Some(me), TestConfig::NOTIFICATION_ARRAY_ENTRIES)
+                .is_err(),
+            "an index past the configured array is an error, not a zero"
+        );
+    }
 }
