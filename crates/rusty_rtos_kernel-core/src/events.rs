@@ -524,8 +524,8 @@ mod tests {
         TestPort,
         NoTrace,
         NoTickHook,
-        3,
-        { crate::items_for(3, 1) },
+        4,
+        { crate::items_for(4, 1) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 2) },
         1,
         2,
@@ -1023,5 +1023,88 @@ mod tests {
             k.switch_context();
         }
         assert!(finished, "the waiter never ran again");
+    }
+
+    /// A real two-task rendezvous, which is the only way to reach
+    /// `finish_sync` -- the path that decides what a BLOCKED sync answers
+    /// when somebody else completes it.
+    ///
+    /// `cargo mutants` left sixteen survivors in that one function after
+    /// the three single-task sync tests, for the same reason `finish_wait`
+    /// had twelve: nothing ever blocked on a sync and then ran again.
+    ///
+    /// The C blocks the first arrival with
+    /// `uxBitsToWaitFor | eventCLEAR_EVENTS_ON_EXIT_BIT | eventWAIT_FOR_ALL_BITS`,
+    /// so a rendezvous is always ALL-bits and always clears.
+    #[test]
+    fn two_tasks_rendezvous_and_the_one_that_waited_is_told_it_completed() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.create_task("a", 1).expect("first arrival");
+        k.create_task("b", 1).expect("second arrival");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        const A: u32 = 0b0001;
+        const B: u32 = 0b0010;
+        const BOTH: u32 = A | B;
+
+        // `a` arrives first: it sets its own bit and blocks on both.
+        let mut waited = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "a" {
+                assert_eq!(
+                    k.event_group_sync(g, A, BOTH, 50),
+                    Ok(Wait::Blocked),
+                    "only one of the two has arrived"
+                );
+                waited = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(waited, "task a never reached the CPU");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(A),
+            "and its arrival is recorded while it waits"
+        );
+
+        // `b` arrives second: the rendezvous completes inside ITS call.
+        let mut completed = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "b" {
+                assert_eq!(
+                    k.event_group_sync(g, B, BOTH, 50),
+                    Ok(Wait::Ready(BOTH)),
+                    "the second arrival sees both and does not block"
+                );
+                completed = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(completed, "task b never reached the CPU");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0),
+            "the rendezvous bits are consumed once, not twice"
+        );
+
+        // `a` resumes and takes the completion path.
+        let mut resumed = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "a" {
+                assert_eq!(
+                    k.event_group_sync(g, A, BOTH, 50),
+                    Ok(Wait::Ready(BOTH)),
+                    "it is told the rendezvous completed, even though the                      group is empty again by the time it runs"
+                );
+                resumed = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(resumed, "task a never ran again");
     }
 }
