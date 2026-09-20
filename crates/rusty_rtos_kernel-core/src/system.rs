@@ -781,11 +781,9 @@ mod tests {
     #[test]
     #[allow(clippy::indexing_slicing)]
     fn ten_blocked_tasks_wake_in_wake_time_order() {
-        let mut k = deep::Kernel::<TestPort, NoTrace, NoTickHook>::new(
-            TestPort::default(),
-            NoTrace,
-        )
-        .expect("the declared geometry adds up");
+        let mut k =
+            deep::Kernel::<TestPort, NoTrace, NoTickHook>::new(TestPort::default(), NoTrace)
+                .expect("the declared geometry adds up");
         // Created directly rather than through `System::build`. Build would
         // also create the declared queue, and that slot is the one
         // `xTimerCreateTimerTask` needs at startup -- the declaration is
@@ -850,8 +848,7 @@ mod tests {
             k.tick_from_isr();
             for (i, task) in all.iter().enumerate() {
                 if asleep[i]
-                    && k.task_state_get(*task).expect("state")
-                        != crate::kernel::TaskState::Blocked
+                    && k.task_state_get(*task).expect("state") != crate::kernel::TaskState::Blocked
                 {
                     asleep[i] = false;
                     woke[w] = i;
@@ -866,7 +863,10 @@ mod tests {
         let mut want = blocked;
         want.sort_by_key(|(ticks, _)| *ticks);
         let want = want.map(|(_, which)| which);
-        assert_eq!(woke, want, "the delayed list did not wake in wake-time order");
+        assert_eq!(
+            woke, want,
+            "the delayed list did not wake in wake-time order"
+        );
     }
 
     /// Creating a task at a HIGHER priority than the running one must ask
@@ -971,8 +971,8 @@ mod tests {
     /// `docs/HOLES.md` H2 -- and this is the only evidence there is.
     #[test]
     fn the_trigger_level_contract() {
-        let mut k = BufferKernel::new(TestPort::default(), NoTrace)
-            .expect("the declared geometry adds up");
+        let mut k =
+            BufferKernel::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
 
         // `create(1, 1)` is a length of TWO: one byte of payload and the
         // spare. The smallest buffer a caller can actually make.
@@ -990,7 +990,11 @@ mod tests {
 
         let wide = k.stream_buffer_create(8, 1).expect("an eight-byte buffer");
         assert_eq!(k.stream_buffer_set_trigger_level(wide, 0), Ok(true));
-        assert_eq!(k.stream_buffer_set_trigger_level(wide, 8), Ok(true), "8 < 9");
+        assert_eq!(
+            k.stream_buffer_set_trigger_level(wide, 8),
+            Ok(true),
+            "8 < 9"
+        );
         assert_eq!(
             k.stream_buffer_set_trigger_level(wide, 9),
             Ok(false),
