@@ -40,6 +40,7 @@ use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::trace::CountTrace;
 
 use rusty_rtos_kernel_core::kernel::{Kernel, TaskState};
+use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_port_core::SimPort;
 
 type SchedKernel = Kernel<
@@ -112,8 +113,13 @@ fn main() {
 
     let _ = k.start_scheduler();
 
+    // A queue nothing ever sends to, so a receive with a timeout parks the
+    // caller on BOTH lists and the timeout is what wakes it.
+    let queue = k.queue_create(4).ok();
+
     let mut delays = 0u64;
     let mut ticks = 0u64;
+    let mut blocked_on_queue = 0u64;
     let mut deepest = 0usize;
 
     for round in 0..ROUNDS {
@@ -121,6 +127,25 @@ fn main() {
         let want = DELAYS.get(i).copied().unwrap_or(1);
         if k.delay(want).is_ok() {
             delays = delays.wrapping_add(1);
+        }
+
+        // ---- block on an EVENT LIST, not just the clock ----------------
+        //
+        // `vTaskDelay` puts a task on the delayed list and nothing else.
+        // Every other way a task waits -- a queue, a semaphore, an event
+        // group, a notification -- puts it on an EVENT LIST as well, through
+        // `vTaskPlaceOnEventList`, which is `vListInsert` sorted by PRIORITY
+        // rather than by wake time. That is a second sorted insert, on a
+        // second list, and the tick has to unlink both when the timeout
+        // fires.
+        //
+        // Receiving from a queue nobody sends to is the cheapest way to
+        // reach it: the receive always times out, so the path runs every
+        // time and the workload stays deterministic.
+        if let Some(q) = queue {
+            if matches!(k.queue_receive(q, 3), Ok(Wait::Blocked)) {
+                blocked_on_queue = blocked_on_queue.wrapping_add(1);
+            }
         }
 
         // ---- prove the list has DEPTH ---------------------------------
@@ -161,5 +186,7 @@ fn main() {
 
     let events = k.into_trace().events;
     println!("checksum {events}");
-    println!("rounds {ROUNDS} delays {delays} ticks {ticks} deepest {deepest} events {events}");
+    println!(
+        "rounds {ROUNDS} delays {delays} queue_blocks {blocked_on_queue} ticks {ticks} deepest {deepest} events {events}"
+    );
 }
