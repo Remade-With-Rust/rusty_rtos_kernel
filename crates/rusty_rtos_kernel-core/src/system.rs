@@ -869,6 +869,66 @@ mod tests {
         assert_eq!(woke, want, "the delayed list did not wake in wake-time order");
     }
 
+    /// Creating a task at a HIGHER priority than the running one must ask
+    /// for a switch; creating one LOWER must not.
+    ///
+    /// **This closes a gap the ledger measured and left open.** `cargo
+    /// mutants` over `kernel.rs`, judged by the conformance corpus, left six
+    /// survivors, and five were this one line in `prvAddNewTaskToReadyList`:
+    ///
+    /// ```text
+    /// if self.running && C::USE_PREEMPTION && self.current_priority() < priority
+    /// ```
+    ///
+    /// `death` was added so the corpus would create tasks after the
+    /// scheduler had started, and it narrowed six survivors to four. It
+    /// could not do better, for a reason visible in its own source:
+    /// `vCreateTasks` creates both suicidal tasks at `uxTaskPriorityGet(
+    /// NULL )` -- its OWN priority -- so the new task never outranks the
+    /// running one. The guard is reached and evaluated on every create and
+    /// is never TRUE. Mutations that make it fire spuriously die at once;
+    /// mutations that suppress a yield which never happens are invisible.
+    /// Reachable is not killed.
+    ///
+    /// No corpus scenario creates a higher-priority task while running, and
+    /// none can be added without a C original to diff against. A unit test
+    /// can do it, and this is it. The four survivors:
+    ///
+    /// | mutation | caught by |
+    /// |---|---|
+    /// | condition → `false` | the HIGHER half |
+    /// | body removed (no yield) | the HIGHER half |
+    /// | `<` → `>` | the HIGHER half |
+    /// | `<` → `!=` | the LOWER half |
+    ///
+    /// Which is why both halves are here. The lower half looks like a
+    /// formality and is the only thing that kills `!=`.
+    #[test]
+    fn creating_a_higher_priority_task_asks_for_a_switch_and_a_lower_one_does_not() {
+        let mut k = CountingKernel::new(CountingPort::default(), NoTrace)
+            .expect("the declared geometry adds up");
+        let mid = k.create_task("mid", 2).expect("task mid");
+        k.start_scheduler().expect("start");
+        assert_eq!(k.current(), mid, "the only app task runs");
+
+        // ---- LOWER: no switch is owed -----------------------------------
+        let before = k.port().yields.get();
+        let _low = k.create_task("low", 1).expect("task low");
+        assert_eq!(
+            k.port().yields.get(),
+            before,
+            "a task created BELOW the running priority cannot preempt it, so              the kernel must not ask for a switch"
+        );
+
+        // ---- HIGHER: a switch is owed -----------------------------------
+        let before = k.port().yields.get();
+        let _high = k.create_task("high", 3).expect("task high");
+        assert!(
+            k.port().yields.get() > before,
+            "a task created ABOVE the running priority preempts it, and the              kernel must ask for the switch"
+        );
+    }
+
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
     }
