@@ -1,0 +1,30 @@
+# Instruction counts for the kernel when tasks actually BLOCK.
+#
+# The gap its four siblings leave: they all pass a zero timeout, so nothing
+# is ever parked and `vListInsert` -- the only walk in list.c -- never runs.
+#
+# A deterministic counter, not a clock: on this workload a clock measures the
+# box. The conformance corpus is mostly scaffolding and trace; this is not.
+[package]
+name = "kdelay-ir"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+deep = []
+
+[dependencies]
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+
+[workspace]

@@ -14,7 +14,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
 
-bin=target/release/ksched-ir
+bin=target/release/kdelay-ir
 cargo build --release
 [ -f "$bin" ] || { echo "no binary at $bin" >&2; exit 1; }
 
