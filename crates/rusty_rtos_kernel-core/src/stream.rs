@@ -1298,4 +1298,83 @@ mod tests {
             }
         }
     }
+    /// A STREAM buffer takes a partial write; a MESSAGE buffer is
+    /// all-or-nothing. `prvWriteMessageToBuffer`:
+    ///
+    /// ```c
+    /// if( message buffer ) {
+    ///     if( xSpace >= xRequiredSpace ) { ...write the header... }
+    ///     else { xDataLengthBytes = 0; }          /* nothing at all */
+    /// } else {
+    ///     xDataLengthBytes = configMIN( xDataLengthBytes, xSpace );   /* as much as fits */
+    /// }
+    /// ```
+    ///
+    /// So the same call with the same arguments loses the tail on one kind
+    /// and loses everything on the other, and the return value is the only
+    /// way to tell which happened.
+    #[test]
+    fn a_stream_takes_a_partial_write_and_a_message_is_all_or_nothing() {
+        let mut k = kernel();
+        let s = k.stream_buffer_create(8, 1).expect("a stream buffer");
+        k.stream_buffer_send(s, b"123456", 0).expect("six");
+        assert_eq!(
+            k.stream_buffer_send(s, b"789", 0),
+            Ok(Wait::Ready(2)),
+            "two of the three fit, and two is what it took"
+        );
+        assert_eq!(k.stream_buffer_spaces_available(s), Ok(0));
+
+        let mut k = kernel();
+        let m = k.message_buffer_create(8).expect("a message buffer");
+        // One message of two costs the header plus two: six of the eight.
+        k.stream_buffer_send(m, b"xy", 0)
+            .expect("the first message");
+        assert_eq!(
+            k.stream_buffer_send(m, b"zzz", 0),
+            Ok(Wait::Ready(0)),
+            "the header plus three does not fit, so NOTHING was written"
+        );
+        assert_eq!(
+            k.stream_buffer_next_message_length(m),
+            Ok(2),
+            "and the message already there is untouched"
+        );
+    }
+
+    /// `xStreamBufferSendFromISR` writes what fits and never blocks -- the
+    /// same body as the task-side send with the block time forced to zero.
+    #[test]
+    fn send_from_isr_writes_what_fits_and_never_blocks() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+
+        let (n, _) = k.stream_buffer_send_from_isr(b, b"abc").expect("isr");
+        assert_eq!(n, 3);
+        assert_eq!(k.stream_buffer_bytes_available(b), Ok(3));
+
+        // Past the end: it takes the five that fit rather than waiting.
+        let (n, _) = k.stream_buffer_send_from_isr(b, b"defghijkl").expect("isr");
+        assert_eq!(n, 5, "five of the nine fit");
+        assert_eq!(k.stream_buffer_is_full(b), Ok(true));
+
+        let (n, _) = k.stream_buffer_send_from_isr(b, b"m").expect("isr");
+        assert_eq!(n, 0, "full, and it still did not block");
+    }
+
+    /// A round trip through the two ISR halves, which is what an
+    /// interrupt-driven driver actually does.
+    #[test]
+    fn a_message_survives_a_round_trip_through_both_isr_halves() {
+        let mut k = kernel();
+        let b = k.message_buffer_create(16).expect("a message buffer");
+        let (n, _) = k.stream_buffer_send_from_isr(b, b"ping").expect("isr");
+        assert_eq!(n, 4);
+
+        let mut out = [0_u8; 16];
+        let (n, _) = k.stream_buffer_receive_from_isr(b, &mut out).expect("isr");
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], b"ping");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+    }
 }

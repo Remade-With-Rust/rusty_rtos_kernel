@@ -512,28 +512,40 @@ mod tests {
     use rusty_rtos_core::config::Config;
     use rusty_rtos_core::hooks::NoTickHook;
 
+    use crate::events::{PENDED_CLEAR_BITS, PENDED_SET_BITS};
     use crate::queue::Wait;
     use crate::system::tests::{NoTrace, TestConfig, TestPort};
 
     /// Three tasks, one queue for the timer daemon, and two event groups.
+    /// The ISR half of this API defers through the timer command queue, so
+    /// a timer slot has to exist even though no timer is ever created.
     type K = crate::Kernel<
         TestConfig,
         TestPort,
         NoTrace,
         NoTickHook,
         3,
-        { crate::items_for(3, 0) },
+        { crate::items_for(3, 1) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 2) },
         1,
+        2,
+        0,
+        0,
         1,
-        0,
-        0,
-        0,
         2,
     >;
 
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// A started kernel with the daemon PARKED, so work it defers stays
+    /// deferred until a test asks for it.
+    fn started() -> K {
+        let mut k = kernel();
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        k
     }
 
     /// `xEventGroupClearBits`:
@@ -718,6 +730,153 @@ mod tests {
         assert!(
             k.event_group_bits(g).is_err(),
             "a stale handle is an error, not a zero"
+        );
+    }
+    /// The ALL/ANY predicate, with a detector that can actually SEE the
+    /// difference.
+    ///
+    /// `prvTestWaitCondition`:
+    ///
+    /// ```c
+    /// if( xWaitForAllBits == pdFALSE ) {
+    ///     if( ( uxCurrentEventBits & uxBitsToWaitFor ) != 0 ) { xWaitConditionMet = pdTRUE; }
+    /// } else {
+    ///     if( ( uxCurrentEventBits & uxBitsToWaitFor ) == uxBitsToWaitFor ) { xWaitConditionMet = pdTRUE; }
+    /// }
+    /// ```
+    ///
+    /// The earlier version of this test compared RETURN VALUES, and with a
+    /// zero block time an unsatisfied wait answers the current bits just
+    /// like a satisfied one -- so it could not tell the two apart, and
+    /// `cargo mutants` proved it: `&` to `|`, `&` to `^` and `==` to `!=`
+    /// all survived it.
+    ///
+    /// CLEAR-ON-EXIT is the detector. It runs only when the wait was
+    /// satisfied, so the bits afterwards say which branch was taken.
+    #[test]
+    fn the_all_and_any_predicates_decide_whether_clear_on_exit_runs() {
+        // ANY, one of two bits present: satisfied, so clear-on-exit runs.
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b0001).expect("set");
+        k.event_group_wait_bits(g, 0b0011, true, false, 0)
+            .expect("wait");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0000),
+            "ANY was satisfied by one bit, so clear-on-exit took it"
+        );
+
+        // ALL, one of two bits present: NOT satisfied, so nothing is taken.
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b0001).expect("set");
+        k.event_group_wait_bits(g, 0b0011, true, true, 0)
+            .expect("wait");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0001),
+            "ALL was NOT satisfied, so clear-on-exit did not run"
+        );
+
+        // ALL, both bits present: satisfied, and only the waited-for bits go.
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b1011).expect("set");
+        k.event_group_wait_bits(g, 0b0011, true, true, 0)
+            .expect("wait");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b1000),
+            "ALL satisfied: bits 0 and 1 taken, bit 3 was nobody's business"
+        );
+    }
+
+    /// `xEventGroupSetBitsFromISR` does not set any bits.
+    ///
+    /// ```c
+    /// xReturn = xTimerPendFunctionCallFromISR( &vEventGroupSetBitsCallback,
+    ///                                          ( void * ) xEventGroup,
+    ///                                          ( uint32_t ) uxBitsToSet,
+    ///                                          pxHigherPriorityTaskWoken );
+    /// ```
+    ///
+    /// The whole body is a deferral to the timer daemon, so the answer is
+    /// "the callback was queued" and the group is untouched until the
+    /// daemon runs it. An ISR that sets a bit and an ISR that asks for a
+    /// bit to be set are different things, and this is the second.
+    #[test]
+    fn set_bits_from_isr_only_queues_the_work() {
+        let mut k = started();
+        let g = k.event_group_create().expect("a group");
+
+        let (queued, _woken) = k.event_group_set_bits_from_isr(g, 0b0101).expect("isr");
+        assert!(queued, "the callback was queued");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0),
+            "and NOTHING is set yet: the daemon has not run"
+        );
+
+        // The daemon's half, which is what `TickHook::pended` routes to.
+        k.event_group_pended_call(PENDED_SET_BITS, u64::from(g.index()), 0b0101)
+            .expect("the daemon runs the callback");
+        assert_eq!(k.event_group_bits(g), Ok(0b0101));
+    }
+
+    /// `xEventGroupClearBitsFromISR` is the same deferral, with the
+    /// clearing callback.
+    #[test]
+    fn clear_bits_from_isr_only_queues_the_work() {
+        let mut k = started();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b1111).expect("set");
+
+        let (queued, _woken) = k.event_group_clear_bits_from_isr(g, 0b0101).expect("isr");
+        assert!(queued, "the callback was queued");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b1111),
+            "and nothing is cleared yet"
+        );
+
+        k.event_group_pended_call(PENDED_CLEAR_BITS, u64::from(g.index()), 0b0101)
+            .expect("the daemon runs the callback");
+        assert_eq!(k.event_group_bits(g), Ok(0b1010));
+    }
+
+    /// `xEventGroupGetBitsFromISR` is the odd one out: it reads the bits
+    /// DIRECTLY under an interrupt-safe critical section, with no
+    /// deferral, so it is the only ISR call here whose answer is current.
+    #[test]
+    fn bits_from_isr_reads_directly_and_is_not_deferred() {
+        let mut k = started();
+        let g = k.event_group_create().expect("a group");
+        assert_eq!(k.event_group_bits_from_isr(g), Ok(0));
+
+        k.event_group_set_bits(g, 0b0110).expect("set from a task");
+        assert_eq!(
+            k.event_group_bits_from_isr(g),
+            Ok(0b0110),
+            "read straight through, unlike set and clear"
+        );
+        assert_eq!(k.event_group_bits_from_isr(g), k.event_group_bits(g));
+    }
+
+    /// A pended call naming a group that does not exist is an error, not a
+    /// silent no-op: the daemon runs these long after the ISR that asked,
+    /// and the group can have been deleted in between.
+    #[test]
+    fn a_pended_call_for_a_deleted_group_is_an_error() {
+        let mut k = started();
+        let g = k.event_group_create().expect("a group");
+        let index = u64::from(g.index());
+        k.event_group_delete(g).expect("delete");
+
+        assert!(
+            k.event_group_pended_call(PENDED_SET_BITS, index, 0b0001)
+                .is_err(),
+            "the slot is empty and the daemon must not write into it"
         );
     }
 }

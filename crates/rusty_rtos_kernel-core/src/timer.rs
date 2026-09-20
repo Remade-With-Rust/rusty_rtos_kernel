@@ -1232,4 +1232,144 @@ mod tests {
         k.process_one_timer_command(0).expect("drain the start");
         assert_eq!(k.timer_is_active(t), Ok(true), "the start, not the stop");
     }
+    /// The ISR halves queue exactly like the task halves do, and are just
+    /// as deferred -- `xTimerStartFromISR` is
+    /// `xTimerGenericCommandFromISR( ..., tmrCOMMAND_START_FROM_ISR, ... )`
+    /// and the daemon is still the only thing that sets the flag.
+    ///
+    /// What differs is the block time: an ISR cannot wait, so there is no
+    /// ticks argument and a full queue is reported at once.
+    #[test]
+    fn a_start_from_isr_is_queued_and_not_active_until_processed() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+
+        let (queued, _woken) = k.timer_start_from_isr(t).expect("isr");
+        assert!(queued, "the command was accepted");
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(false),
+            "and the timer is not running: the daemon has not run"
+        );
+
+        k.process_one_timer_command(0).expect("the daemon runs");
+        assert_eq!(k.timer_is_active(t), Ok(true));
+    }
+
+    /// A stop from an interrupt, likewise deferred -- and it takes effect
+    /// only when the daemon reaches it, so between the two the timer is
+    /// still running and can still expire.
+    #[test]
+    fn a_stop_from_isr_leaves_the_timer_running_until_the_daemon_reaches_it() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+        k.timer_start(t, 0).expect("queue the start");
+        k.process_one_timer_command(0)
+            .expect("the daemon starts it");
+        assert_eq!(k.timer_is_active(t), Ok(true));
+
+        let (queued, _woken) = k.timer_stop_from_isr(t).expect("isr");
+        assert!(queued);
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(true),
+            "STILL RUNNING: an interrupt asked, and nothing has answered yet"
+        );
+
+        k.process_one_timer_command(0).expect("the daemon stops it");
+        assert_eq!(k.timer_is_active(t), Ok(false));
+    }
+
+    /// `xTimerChangePeriodFromISR` carries its value the same way, and the
+    /// period is the daemon's to write.
+    #[test]
+    fn a_change_period_from_isr_carries_its_value_through_the_queue() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+
+        let (queued, _woken) = k.timer_change_period_from_isr(t, 40).expect("isr");
+        assert!(queued);
+        assert_eq!(k.timer_period(t), Ok(10), "not yet");
+
+        k.process_one_timer_command(0).expect("the daemon runs");
+        assert_eq!(k.timer_period(t), Ok(40));
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(true),
+            "and a change period starts a dormant timer, from an ISR too"
+        );
+    }
+
+    /// `xTimerResetFromISR` restarts the countdown from NOW, which is the
+    /// whole point of it -- a reset on a running timer must move the
+    /// expiry, not leave it where it was.
+    #[test]
+    fn a_reset_from_isr_moves_the_expiry_forward() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+        k.timer_start(t, 0).expect("queue the start");
+        k.process_one_timer_command(0)
+            .expect("the daemon starts it");
+        let first = k.timer_expiry_time(t).expect("an expiry");
+
+        for _ in 0..3_u32 {
+            k.tick_from_isr();
+        }
+
+        let (queued, _woken) = k.timer_reset_from_isr(t).expect("isr");
+        assert!(queued);
+        k.process_one_timer_command(0)
+            .expect("the daemon resets it");
+
+        assert_eq!(
+            k.timer_expiry_time(t),
+            Ok(first.wrapping_add(3)),
+            "the countdown restarted from the tick the reset was taken at"
+        );
+    }
+
+    /// `xTimerPendFunctionCall` rides the same queue as the timer commands
+    /// -- it is a way to run something in task context that an interrupt
+    /// asked for, and it competes with real timer work for queue slots.
+    ///
+    /// `TestConfig` gives the queue one slot, so this pins the competition
+    /// rather than assuming it.
+    #[test]
+    fn a_pended_function_call_competes_for_the_same_queue() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+
+        assert_eq!(
+            k.timer_pend_function_call(1, 2, 3, 0),
+            Ok(Wait::Ready(true)),
+            "the callback is queued"
+        );
+        assert_eq!(
+            k.timer_start(t, 0),
+            Ok(Wait::Ready(false)),
+            "and now a timer start has nowhere to go"
+        );
+
+        k.process_one_timer_command(0).expect("drain the callback");
+        assert_eq!(
+            k.timer_start(t, 0),
+            Ok(Wait::Ready(true)),
+            "with the slot free again the start is accepted"
+        );
+    }
+
+    /// The ISR half of the same call, which is how
+    /// `xEventGroupSetBitsFromISR` reaches the daemon.
+    #[test]
+    fn a_pended_function_call_from_isr_queues_without_blocking() {
+        let mut k = started();
+        let (queued, _woken) = k.timer_pend_function_call_from_isr(1, 2, 3).expect("isr");
+        assert!(queued, "queued");
+
+        let (queued, _woken) = k.timer_pend_function_call_from_isr(4, 5, 6).expect("isr");
+        assert!(
+            !queued,
+            "and the second is refused at once: an interrupt cannot wait"
+        );
+    }
 }
