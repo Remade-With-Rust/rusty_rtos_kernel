@@ -735,6 +735,131 @@ mod tests {
         );
     }
 
+    // ---- a delayed list deeper than the conformance corpus ever builds ---
+
+    crate::system! {
+        mod deep use TestConfig;
+        tasks {
+            d0: 1, d1: 1, d2: 1, d3: 1, d4: 1,
+            d5: 1, d6: 1, d7: 1, d8: 1, d9: 1
+        }
+        queues { unused: u8; 1 }
+    }
+
+    /// Ten tasks blocked at once, waking in wake-time order.
+    ///
+    /// **This exists because the conformance gate cannot reach here.** That
+    /// gate is the strongest evidence in the project -- 19 scenarios, every
+    /// scheduling decision compared line-for-line against the instrumented C
+    /// kernel -- and its delayed list never gets deeper than FOUR. Measured,
+    /// by replaying each scenario's own trace and tracking membership:
+    ///
+    /// ```text
+    ///   BlockQ 4  death 4  dynamic 3  PollQ 3  semtest 3  recmutex 3
+    ///   blocktim 3  IntSemTest 3  TimerDemo 3  QPeek 2  GenQTest 2
+    ///   MessageBufferAMP 2  countsem 1  QueueOverwrite 1
+    ///   QueueSetPolling 1  StreamBufferInterrupt 1  EventGroupsDemo 1
+    /// ```
+    ///
+    /// `vListInsert` is the only operation in the kernel whose cost is its
+    /// depth, and the corpus never tests it past n=4. Anything that goes
+    /// wrong only when the list is deep -- an ordering bug, an off-by-one in
+    /// the walk, a fast path that appends where it should splice -- passes
+    /// that gate green.
+    ///
+    /// The delays are deliberately NOT monotonic: a shortcut that appends
+    /// unconditionally orders them wrongly, and ascending delays would let
+    /// it through. They are distinct, because two tasks sharing a wake time
+    /// wake on the same tick and this probe cannot see which left first.
+    #[test]
+    fn ten_blocked_tasks_wake_in_wake_time_order() {
+        let mut k = deep::Kernel::<TestPort, NoTrace, NoTickHook>::new(
+            TestPort::default(),
+            NoTrace,
+        )
+        .expect("the declared geometry adds up");
+        // Created directly rather than through `System::build`: the
+        // declaration sizes the kernel, and build would also create the
+        // declared queue, which is the slot `xTimerCreateTimerTask` needs.
+        let mut all = [::rusty_rtos_core::handle::TaskHandle::from_raw(0); 10];
+        for (i, slot) in all.iter_mut().enumerate() {
+            let name = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"][i];
+            *slot = k.create_task(name, 1).expect("task");
+        }
+        let started = k.start_scheduler().expect("start");
+        // Park the timer daemon. It sits at TIMER_TASK_PRIORITY, above these
+        // tasks, so leaving it ready means it is the one that runs and the
+        // ten never get a turn. The tickless tests park it for the same
+        // reason.
+        k.suspend(Some(started.timer)).expect("park the daemon");
+
+        // Out of order on purpose: a shortcut that appends unconditionally
+        // gets these wrong, and ascending delays would let it through.
+        //
+        // DISTINCT, though. Two tasks with the same wake time wake on the
+        // same TICK, and `task_state_get` cannot say which of them left the
+        // delayed list first -- the probe below would record them in index
+        // order whatever the list did. The tie rule is real and it is tested
+        // where it is observable, directly on the list, in
+        // `list::tests::a_value_equal_to_the_tail_goes_after_it`.
+        let delays = [9u64, 3, 14, 7, 1, 11, 5, 8, 2, 13];
+
+        // Block each in turn. `delay` acts on whichever task is RUNNING, so
+        // the schedule picks the order and this records what it picked --
+        // asserting the kernel's own choice rather than assuming one.
+        let mut blocked = [(0u64, 0usize); 10];
+        let mut n = 0usize;
+        for _ in 0..200u32 {
+            if n == all.len() {
+                break;
+            }
+            let running = k.current();
+            if let Some(which) = all.iter().position(|t| *t == running) {
+                if !blocked[..n].iter().any(|(_, w)| *w == which) {
+                    k.delay(delays[which]).expect("blocks");
+                    blocked[n] = (delays[which], which);
+                    n = n.saturating_add(1);
+                }
+            }
+            k.switch_context();
+        }
+        assert_eq!(n, all.len(), "every task should have blocked");
+
+        for (i, task) in all.iter().enumerate() {
+            assert_eq!(
+                k.task_state_get(*task).expect("state"),
+                crate::kernel::TaskState::Blocked,
+                "task {i} should be blocked; all ten are, at once, which is                  more than twice as deep as any conformance scenario reaches"
+            );
+        }
+
+        // Tick forward and record the order they come back.
+        let mut woke = [0usize; 10];
+        let mut w = 0usize;
+        let mut asleep = [true; 10];
+        for _ in 0..40u32 {
+            k.tick_from_isr();
+            for (i, task) in all.iter().enumerate() {
+                if asleep[i]
+                    && k.task_state_get(*task).expect("state")
+                        != crate::kernel::TaskState::Blocked
+                {
+                    asleep[i] = false;
+                    woke[w] = i;
+                    w = w.saturating_add(1);
+                }
+            }
+        }
+        assert_eq!(w, all.len(), "every task should have woken");
+
+        // Ascending wake time; ties in the order they blocked. That is what
+        // `vListInsert` promises and the only order the list guarantees.
+        let mut want = blocked;
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        let want = want.map(|(_, which)| which);
+        assert_eq!(woke, want, "the delayed list did not wake in wake-time order");
+    }
+
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
     }
