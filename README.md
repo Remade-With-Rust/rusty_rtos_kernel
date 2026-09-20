@@ -80,6 +80,28 @@ to a freed object gets a new ordinal where our arena reuses the freed index.
 It is recorded, not hidden, and runs on its own with `kairos conform
 AbortDelay`.
 
+## Tickless idle
+
+Three functions, each the C's, and all inert unless
+`Config::USE_TICKLESS_IDLE` is set — with it off the 19-scenario differential
+is unchanged, byte for byte.
+
+| ours | the C | note |
+|---|---|---|
+| `expected_idle_time` | `prvGetExpectedIdleTime` | zero unless the idle task is genuinely the only runnable thing |
+| `step_tick` | `vTaskStepTick` | leaves the **last** tick *pended* rather than stepped, so `increment_tick` wakes the delayed task through the same code that would have woken it. The whole invariance rests on this line |
+| `idle_suppress_ticks` | the `configUSE_TICKLESS_IDLE` block of `prvIdleTask` | double-sample and all |
+
+A port that oversleeps is **clamped rather than trusted** — winding the clock
+past a task's wake time loses the wake, where losing the extra sleep is
+recoverable, and this kernel may not panic.
+
+Poison-proved: stepping the last tick instead of pending it fails the
+invariance test in unit tests, and on hardware makes every lap arrive one tick
+late — 421 ticks where the arithmetic says 400 — **with the schedule digest
+unchanged**, because nothing was ever out of order. An order check alone cannot
+see a wake that is late; the cells bound the clock as well.
+
 ## Using it
 
 A system declares its geometry; the kernel is sized for exactly what was
