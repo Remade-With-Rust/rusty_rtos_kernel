@@ -879,4 +879,149 @@ mod tests {
             "the slot is empty and the daemon must not write into it"
         );
     }
+    /// `xEventGroupSync` when the rendezvous completes on the spot.
+    ///
+    /// ```c
+    /// uxOriginalBitValue = pxEventBits->uxEventBits;
+    /// ( void ) xEventGroupSetBits( xEventGroup, uxBitsToSet );
+    /// if( ( ( uxOriginalBitValue | uxBitsToSet ) & uxBitsToWaitFor ) == uxBitsToWaitFor )
+    /// {
+    ///     uxReturn = ( uxOriginalBitValue | uxBitsToSet );
+    ///     pxEventBits->uxEventBits &= ~uxBitsToWaitFor;
+    ///     xTicksToWait = 0;
+    /// }
+    /// ```
+    ///
+    /// The answer is the value from BEFORE the clear -- it still contains
+    /// the bits the call is about to take away, and it contains the ones
+    /// this caller just set. Reading it as "what is left in the group" is
+    /// exactly wrong, twice over.
+    #[test]
+    fn a_sync_that_completes_answers_the_value_from_before_it_clears() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b0001)
+            .expect("the other half arrived");
+
+        assert_eq!(
+            k.event_group_sync(g, 0b0010, 0b0011, 0),
+            Ok(Wait::Ready(0b0011)),
+            "original | set, INCLUDING the bits it is about to clear"
+        );
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0000),
+            "and the rendezvous bits are gone: sync always clears on exit"
+        );
+    }
+
+    /// The bits are set EVEN WHEN the rendezvous does not complete, which
+    /// is the whole point of a rendezvous: this caller's arrival has to be
+    /// visible to the participants who have not arrived yet.
+    ///
+    /// The C sets them unconditionally, before it tests the condition.
+    #[test]
+    fn a_sync_that_does_not_complete_still_leaves_its_own_bits_set() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+
+        assert_eq!(
+            k.event_group_sync(g, 0b0001, 0b0011, 0),
+            Ok(Wait::Ready(0b0001)),
+            "not satisfied, so the answer is the CURRENT bits"
+        );
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0001),
+            "and this caller's arrival is still recorded for the others"
+        );
+    }
+
+    /// A sync takes only the bits it waited for, and leaves anything else
+    /// in the group alone.
+    #[test]
+    fn a_sync_clears_only_its_own_rendezvous_bits() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b1000)
+            .expect("somebody else's bit");
+
+        assert_eq!(
+            k.event_group_sync(g, 0b0001, 0b0001, 0),
+            Ok(Wait::Ready(0b1001)),
+            "the answer carries the unrelated bit too"
+        );
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b1000),
+            "and the unrelated bit survives the clear"
+        );
+    }
+
+    /// The WHOLE round trip of a blocked wait: block, be woken by a set,
+    /// and then RUN AGAIN to take the completion path.
+    ///
+    /// The earlier tests here stopped at the wake-up and never resumed the
+    /// waiter, so `finish_wait` -- everything that decides what a resumed
+    /// wait ANSWERS -- was never reached at all. `cargo mutants` found it
+    /// as a dozen survivors in one function.
+    #[test]
+    fn a_woken_waiter_resumes_and_is_told_which_bits_satisfied_it() {
+        // NOT `started()`: this creates its own task before starting, and
+        // the scheduler can only be started once.
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.create_task("w", 1).expect("a waiter");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        // Get the waiter onto the CPU and block it, clearing on exit.
+        let mut blocked = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "w" {
+                assert_eq!(
+                    k.event_group_wait_bits(g, 0b0011, true, true, 50),
+                    Ok(Wait::Blocked),
+                    "ALL of two bits, neither set yet"
+                );
+                blocked = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(blocked, "never got the waiter onto the CPU");
+
+        // One bit is not enough for an ALL wait: it must stay blocked.
+        k.event_group_set_bits(g, 0b0001).expect("half of it");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0001),
+            "one bit does not satisfy ALL, so nothing was consumed"
+        );
+
+        // The second completes it, and the waiter's clear-on-exit runs.
+        k.event_group_set_bits(g, 0b0010).expect("the other half");
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b0000),
+            "both bits matched, so the waiter took them"
+        );
+
+        // Now RESUME it: the same call at the same pc takes the finish path.
+        let mut finished = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "w" {
+                assert_eq!(
+                    k.event_group_wait_bits(g, 0b0011, true, true, 50),
+                    Ok(Wait::Ready(0b0011)),
+                    "it is told the bits that satisfied it, not what is \
+                     left in the group after its own clear"
+                );
+                finished = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(finished, "the waiter never ran again");
+    }
 }
