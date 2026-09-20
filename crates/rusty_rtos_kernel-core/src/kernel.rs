@@ -3641,4 +3641,190 @@ mod tests {
             "an index past the configured array is an error, not a zero"
         );
     }
+    /// `delay_until`'s BOUNDARIES, which is where the four mutants that
+    /// survived both oracles live.
+    ///
+    /// Each comparison in it has an edge the ordinary tests never touch,
+    /// and each edge is reachable once you notice that `previous_wake` is
+    /// a CALLER variable and the period may be zero:
+    ///
+    /// | line | comparison | the edge |
+    /// |---|---|---|
+    /// | 3228 | `wake_at < *previous_wake` | equal, via a period of 0 |
+    /// | 3228 | `wake_at > now` | equal, by ticking to the wake time |
+    /// | 3231 | `wake_at < *previous_wake` | equal, via a period of 0 |
+    ///
+    /// All three answers must be "do not delay". A `<=` or a `>=` in any of
+    /// them turns a zero-length wait into a full period of sleep.
+    #[test]
+    fn delay_until_does_not_delay_on_any_of_its_boundaries() {
+        let max = K::MAX_DELAY;
+
+        // (1) OVERFLOW arm, period zero: the wake time equals the previous
+        // one, so there is nothing to wait for.
+        let mut k = running();
+        for _ in 0..5_u32 {
+            k.tick_from_isr();
+        }
+        let mut previous = max.wrapping_sub(10);
+        assert_eq!(
+            k.delay_until(&mut previous, 0),
+            Ok(false),
+            "a period of zero is not a period of MAX_DELAY"
+        );
+
+        // (2) OVERFLOW arm, wake time exactly equal to now: already due.
+        // (max - 10) + 20 wraps to 9, so tick to 9.
+        let mut k = running();
+        for _ in 0..9_u32 {
+            k.tick_from_isr();
+        }
+        let mut previous = max.wrapping_sub(10);
+        assert_eq!(
+            previous.wrapping_add(20) & max,
+            9,
+            "the wake time wraps to 9"
+        );
+        assert_eq!(
+            k.delay_until(&mut previous, 20),
+            Ok(false),
+            "the wrapped wake time is NOW, so it is not in the future"
+        );
+
+        // (3) NON-overflow arm, period zero with now already at the wake
+        // time: neither disjunct holds.
+        let mut k = running();
+        for _ in 0..10_u32 {
+            k.tick_from_isr();
+        }
+        let mut previous = 10_u64;
+        assert_eq!(
+            k.delay_until(&mut previous, 0),
+            Ok(false),
+            "nothing to wait for, and no period to sleep"
+        );
+        assert_eq!(previous, 10, "and the wake time does not move");
+    }
+    /// The tick-wrap bookkeeping, which `xTaskIncrementTick` runs once
+    /// every `MAX_DELAY + 1` ticks.
+    ///
+    /// Neither oracle can reach it: the corpus runs 2,000 ticks and the
+    /// unit suite does not wrap either, so every mutation of it survived
+    /// both. It is a private `fn` and this module is inside `kernel.rs`,
+    /// so the test calls it directly rather than trying to simulate 2^32
+    /// ticks — which is the right answer when the trigger is unreachable
+    /// but the behaviour is not.
+    #[test]
+    fn switching_the_delayed_lists_flips_the_pair_and_counts_the_wrap() {
+        let mut k = running();
+        let swapped = k.delayed_swapped;
+        let overflows = k.overflows;
+
+        k.switch_delayed_lists();
+        assert_ne!(
+            k.delayed_swapped, swapped,
+            "the delayed and overflow lists change places"
+        );
+        assert_eq!(
+            k.overflows,
+            overflows.wrapping_add(1),
+            "and the wrap is counted, because `overflows` is how a trace \
+             tells one epoch from the next"
+        );
+
+        k.switch_delayed_lists();
+        assert_eq!(k.delayed_swapped, swapped, "flipping twice is the identity");
+        assert_eq!(k.overflows, overflows.wrapping_add(2));
+    }
+
+    /// `prvResetNextTaskUnblockTime`, which the wrap calls: after the swap
+    /// the next unblock time has to be recomputed from the list that is
+    /// NOW the delayed one.
+    ///
+    /// That list is empty immediately after a wrap, so the answer must be
+    /// `MAX_DELAY` — a stale value from the old list would make the
+    /// kernel think a task is due and spin, or sleep through one that is.
+    #[test]
+    fn switching_the_delayed_lists_recomputes_the_next_unblock_time() {
+        let mut k = running();
+        let due = k.tick_count().wrapping_add(30);
+        k.delay(30).expect("park our task on the delayed list");
+        assert_eq!(k.next_unblock_time, due, "the parked task is what is next");
+
+        k.switch_delayed_lists();
+        assert_eq!(
+            k.next_unblock_time,
+            u64::MAX,
+            "the list that is now 'delayed' is empty, so nothing is due"
+        );
+    }
+
+    /// The sentinel for "nothing is due" is NOT the same value in the two
+    /// places this kernel writes it, and this pins both.
+    ///
+    /// `new()` starts it at `MAX_DELAY` -- the tick mask, and what the C's
+    /// `portMAX_DELAY` is. `reset_next_task_unblock_time` instead takes
+    /// `head_value` of an empty list, which answers `ListsOf::MAX_VALUE`
+    /// = `u64::MAX`, so the `unwrap_or(MAX_DELAY)` beside it never fires
+    /// for emptiness.
+    ///
+    /// Neither is reachable as a tick, because the tick is masked to
+    /// `MAX_DELAY`, so no scheduling decision can tell them apart and the
+    /// corpus is green either way. It IS visible to the tickless path:
+    /// `expected_idle_time` answers `next_unblock_time - tick`, which is
+    /// the window the port is handed, and the two sentinels differ there
+    /// by four billion.
+    ///
+    /// Recorded rather than changed: making them agree is an owner
+    /// decision, because `expected_idle_time` feeds a port and any change
+    /// to it moves what a tickless build asks for.
+    #[test]
+    fn the_nothing_is_due_sentinel_differs_between_init_and_reset() {
+        let k = kernel();
+        assert_eq!(
+            k.next_unblock_time,
+            K::MAX_DELAY,
+            "a fresh kernel uses the tick mask, which is the C's portMAX_DELAY"
+        );
+
+        let mut k = running();
+        k.reset_next_task_unblock_time();
+        assert_eq!(
+            k.next_unblock_time,
+            u64::MAX,
+            "and a reset over an empty list uses the LIST's maximum instead"
+        );
+        assert_ne!(
+            K::MAX_DELAY,
+            u64::MAX,
+            "the two are genuinely different values, or this test is vacuous"
+        );
+    }
+
+    /// The stream-buffer resume flag is a ONE-SHOT: the take clears it, so
+    /// a second take answers None. A `take` that did not clear would let a
+    /// blocked reader wake twice on one send.
+    #[test]
+    fn a_stream_resume_is_taken_once_and_then_gone() {
+        let mut k = running();
+        let me = k.current();
+        assert_eq!(k.take_stream_resume(me), None, "nothing set yet");
+
+        k.set_stream_resume(me, 7);
+        assert_eq!(k.take_stream_resume(me), Some(7), "the value that was set");
+        assert_eq!(k.take_stream_resume(me), None, "and it is consumed");
+    }
+
+    /// `vTaskMissedYield`: a yield asked for while the scheduler is
+    /// suspended has to be remembered, or it is simply lost.
+    #[test]
+    fn a_missed_yield_is_remembered_rather_than_dropped() {
+        let mut k = running();
+        k.yield_pending = false;
+        k.missed_yield();
+        assert!(
+            k.yield_pending,
+            "the yield survives until something can act on it"
+        );
+    }
 }
