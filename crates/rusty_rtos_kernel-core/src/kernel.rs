@@ -2438,29 +2438,19 @@ where
             // blocking with comparable timeouts produce ASCENDING wake times
             // and belong after everything already there.
             //
-            // Three facts make the shortcut sound, and all three are
-            // properties of THIS list rather than of lists in general --
-            // which is why the test lives here and not in `insert`:
+            // `insert_sorted` takes that shortcut, and it asks this caller
+            // for exactly ONE thing: that the list is already sorted. The
+            // delayed list is, because it is only ever built by sorted
+            // inserts and by this append -- so its last item carries its
+            // largest value.
             //
-            //  * the delayed list is only ever built by sorted inserts and
-            //    by this append, so it IS sorted, so its last item carries
-            //    its largest value;
-            //  * `>=` rather than `>` keeps `vListInsert`'s rule that a
-            //    later equal value goes AFTER the ones already there, which
-            //    is exactly where appending puts it;
-            //  * `insert_end` inserts before the CURSOR, and a delayed
-            //    list's cursor never leaves its marker -- only
-            //    `next_round_robin` moves one, and that is called on ready
-            //    lists alone -- so "before the cursor" is "at the tail".
-            //
-            // `insert_end` keeps the item's own value, so the value has to
-            // be set first; `insert` would have written it either way.
-            if wake_at >= self.lists.tail_value(list)? {
-                self.lists.set_value(item, wake_at)?;
-                self.lists.insert_end(list, item)?;
-            } else {
-                self.lists.insert(list, item, wake_at)?;
-            }
+            // The other two promises this call site used to make are gone
+            // into the list, where they are written once instead of at
+            // every future call site: the `>=` tie rule, and the fact that
+            // `insert_end` only appends while the cursor is at the marker.
+            // Both were silent when wrong. See `ListsOf::insert_sorted`,
+            // and `ListsOf::is_sorted` for checking the one that is left.
+            self.lists.insert_sorted(list, item, wake_at)?;
             if wake_at < self.next_unblock_time {
                 self.next_unblock_time = wake_at;
             }
