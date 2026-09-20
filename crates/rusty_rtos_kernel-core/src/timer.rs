@@ -984,3 +984,252 @@ where
         self.timers.handle_at(index)
     }
 }
+
+// ================================================================ tests ==
+
+/// `timer.rs` had no unit test at all, and three of its APIs are also ones
+/// no conformance scenario reaches (`docs/HOLES.md`, H2 and H3).
+///
+/// Every test here quotes the `timers.c` line it pins, and pins **the C's
+/// contract** rather than this kernel's behaviour.
+///
+/// The theme is that the timer API is a COMMAND QUEUE. Every mutator
+/// returns "the command was queued", not "the thing happened", and the
+/// queries read state the daemon has not updated yet. That is the single
+/// most surprising thing about this API and no scenario in the corpus
+/// isolates it, because a scenario always lets the daemon run.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use rusty_rtos_core::config::Config;
+    use rusty_rtos_core::hooks::NoTickHook;
+
+    use crate::queue::Wait;
+    use crate::system::tests::{NoTrace, TestConfig, TestPort};
+
+    /// Three tasks (idle, the timer daemon, one spare), one queue for the
+    /// timer commands, and room for two timers.
+    type K = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        3,
+        { crate::items_for(3, 2) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        2,
+        0,
+        0,
+        2,
+        0,
+    >;
+
+    /// A started kernel with the daemon PARKED, so a queued command stays
+    /// queued until a test asks for it to be processed.
+    fn started() -> K {
+        let mut k = K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        k
+    }
+
+    /// `xTimerStart` queues a command; it does not start a timer.
+    ///
+    /// `prvProcessReceivedCommands` is where the flag is actually set:
+    ///
+    /// ```c
+    /// case tmrCOMMAND_START:
+    ///     ...
+    ///     pxTimer->ucStatus |= tmrSTATUS_IS_ACTIVE;
+    /// ```
+    ///
+    /// so `pdPASS` from `xTimerStart` means "the daemon has been told", and
+    /// `xTimerIsTimerActive` keeps saying pdFALSE until the daemon runs. A
+    /// caller that starts a timer and immediately asks whether it is active
+    /// gets "no", correctly.
+    #[test]
+    fn a_start_only_queues_and_the_timer_is_not_active_until_it_is_processed() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+        assert_eq!(k.timer_is_active(t), Ok(false), "created dormant");
+
+        assert_eq!(
+            k.timer_start(t, 0),
+            Ok(Wait::Ready(true)),
+            "the COMMAND was accepted"
+        );
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(false),
+            "and the timer is still not running: the daemon has not run"
+        );
+
+        k.process_one_timer_command(0).expect("the daemon runs");
+        assert_eq!(k.timer_is_active(t), Ok(true), "now it is running");
+    }
+
+    /// `xTimerGetPeriod`:
+    ///
+    /// ```c
+    /// return pxTimer->xTimerPeriodInTicks;
+    /// ```
+    ///
+    /// a plain field read -- and the field is written by the DAEMON:
+    ///
+    /// ```c
+    /// case tmrCOMMAND_CHANGE_PERIOD:
+    ///     pxTimer->xTimerPeriodInTicks = xMessage.u.xTimerParameters.xMessageValue;
+    /// ```
+    ///
+    /// So between `xTimerChangePeriod` returning pdPASS and the daemon
+    /// running, `xTimerGetPeriod` answers the OLD period. Two calls that
+    /// look like a setter and its getter, and they disagree.
+    #[test]
+    fn the_period_is_the_old_one_until_a_change_is_processed() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+        assert_eq!(k.timer_period(t), Ok(10));
+
+        assert_eq!(k.timer_change_period(t, 25, 0), Ok(Wait::Ready(true)));
+        assert_eq!(
+            k.timer_period(t),
+            Ok(10),
+            "the setter returned pdPASS and the getter still says 10"
+        );
+
+        k.process_one_timer_command(0).expect("the daemon runs");
+        assert_eq!(k.timer_period(t), Ok(25));
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(true),
+            "and a change period STARTS a dormant timer, which is the C's rule"
+        );
+    }
+
+    /// `xTimerGetExpiryTime`:
+    ///
+    /// ```c
+    /// xReturn = listGET_LIST_ITEM_VALUE( &( pxTimer->xTimerListItem ) );
+    /// return xReturn;
+    /// ```
+    ///
+    /// An unconditional list-item read. **Nothing checks that the timer is
+    /// active**, so on a dormant one this answers whatever the item was
+    /// last left holding, and the return type cannot say "not running".
+    ///
+    /// The only correct use is gated on `xTimerIsTimerActive`, and that is
+    /// what this pins -- so that a future caller reads it here rather than
+    /// discovering it from a wrong wake-up.
+    #[test]
+    fn expiry_time_is_an_unguarded_list_read_and_needs_is_active_first() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+
+        // Dormant: the call SUCCEEDS and the answer means nothing.
+        assert!(
+            k.timer_expiry_time(t).is_ok(),
+            "it answers happily for a timer that was never started"
+        );
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(false),
+            "and this is the only call that says the answer is meaningless"
+        );
+
+        k.timer_start(t, 0).expect("queue the start");
+        k.process_one_timer_command(0).expect("the daemon runs");
+
+        assert_eq!(k.timer_is_active(t), Ok(true));
+        assert_eq!(
+            k.timer_expiry_time(t),
+            Ok(k.tick_count().wrapping_add(10)),
+            "now it is now-plus-the-period, and now it means something"
+        );
+    }
+
+    /// `vTimerSetReloadMode`:
+    ///
+    /// ```c
+    /// taskENTER_CRITICAL();
+    /// if( xAutoReload != pdFALSE ) { pxTimer->ucStatus |=  tmrSTATUS_IS_AUTORELOAD; }
+    /// else                         { pxTimer->ucStatus &= ~tmrSTATUS_IS_AUTORELOAD; }
+    /// taskEXIT_CRITICAL();
+    /// ```
+    ///
+    /// The odd one out: it is NOT a queued command, it writes the flag
+    /// directly. So unlike every other mutator in this file it takes effect
+    /// at once -- and it does not reschedule anything, so a running timer
+    /// keeps the expiry it already has and the new mode applies from the
+    /// next expiry on.
+    #[test]
+    fn set_auto_reload_is_immediate_and_reschedules_nothing() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a one-shot");
+        assert_eq!(k.timer_auto_reload(t), Ok(false));
+
+        k.timer_start(t, 0).expect("queue the start");
+        k.process_one_timer_command(0).expect("the daemon runs");
+        let expiry = k.timer_expiry_time(t).expect("an expiry");
+
+        // No daemon round trip, unlike start/stop/change-period.
+        k.timer_set_auto_reload(t, true).expect("set");
+        assert_eq!(
+            k.timer_auto_reload(t),
+            Ok(true),
+            "immediate: this one is not a queued command"
+        );
+        assert_eq!(
+            k.timer_expiry_time(t),
+            Ok(expiry),
+            "and it moved nothing: the pending expiry is untouched"
+        );
+        assert_eq!(k.timer_is_active(t), Ok(true));
+    }
+
+    /// The id is the caller's own storage and the kernel never reads it.
+    /// `TimerDemo` uses it to count callbacks, which is the only reason it
+    /// has any coverage at all.
+    #[test]
+    fn the_id_is_the_callers_and_round_trips() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 7, 0).expect("a timer");
+        assert_eq!(k.timer_id(t), Ok(7), "the creation id");
+        k.timer_set_id(t, 0xdead_beef).expect("set");
+        assert_eq!(k.timer_id(t), Ok(0xdead_beef));
+
+        // And it survives the daemon, because no command touches it.
+        k.timer_start(t, 0).expect("queue the start");
+        k.process_one_timer_command(0).expect("the daemon runs");
+        assert_eq!(k.timer_id(t), Ok(0xdead_beef));
+    }
+
+    /// The command queue is finite, and a full one is reported as `pdFAIL`
+    /// from a call whose name suggests it did something.
+    ///
+    /// `TestConfig` declares `configTIMER_QUEUE_LENGTH` of one, so the
+    /// second command with no block time has nowhere to go. It is the same
+    /// answer a caller gets on a busy system, where it is a race rather
+    /// than an arithmetic certainty -- which is why it is worth pinning
+    /// somewhere it is certain.
+    #[test]
+    fn a_full_command_queue_refuses_without_erroring() {
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+
+        assert_eq!(k.timer_start(t, 0), Ok(Wait::Ready(true)), "queued");
+        assert_eq!(
+            k.timer_stop(t, 0),
+            Ok(Wait::Ready(false)),
+            "refused: the queue is full and the block time is zero"
+        );
+        assert_eq!(
+            k.timer_is_active(t),
+            Ok(false),
+            "neither command has run yet"
+        );
+
+        k.process_one_timer_command(0).expect("drain the start");
+        assert_eq!(k.timer_is_active(t), Ok(true), "the start, not the stop");
+    }
+}

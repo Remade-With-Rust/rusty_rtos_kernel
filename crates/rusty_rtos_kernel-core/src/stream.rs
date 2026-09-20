@@ -941,3 +941,361 @@ where
         (u64::from_le_bytes(raw) as usize, tail)
     }
 }
+
+// ================================================================ tests ==
+
+/// `stream.rs` had no unit test at all, and six of its APIs are also the
+/// ones no conformance scenario reaches (`docs/HOLES.md`, H2 and H3). For
+/// those, the only evidence available is a semantic audit against the C
+/// source plus tests that pin what it says.
+///
+/// So every test here quotes the `stream_buffer.c` line it is pinning, and
+/// pins **the C's contract** rather than this kernel's behaviour. A test
+/// written the other way round proves only that the code still does what it
+/// did, which is worth having and is not evidence of conformance.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use rusty_rtos_core::config::Config;
+    use rusty_rtos_core::hooks::NoTickHook;
+
+    use crate::queue::Wait;
+    use crate::system::tests::{NoTrace, TestConfig, TestPort};
+
+    /// A kernel with buffers, which `system!` never declares: the macro
+    /// sizes `BUFFERS` and `BYTES` at zero. Four tasks is the idle task,
+    /// the timer daemon and one of our own, with room to spare.
+    type K = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::items_for(4, 0) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        2,
+        64,
+        0,
+        0,
+    >;
+
+    fn kernel() -> K {
+        K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// The header a message buffer writes in front of every message.
+    const HDR: usize = K::MESSAGE_LENGTH_BYTES;
+
+    /// `xStreamBufferIsEmpty`:
+    ///
+    /// ```c
+    /// if( pxStreamBuffer->xHead == xTail ) { xReturn = pdTRUE; }
+    /// ```
+    ///
+    /// Head-equals-tail, which is emptiness and NOT "nothing readable" --
+    /// the two differ on a message buffer holding only a header, which the
+    /// zero-length-message test below pins.
+    #[test]
+    fn is_empty_is_head_equals_tail() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+
+        k.stream_buffer_send(b, b"abc", 0).expect("send");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(false));
+
+        let mut out = [0_u8; 8];
+        k.stream_buffer_receive(b, &mut out, 0).expect("receive");
+        assert_eq!(
+            k.stream_buffer_is_empty(b),
+            Ok(true),
+            "drained is empty again, wherever head and tail have walked to"
+        );
+    }
+
+    /// `xStreamBufferIsFull` on a STREAM buffer:
+    ///
+    /// ```c
+    /// xBytesToStoreMessageLength = 0;   /* not a message buffer */
+    /// if( xStreamBufferSpacesAvailable( xStreamBuffer ) <= xBytesToStoreMessageLength )
+    /// ```
+    ///
+    /// so full is exactly "no spaces left".
+    #[test]
+    fn is_full_on_a_stream_buffer_means_no_spaces_at_all() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        assert_eq!(k.stream_buffer_spaces_available(b), Ok(8));
+        assert_eq!(k.stream_buffer_is_full(b), Ok(false));
+
+        k.stream_buffer_send(b, b"1234567", 0).expect("send seven");
+        assert_eq!(k.stream_buffer_spaces_available(b), Ok(1));
+        assert_eq!(
+            k.stream_buffer_is_full(b),
+            Ok(false),
+            "one free byte is not full on a STREAM buffer"
+        );
+
+        k.stream_buffer_send(b, b"8", 0).expect("send the last");
+        assert_eq!(k.stream_buffer_spaces_available(b), Ok(0));
+        assert_eq!(k.stream_buffer_is_full(b), Ok(true));
+    }
+
+    /// `xStreamBufferIsFull` on a MESSAGE buffer, which is the one that
+    /// surprises:
+    ///
+    /// ```c
+    /// if( ( pxStreamBuffer->ucFlags & sbFLAGS_IS_MESSAGE_BUFFER ) != 0 )
+    ///     xBytesToStoreMessageLength = sbBYTES_TO_STORE_MESSAGE_LENGTH;
+    /// if( xStreamBufferSpacesAvailable( xStreamBuffer ) <= xBytesToStoreMessageLength )
+    /// ```
+    ///
+    /// `<=`, against the size of the LENGTH HEADER rather than against
+    /// zero. So a message buffer reports FULL while it still has free
+    /// bytes, because those bytes could not hold even a zero-length
+    /// message's header.
+    ///
+    /// A caller that polls `is_full` and expects `spaces_available() == 0`
+    /// is wrong by up to a header, and only on message buffers.
+    #[test]
+    fn is_full_on_a_message_buffer_leaves_a_header_of_bytes_free() {
+        let mut k = kernel();
+        let b = k.message_buffer_create(8).expect("a message buffer");
+        assert_eq!(k.stream_buffer_spaces_available(b), Ok(8));
+        assert_eq!(k.stream_buffer_is_full(b), Ok(false));
+
+        // One three-byte message costs the header plus the payload.
+        k.stream_buffer_send(b, b"abc", 0).expect("send");
+        let spaces = k.stream_buffer_spaces_available(b).expect("spaces");
+        assert_eq!(spaces, 8 - (HDR + 3));
+        assert!(spaces > 0, "there ARE free bytes");
+        assert!(spaces <= HDR, "but not enough for another header");
+        assert_eq!(
+            k.stream_buffer_is_full(b),
+            Ok(true),
+            "full with {spaces} byte(s) free: the C compares against the header, not zero"
+        );
+    }
+
+    /// `xStreamBufferNextMessageLengthBytes` on a stream buffer:
+    ///
+    /// ```c
+    /// if( ( pxStreamBuffer->ucFlags & sbFLAGS_IS_MESSAGE_BUFFER ) != 0 ) { ... }
+    /// else { xReturn = 0; }
+    /// ```
+    ///
+    /// Zero for a stream buffer NO MATTER WHAT IT HOLDS. That is not "no
+    /// message waiting", it is "the question does not apply" -- and the
+    /// return type cannot tell a caller which of the two it got.
+    #[test]
+    fn next_message_length_is_zero_on_a_stream_buffer_however_full() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(0));
+
+        k.stream_buffer_send(b, b"abcde", 0).expect("send");
+        assert_eq!(k.stream_buffer_bytes_available(b), Ok(5));
+        assert_eq!(
+            k.stream_buffer_next_message_length(b),
+            Ok(0),
+            "five bytes waiting and still zero, because it is not a message buffer"
+        );
+    }
+
+    /// The same call on a message buffer PEEKS:
+    ///
+    /// ```c
+    /// ( void ) prvReadBytesFromBuffer( pxStreamBuffer, ..., pxStreamBuffer->xTail );
+    /// ```
+    ///
+    /// It reads at the tail without advancing it, so asking twice answers
+    /// twice and the message is still there to be received.
+    #[test]
+    fn next_message_length_peeks_and_does_not_consume() {
+        let mut k = kernel();
+        let b = k.message_buffer_create(16).expect("a message buffer");
+        k.stream_buffer_send(b, b"hello", 0).expect("send");
+
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(5));
+        assert_eq!(
+            k.stream_buffer_next_message_length(b),
+            Ok(5),
+            "asking did not consume it"
+        );
+
+        let mut out = [0_u8; 16];
+        assert_eq!(k.stream_buffer_receive(b, &mut out, 0), Ok(Wait::Ready(5)));
+        assert_eq!(&out[..5], b"hello");
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(0), "drained");
+    }
+
+    /// A zero-length message is a NO-OP that is indistinguishable from a
+    /// send that failed -- which is not visible from the call site, and is
+    /// the sort of thing only a source audit finds.
+    ///
+    /// `prvWriteMessageToBuffer`:
+    ///
+    /// ```c
+    /// if( message buffer ) {
+    ///     xMessageLength = ( configMESSAGE_BUFFER_LENGTH_TYPE ) xDataLengthBytes;  /* 0 */
+    ///     if( xSpace >= xRequiredSpace ) {
+    ///         xNextHead = prvWriteBytesToBuffer( pxStreamBuffer, &xMessageLength,
+    ///                                            sbBYTES_TO_STORE_MESSAGE_LENGTH, xNextHead );
+    ///     }
+    /// }
+    /// if( xDataLengthBytes != ( size_t ) 0 ) {
+    ///     pxStreamBuffer->xHead = prvWriteBytesToBuffer( ..., xNextHead );
+    /// }
+    /// return xDataLengthBytes;
+    /// ```
+    ///
+    /// The header IS written into the storage array -- but the new position
+    /// goes into `xNextHead`, a LOCAL. `pxStreamBuffer->xHead` is only
+    /// committed inside the `xDataLengthBytes != 0` branch, which a
+    /// zero-length message does not take.
+    ///
+    /// So the bytes are in the array and the buffer does not know it: the
+    /// head never moves, the buffer stays empty, the call returns 0, and
+    /// the next send writes over them. A caller cannot tell this apart from
+    /// a send that was refused for want of space.
+    ///
+    /// Pinned because the earlier version of this test asserted the
+    /// opposite -- that the header would show up in `bytes_available` --
+    /// and the kernel was right.
+    #[test]
+    fn a_zero_length_message_is_a_no_op_that_looks_like_a_failed_send() {
+        let mut k = kernel();
+        let b = k.message_buffer_create(16).expect("a message buffer");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+
+        assert_eq!(
+            k.stream_buffer_send(b, b"", 0),
+            Ok(Wait::Ready(0)),
+            "zero bytes written, which is also what a refused send answers"
+        );
+        assert_eq!(
+            k.stream_buffer_bytes_available(b),
+            Ok(0),
+            "the header went into the array and the head was never committed"
+        );
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(0));
+
+        // And a real message lands in the same place, over the top of it.
+        k.stream_buffer_send(b, b"ok", 0).expect("a real message");
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(2));
+        let mut out = [0_u8; 16];
+        assert_eq!(k.stream_buffer_receive(b, &mut out, 0), Ok(Wait::Ready(2)));
+        assert_eq!(&out[..2], b"ok");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+    }
+
+    /// `xStreamBufferReset`:
+    ///
+    /// ```c
+    /// if( ( pxStreamBuffer->xTaskWaitingToReceive == NULL ) &&
+    ///     ( pxStreamBuffer->xTaskWaitingToSend == NULL ) )
+    /// {
+    ///     prvInitialiseNewStreamBuffer( ..., pxStreamBuffer->xTriggerLevelBytes, ... );
+    ///     xReturn = pdPASS;
+    /// }
+    /// ```
+    ///
+    /// The buffer's own trigger level is passed straight back in, so a
+    /// reset empties the buffer and KEEPS the trigger. It is not a return
+    /// to the creation default, which is what the name suggests.
+    #[test]
+    fn reset_empties_the_buffer_and_keeps_the_trigger_level() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        assert_eq!(k.stream_buffer_set_trigger_level(b, 5), Ok(true));
+        k.stream_buffer_send(b, b"abcd", 0).expect("send");
+        assert_eq!(k.stream_buffer_bytes_available(b), Ok(4));
+
+        assert_eq!(k.stream_buffer_reset(b), Ok(true));
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+        assert_eq!(k.stream_buffer_bytes_available(b), Ok(0));
+        assert_eq!(
+            k.stream_buffer_spaces_available(b),
+            Ok(8),
+            "the whole usable length is back"
+        );
+    }
+
+    /// The other half of that guard: a reset must REFUSE while a task is
+    /// blocked on the buffer, because reinitialising would drop the handle
+    /// that task is waiting on.
+    #[test]
+    fn reset_refuses_while_a_task_is_waiting_to_receive() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        k.create_task("rx", 1).expect("a task");
+        let started = k.start_scheduler().expect("start");
+        k.suspend(Some(started.timer)).expect("park the daemon");
+
+        // Run until our task is the one on the CPU, then block it.
+        let mut out = [0_u8; 8];
+        let mut blocked = false;
+        for _ in 0..50_u32 {
+            let running = k.name_of(k.current()).expect("a running task has a name");
+            if running.as_str() == "rx" {
+                assert_eq!(
+                    k.stream_buffer_receive(b, &mut out, 20),
+                    Ok(Wait::Blocked),
+                    "an empty buffer with a timeout blocks"
+                );
+                blocked = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(blocked, "never got the task onto the CPU");
+
+        assert_eq!(
+            k.stream_buffer_reset(b),
+            Ok(false),
+            "a waiting receiver refuses the reset"
+        );
+    }
+
+    /// `xStreamBufferReceiveFromISR` never blocks: it takes a whole
+    /// message, or nothing.
+    #[test]
+    fn receive_from_isr_takes_a_whole_message_or_nothing() {
+        let mut k = kernel();
+        let b = k.message_buffer_create(16).expect("a message buffer");
+        let mut out = [0_u8; 16];
+
+        let (n, _) = k.stream_buffer_receive_from_isr(b, &mut out).expect("isr");
+        assert_eq!(n, 0, "nothing waiting, and it did not block");
+
+        k.stream_buffer_send(b, b"xy", 0).expect("send");
+        let (n, _) = k.stream_buffer_receive_from_isr(b, &mut out).expect("isr");
+        assert_eq!(n, 2);
+        assert_eq!(&out[..2], b"xy");
+        assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+    }
+
+    /// `bytes_available` and `spaces_available` partition the USABLE
+    /// length, which is one less than the ring's own -- the spare byte that
+    /// tells full from empty, the C's `xBufferSizeBytes++` at creation.
+    #[test]
+    fn bytes_and_spaces_partition_the_usable_length() {
+        let mut k = kernel();
+        let b = k.stream_buffer_create(8, 1).expect("a buffer");
+        for n in 0..=8_usize {
+            let bytes = k.stream_buffer_bytes_available(b).expect("bytes");
+            let spaces = k.stream_buffer_spaces_available(b).expect("spaces");
+            assert_eq!(
+                bytes.saturating_add(spaces),
+                8,
+                "at {n} byte(s) in: {bytes} + {spaces} should be the usable 8"
+            );
+            if n < 8 {
+                k.stream_buffer_send(b, b"z", 0).expect("send one");
+            }
+        }
+    }
+}

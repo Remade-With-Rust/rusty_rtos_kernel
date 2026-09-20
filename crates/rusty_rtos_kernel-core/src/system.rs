@@ -314,7 +314,10 @@ macro_rules! system {
 // -- its tasks are created directly so the declared queue slot stays free
 // for the timer daemon.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
-mod tests {
+// `pub(crate)` so `timer.rs`, `stream.rs` and `events.rs` can test against
+// the same config, port and sink rather than declaring three more of each
+// -- three copies of a test harness is three places for it to drift (H3).
+pub(crate) mod tests {
     use rusty_rtos_core::config::Config;
     use rusty_rtos_core::hooks::NoTickHook;
     use rusty_rtos_core::isr::Woken;

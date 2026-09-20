@@ -492,3 +492,232 @@ where
         );
     }
 }
+
+// ================================================================ tests ==
+
+/// `events.rs` had no unit test at all (`docs/HOLES.md`, H3).
+///
+/// `EventGroupsDemo` does cover this file against the C, so unlike
+/// `timer.rs` and `stream.rs` these are not the only evidence there is.
+/// What they add is ISOLATION: the scenario exercises the whole file at
+/// once and a divergence points at a trace line, whereas each of these
+/// names one return-value contract and fails on its own.
+///
+/// The two worth reading are the ones about what a call ANSWERS, because
+/// both return a bit set that a caller is likely to assume is something
+/// else.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use rusty_rtos_core::config::Config;
+    use rusty_rtos_core::hooks::NoTickHook;
+
+    use crate::queue::Wait;
+    use crate::system::tests::{NoTrace, TestConfig, TestPort};
+
+    /// Three tasks, one queue for the timer daemon, and two event groups.
+    type K = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        3,
+        { crate::items_for(3, 0) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 2) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        2,
+    >;
+
+    fn kernel() -> K {
+        K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// `xEventGroupClearBits`:
+    ///
+    /// ```c
+    /// /* The value returned is the event group value prior to the bits being
+    ///  * cleared. */
+    /// uxReturn = pxEventBits->uxEventBits;
+    /// pxEventBits->uxEventBits &= ~uxBitsToClear;
+    /// ```
+    ///
+    /// BEFORE, not after -- so the return value still contains the bits the
+    /// call just cleared, and a caller who reads it as "what is left" has
+    /// it exactly backwards.
+    #[test]
+    fn clear_bits_answers_the_value_from_before_the_clear() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b1111).expect("set");
+
+        assert_eq!(
+            k.event_group_clear_bits(g, 0b0101),
+            Ok(0b1111),
+            "the value BEFORE: it still has the bits being cleared in it"
+        );
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b1010),
+            "and this is what is actually left"
+        );
+    }
+
+    /// `xEventGroupSetBits` answers the value AFTER any waiter it just
+    /// unblocked has taken its bits away:
+    ///
+    /// ```c
+    /// if( xMatchFound != pdFALSE ) {
+    ///     if( ( uxControlBits & eventCLEAR_EVENTS_ON_EXIT_BIT ) != 0 ) {
+    ///         uxBitsToClear |= uxBitsWaitedFor;
+    ///     }
+    ///     ...
+    /// }
+    /// pxEventBits->uxEventBits &= ~uxBitsToClear;
+    /// uxReturnBits = pxEventBits->uxEventBits;
+    /// ```
+    ///
+    /// So **a set can return a value that does not contain the bit it just
+    /// set.** The waiter woke inside the call, its clear-on-exit ran, and
+    /// the snapshot is taken afterwards. A caller that asserts the returned
+    /// value has its own bit in it is writing a race.
+    #[test]
+    fn set_bits_answers_a_value_a_woken_waiter_has_already_cleared() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.create_task("w", 1).expect("a waiter");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        // Get the waiter onto the CPU and block it with CLEAR ON EXIT.
+        let mut blocked = false;
+        for _ in 0..50_u32 {
+            let running = k.name_of(k.current()).expect("a name");
+            if running.as_str() == "w" {
+                assert_eq!(
+                    k.event_group_wait_bits(g, 0b0001, true, false, 20),
+                    Ok(Wait::Blocked)
+                );
+                blocked = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(blocked, "never got the waiter onto the CPU");
+
+        // Set the bit it is waiting for, from another context.
+        assert_eq!(
+            k.event_group_set_bits(g, 0b0001),
+            Ok(0b0000),
+            "the bit was set, the waiter matched, its clear-on-exit ran, \
+             and the snapshot came after all of that"
+        );
+        assert_eq!(k.event_group_bits(g), Ok(0b0000));
+    }
+
+    /// The same set with a waiter that does NOT clear on exit leaves the
+    /// bit where it is -- which is the control test for the one above, and
+    /// the reason the surprise is about clear-on-exit and not about
+    /// waking.
+    #[test]
+    fn set_bits_keeps_the_bit_when_the_waiter_does_not_clear_on_exit() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.create_task("w", 1).expect("a waiter");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        let mut blocked = false;
+        for _ in 0..50_u32 {
+            let running = k.name_of(k.current()).expect("a name");
+            if running.as_str() == "w" {
+                assert_eq!(
+                    k.event_group_wait_bits(g, 0b0001, false, false, 20),
+                    Ok(Wait::Blocked)
+                );
+                blocked = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(blocked, "never got the waiter onto the CPU");
+
+        assert_eq!(
+            k.event_group_set_bits(g, 0b0001),
+            Ok(0b0001),
+            "no clear-on-exit, so the bit is still there when the set returns"
+        );
+    }
+
+    /// `xWaitForAllBits`: ANY is a non-empty intersection, ALL is a
+    /// superset. With the bits already present neither call blocks, so
+    /// this isolates the predicate from the blocking machinery.
+    #[test]
+    fn wait_for_all_needs_every_bit_and_wait_for_any_needs_one() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b0001).expect("set one of two");
+
+        // ANY, with one of the two present: satisfied at once.
+        assert_eq!(
+            k.event_group_wait_bits(g, 0b0011, false, false, 0),
+            Ok(Wait::Ready(0b0001)),
+            "one of the two is enough for ANY"
+        );
+
+        // ALL, with the same bits: not satisfied, and a zero block time
+        // means it gives up immediately and reports what it found.
+        assert_eq!(
+            k.event_group_wait_bits(g, 0b0011, false, true, 0),
+            Ok(Wait::Ready(0b0001)),
+            "ALL is not met, and the answer is still the CURRENT bits -- \
+             the return value does not say whether the wait succeeded"
+        );
+
+        k.event_group_set_bits(g, 0b0010).expect("set the other");
+        assert_eq!(
+            k.event_group_wait_bits(g, 0b0011, false, true, 0),
+            Ok(Wait::Ready(0b0011)),
+            "now ALL is met"
+        );
+    }
+
+    /// Clear-on-exit clears only the bits that were WAITED FOR, not the
+    /// whole group -- so an unrelated bit set by someone else survives a
+    /// wait that consumed its own.
+    #[test]
+    fn clear_on_exit_takes_only_the_bits_that_were_waited_for() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.event_group_set_bits(g, 0b1101).expect("set");
+
+        assert_eq!(
+            k.event_group_wait_bits(g, 0b0001, true, false, 0),
+            Ok(Wait::Ready(0b1101)),
+            "the answer is the value at the moment the wait was satisfied"
+        );
+        assert_eq!(
+            k.event_group_bits(g),
+            Ok(0b1100),
+            "and only bit 0 was taken: the other two were nobody's business"
+        );
+    }
+
+    /// A group starts with no bits set, and delete does not leave the
+    /// handle usable.
+    #[test]
+    fn a_new_group_is_empty_and_a_deleted_one_is_gone() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        assert_eq!(k.event_group_bits(g), Ok(0));
+
+        k.event_group_delete(g).expect("delete");
+        assert!(
+            k.event_group_bits(g).is_err(),
+            "a stale handle is an error, not a zero"
+        );
+    }
+}
