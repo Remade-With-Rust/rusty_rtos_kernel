@@ -1161,6 +1161,24 @@ where
     }
 
     /// `prvAddTaskToReadyList`.
+    /// Returns `Result<()>`, and that is a measured decision, not an
+    /// oversight.
+    ///
+    /// Its two hot callers -- the tick's wake loop and the pending-ready
+    /// drain -- resolve the SAME TCB again on the next line for the SAME
+    /// field, to ask whether the woken task outranks the running one. Having
+    /// this hand the priority back instead costs **+3.69% on kdelay-ir and
+    /// +3.10% on ksched-ir**.
+    ///
+    /// Wrapping it -- narrow signature for the eleven callers that ignore the
+    /// value, a wide inner for the two that want it -- does NOT help: that
+    /// measured bit-for-bit identical to the unwrapped version on all four
+    /// arms, because LLVM inlines through the wrapper and propagates the wide
+    /// return anyway.
+    ///
+    /// The likely mechanism is the tail call. At `Result<()>` this function
+    /// ends by handing back `insert_end`'s own result; at `Result<u8>` it has
+    /// to capture that result, test it, and build a new one, at every site.
     pub(crate) fn add_task_to_ready_list(&mut self, task: TaskHandle) -> Result<()> {
         let priority = self.tcbs.resolve(task)?.priority;
         self.trace_task(task, |task, name| Event::MovedTaskToReadyState {
