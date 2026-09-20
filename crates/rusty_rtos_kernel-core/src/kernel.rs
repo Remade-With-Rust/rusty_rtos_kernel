@@ -1899,6 +1899,63 @@ where
         result.map(|(ok, woken)| (ok, if woken { Woken::YES } else { Woken::NO }))
     }
 
+    /// `xTaskGenericNotify` with its `pulPreviousNotificationValue`
+    /// out-parameter filled: `xTaskNotifyAndQuery`.
+    ///
+    /// It exists because the answer has to come out of the SAME critical
+    /// section as the notification. Reading [`Kernel::notify_value`] first
+    /// and then notifying yields the same two numbers and costs a second
+    /// critical section -- and on the sim a critical-section exit is a
+    /// tick opportunity, so the extra one moves the tick and the trace
+    /// stops matching the C. `TaskNotify.c` calls this eleven times.
+    ///
+    /// # Errors
+    /// As [`Kernel::notify`].
+    pub fn notify_and_query(
+        &mut self,
+        task: TaskHandle,
+        index: usize,
+        value: u32,
+        action: NotifyAction,
+    ) -> Result<(bool, u32)> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        self.enter_critical();
+        let previous = self
+            .tcbs
+            .resolve(task)
+            .map(|tcb| tcb.notified.get(index).copied().unwrap_or(0));
+        let result = self.notify_locked(task, index, value, action, false);
+        self.exit_critical();
+        Ok((result?.0, previous?))
+    }
+
+    /// `xTaskGenericNotifyAndQueryFromISR`.
+    ///
+    /// # Errors
+    /// As [`Kernel::notify`].
+    pub fn notify_and_query_from_isr(
+        &mut self,
+        task: TaskHandle,
+        index: usize,
+        value: u32,
+        action: NotifyAction,
+    ) -> Result<(bool, u32, Woken)> {
+        if index >= C::NOTIFICATION_ARRAY_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        let mask = self.port.enter_critical_from_isr();
+        let previous = self
+            .tcbs
+            .resolve(task)
+            .map(|tcb| tcb.notified.get(index).copied().unwrap_or(0));
+        let result = self.notify_locked(task, index, value, action, true);
+        self.port.exit_critical_from_isr(mask);
+        let (ok, woken) = result?;
+        Ok((ok, previous?, if woken { Woken::YES } else { Woken::NO }))
+    }
+
     /// The body both notify paths share.
     fn notify_locked(
         &mut self,

@@ -958,6 +958,21 @@ where
             let _ = self.insert_timer_in_active_list(timer, expiry, now, now)?;
         } else if message.command == Command::Delete {
             let _ = self.timers.remove(timer);
+            // `vPortFree( pxTimer )`, which every `heap_N.c` wraps in
+            // `vTaskSuspendAll` / `xTaskResumeAll` exactly as it wraps
+            // malloc -- so a delete costs one outermost critical-section
+            // exit, which under the sim contract is one unit of time,
+            // while emitting no trace line at all (this harness defines no
+            // `traceTIMER_DELETE`).
+            //
+            // `queue_delete` and `event_group_delete` both carry this
+            // note; the timer command was the third object with a free and
+            // the one that had not been told. `TaskNotify` is the scenario
+            // that finds it -- it is the first in the corpus to delete a
+            // timer -- and it showed up exactly as the other two did:
+            // every event agreed and the exit column was one short from
+            // the first delete onwards.
+            self.account_for_allocation();
         }
         Ok(Ready(true))
     }
