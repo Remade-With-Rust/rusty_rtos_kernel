@@ -330,10 +330,32 @@ where
         trigger: usize,
     ) -> Result<bool> {
         let length = self.buffers.resolve(buffer)?.length;
+        // Coerce first, then bounds-check, which is the order the C uses:
+        //
+        //     if( xTriggerLevel == ( size_t ) 0 ) { xTriggerLevel = 1; }
+        //     if( xTriggerLevel < pxStreamBuffer->xLength ) { ...pdPASS }
+        //     else { xReturn = pdFALSE; }
+        //
+        // The two orders disagree on exactly one input: a zero trigger
+        // against a length of ONE. Coercing first makes it 1, finds `1 < 1`
+        // false, and refuses without storing; bounds-checking first lets 0
+        // through and stores the coerced 1.
+        //
+        // THAT INPUT IS UNREACHABLE HERE, and the ordering is matched anyway
+        // rather than left to depend on it. `length` is `size + 1` -- the
+        // spare byte a ring buffer needs to tell full from empty, the C's
+        // own `xBufferSizeBytes++` -- and `size == 0` is refused at
+        // creation, so no buffer has a length of 1 and the orders agree on
+        // every input a caller can construct.
+        //
+        // Written down because the first version of this comment claimed a
+        // live divergence. It is not one; it is an inconsistency with the C
+        // that one arithmetic detail in a different function is keeping
+        // harmless.
+        let trigger = if trigger == 0 { 1 } else { trigger };
         if trigger >= length {
             return Ok(false);
         }
-        let trigger = if trigger == 0 { 1 } else { trigger };
         self.buffers.resolve_mut(buffer)?.trigger = trigger;
         Ok(true)
     }

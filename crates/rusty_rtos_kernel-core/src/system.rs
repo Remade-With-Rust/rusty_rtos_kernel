@@ -929,6 +929,75 @@ mod tests {
         );
     }
 
+    /// A kernel with room for a stream buffer, which `system!` never gives
+    /// one: the macro sizes `BUFFERS` and `BYTES` at zero.
+    type BufferKernel = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::items_for(4, 0) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        2,
+        64,
+        0,
+        0,
+    >;
+
+    /// `xStreamBufferSetTriggerLevel`'s contract, pinned.
+    ///
+    /// The C coerces a zero trigger to one BEFORE bounds-checking:
+    ///
+    /// ```c
+    /// if( xTriggerLevel == ( size_t ) 0 ) { xTriggerLevel = 1; }
+    /// if( xTriggerLevel < pxStreamBuffer->xLength ) { ...pdPASS }
+    /// else { xReturn = pdFALSE; }
+    /// ```
+    ///
+    /// This kernel had the two the other way round. The orders disagree on
+    /// exactly one input -- a zero trigger against a length of ONE -- and
+    /// that input cannot be built: `length` is `size + 1` (the spare byte a
+    /// ring buffer needs to tell full from empty) and `size == 0` is refused
+    /// at creation. So it was an inconsistency with the C, not a live bug,
+    /// and the order has been matched anyway rather than left resting on an
+    /// arithmetic detail in another function.
+    ///
+    /// What this test pins is the contract at the lengths that exist. There
+    /// is no conformance scenario for this API and no C demo in the vendored
+    /// tree that calls it, so a differential is not available --
+    /// `docs/HOLES.md` H2 -- and this is the only evidence there is.
+    #[test]
+    fn the_trigger_level_contract() {
+        let mut k = BufferKernel::new(TestPort::default(), NoTrace)
+            .expect("the declared geometry adds up");
+
+        // `create(1, 1)` is a length of TWO: one byte of payload and the
+        // spare. The smallest buffer a caller can actually make.
+        let small = k.stream_buffer_create(1, 1).expect("a one-byte buffer");
+        assert_eq!(
+            k.stream_buffer_set_trigger_level(small, 0),
+            Ok(true),
+            "zero becomes one, and one IS below a length of two"
+        );
+        assert_eq!(
+            k.stream_buffer_set_trigger_level(small, 2),
+            Ok(false),
+            "two is not below a length of two"
+        );
+
+        let wide = k.stream_buffer_create(8, 1).expect("an eight-byte buffer");
+        assert_eq!(k.stream_buffer_set_trigger_level(wide, 0), Ok(true));
+        assert_eq!(k.stream_buffer_set_trigger_level(wide, 8), Ok(true), "8 < 9");
+        assert_eq!(
+            k.stream_buffer_set_trigger_level(wide, 9),
+            Ok(false),
+            "nine is not below a length of nine"
+        );
+    }
+
     fn kernel() -> K {
         K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
     }
