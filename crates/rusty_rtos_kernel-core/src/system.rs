@@ -309,7 +309,11 @@ macro_rules! system {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// `dead_code`: a `system!` declaration generates a `System` and its
+// `build`, and `deep`'s exists to SIZE a kernel rather than to furnish one
+// -- its tasks are created directly so the declared queue slot stays free
+// for the timer daemon.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 mod tests {
     use rusty_rtos_core::config::Config;
     use rusty_rtos_core::hooks::NoTickHook;
@@ -737,6 +741,9 @@ mod tests {
 
     // ---- a delayed list deeper than the conformance corpus ever builds ---
 
+    // `System` here is never built: the tasks are created directly so the
+    // declared queue slot stays free for `xTimerCreateTimerTask`. The
+    // declaration is still what sizes the kernel.
     crate::system! {
         mod deep use TestConfig;
         tasks {
@@ -772,18 +779,20 @@ mod tests {
     /// it through. They are distinct, because two tasks sharing a wake time
     /// wake on the same tick and this probe cannot see which left first.
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn ten_blocked_tasks_wake_in_wake_time_order() {
         let mut k = deep::Kernel::<TestPort, NoTrace, NoTickHook>::new(
             TestPort::default(),
             NoTrace,
         )
         .expect("the declared geometry adds up");
-        // Created directly rather than through `System::build`: the
-        // declaration sizes the kernel, and build would also create the
-        // declared queue, which is the slot `xTimerCreateTimerTask` needs.
+        // Created directly rather than through `System::build`. Build would
+        // also create the declared queue, and that slot is the one
+        // `xTimerCreateTimerTask` needs at startup -- the declaration is
+        // here to SIZE the kernel, not to furnish it.
+        let names = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"];
         let mut all = [::rusty_rtos_core::handle::TaskHandle::from_raw(0); 10];
-        for (i, slot) in all.iter_mut().enumerate() {
-            let name = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"][i];
+        for (slot, name) in all.iter_mut().zip(names) {
             *slot = k.create_task(name, 1).expect("task");
         }
         let started = k.start_scheduler().expect("start");
@@ -855,7 +864,7 @@ mod tests {
         // Ascending wake time; ties in the order they blocked. That is what
         // `vListInsert` promises and the only order the list guarantees.
         let mut want = blocked;
-        want.sort_by(|a, b| a.0.cmp(&b.0));
+        want.sort_by_key(|(ticks, _)| *ticks);
         let want = want.map(|(_, which)| which);
         assert_eq!(woke, want, "the delayed list did not wake in wake-time order");
     }
