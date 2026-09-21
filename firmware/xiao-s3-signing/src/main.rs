@@ -65,7 +65,7 @@ use rusty_rtos_core::config::Config;
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::{Event, Trace};
-use rusty_rtos_kernel_core::{items_for, lists_for, Kernel};
+use rusty_rtos_kernel_core::{list_slots_for, lists_for, Kernel};
 use rusty_rtos_port_core::sim::SimPort;
 
 esp_bootloader_esp_idf::esp_app_desc!();
