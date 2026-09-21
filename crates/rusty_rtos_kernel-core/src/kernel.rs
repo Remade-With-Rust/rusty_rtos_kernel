@@ -144,6 +144,25 @@ pub enum TaskState {
     Deleted,
 }
 
+/// Where a preempted queue call has to start again.
+///
+/// A queue call has SEVERAL critical-section exits that can release a tick
+/// and switch the caller away, and the C's thread resumes below whichever
+/// one it stopped at. One marker is not enough to say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum QueueResume {
+    /// Nothing to resume; enter at the top.
+    #[default]
+    No,
+    /// Below the section that samples the queue, in the caller.
+    BelowSample,
+    /// Below the `xTaskResumeAll` of the TIMED-OUT branch, which is the one
+    /// `IntQueue` reaches at tick 16,260: the tick pended inside the
+    /// scheduler suspension is replayed there, and replaying it switches
+    /// the caller away with `prvIsQueueEmpty` still to run.
+    BelowTimedOutResume,
+}
+
 /// One task control block: the C `TCB_t` minus everything that is a
 /// pointer. No stack, no TLS, no `pxTopOfStack`.
 #[derive(Debug, Clone, Copy)]
@@ -168,7 +187,7 @@ pub(crate) struct Tcb {
     /// critical-section exit that samples the buffer, and must resume
     /// *after* that exit rather than repeat it.
     stream_resume: bool,
-    /// The same, for a blocking queue call.
+    /// Where a preempted queue call resumes. See [`QueueResume`].
     ///
     /// `xQueueGenericSend` and `xQueueReceive` exit their sampling section
     /// before suspending the scheduler to block, and THAT exit can release
@@ -178,7 +197,7 @@ pub(crate) struct Tcb {
     /// so names the right task. Without this marker the trace attributes
     /// the block to whoever the tick switched TO, which `IntQueue` catches
     /// at tick 5 and no other scenario reaches.
-    queue_resume: bool,
+    queue_resume: QueueResume,
     /// Whether a blocking `xStreamBufferSend` has already run its
     /// `vTaskSetTimeOutState`. See [`Kernel::take_stream_timed`].
     stream_timed: bool,
@@ -1124,7 +1143,7 @@ where
             notify_blocked: false,
             event_blocked: false,
             stream_resume: false,
-            queue_resume: false,
+            queue_resume: QueueResume::No,
             stream_timed: false,
             stream_waited: false,
             stream_local: 0,
@@ -2248,12 +2267,12 @@ where
 
     /// Whether `task` has a queue call to resume below its sampling exit.
     /// Taking it clears the marker.
-    pub(crate) fn take_queue_resume(&mut self, task: TaskHandle) -> bool {
+    pub(crate) fn take_queue_resume(&mut self, task: TaskHandle) -> QueueResume {
         let Ok(tcb) = self.tcbs.resolve_mut(task) else {
-            return false;
+            return QueueResume::No;
         };
         let resume = tcb.queue_resume;
-        tcb.queue_resume = false;
+        tcb.queue_resume = QueueResume::No;
         resume
     }
 
@@ -2262,9 +2281,9 @@ where
     /// No local travels with it, unlike [`Kernel::set_stream_resume`]: the C
     /// re-reads the queue under `prvLockQueue` on the other side of the
     /// exit, so there is nothing sampled to carry.
-    pub(crate) fn set_queue_resume(&mut self, task: TaskHandle) {
+    pub(crate) fn set_queue_resume(&mut self, task: TaskHandle, at: QueueResume) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
-            tcb.queue_resume = true;
+            tcb.queue_resume = at;
         }
     }
 

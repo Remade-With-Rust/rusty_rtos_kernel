@@ -38,7 +38,7 @@ use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::trace::{Event, Trace};
 
-use crate::kernel::{Kernel, OwedTrace};
+use crate::kernel::{Kernel, OwedTrace, QueueResume};
 
 /// What a blocking call answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,7 +811,10 @@ where
         // `Kernel::take_queue_resume`: the prologue has already run, and
         // repeating it would spend a second critical-section exit that the
         // C never spends.
-        if self.take_queue_resume(caller) {
+        if self.take_queue_resume(caller) != QueueResume::No {
+            // The send's only resume point is below its sampling exit: its
+            // timed-out branch has nothing after `resume_all` that costs an
+            // exit, so being switched away there changes no count.
             return self.queue_send_blocking(caller, queue);
         }
         self.enter_critical();
@@ -886,7 +889,7 @@ where
         // away. The C's thread stops INSIDE the exit, so everything below
         // runs when the task is scheduled again -- and names that task.
         if self.current != caller {
-            self.set_queue_resume(caller);
+            self.set_queue_resume(caller, QueueResume::BelowSample);
             return Ok(Blocked);
         }
         self.queue_send_blocking(caller, queue)
@@ -1069,9 +1072,16 @@ where
         // The snapshot is re-read rather than carried: nothing below uses
         // anything of it that a concurrent access could change, and the
         // read takes no critical section, so it costs the clock nothing.
-        if self.take_queue_resume(caller) {
-            let snapshot = *self.queues.resolve(queue)?;
-            return self.queue_take_blocking::<PEEK>(caller, queue, snapshot);
+        match self.take_queue_resume(caller) {
+            QueueResume::No => {}
+            QueueResume::BelowSample => {
+                let snapshot = *self.queues.resolve(queue)?;
+                return self.queue_take_blocking::<PEEK>(caller, queue, snapshot);
+            }
+            QueueResume::BelowTimedOutResume => {
+                let snapshot = *self.queues.resolve(queue)?;
+                return self.queue_take_timed_out::<PEEK>(caller, queue, snapshot);
+            }
         }
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
@@ -1147,7 +1157,7 @@ where
         // away. The C's thread stops INSIDE the exit, so everything below
         // runs when the task is scheduled again -- and names that task.
         if self.current != caller {
-            self.set_queue_resume(caller);
+            self.set_queue_resume(caller, QueueResume::BelowSample);
             return Ok(Blocked);
         }
         self.queue_take_blocking::<PEEK>(caller, queue, snapshot)
@@ -1166,6 +1176,30 @@ where
         if self.check_for_timeout(caller) {
             self.unlock_queue(queue)?;
             let _ = self.resume_all();
+            // `xTaskResumeAll` replays any tick that pended while the
+            // scheduler was suspended, and replaying it can switch this task
+            // away with `prvIsQueueEmpty` still to run. The C's thread stops
+            // inside it; everything below runs when the task is next
+            // scheduled. Without this, `prvIsQueueEmpty`'s section is spent
+            // in the wrong window -- one exit, and IntQueue's 100,000-tick
+            // run diverges at tick 16,260.
+            if self.current != caller {
+                self.set_queue_resume(caller, QueueResume::BelowTimedOutResume);
+                return Ok(Blocked);
+            }
+            return self.queue_take_timed_out::<PEEK>(caller, queue, snapshot);
+        }
+        self.queue_take_locked::<PEEK>(caller, queue, snapshot)
+    }
+
+    /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.
+    fn queue_take_timed_out<const PEEK: bool>(
+        &mut self,
+        caller: TaskHandle,
+        queue: QueueHandle,
+        snapshot: Queue,
+    ) -> Result<Wait<u64>> {
+        {
             if self.is_queue_empty(queue) {
                 if snapshot.kind.is_mutex() && self.wait_inherited(caller) {
                     // `vTaskPriorityDisinheritAfterTimeout`: the holder
@@ -1182,8 +1216,17 @@ where
                 self.end_wait(caller);
                 return Err(Error::Empty);
             }
-            return Ok(Blocked);
+            Ok(Blocked)
         }
+    }
+
+    /// `xQueueReceive` below its timeout test, with the queue still locked.
+    fn queue_take_locked<const PEEK: bool>(
+        &mut self,
+        caller: TaskHandle,
+        queue: QueueHandle,
+        snapshot: Queue,
+    ) -> Result<Wait<u64>> {
         if self.is_queue_empty(queue) {
             let event = if PEEK {
                 Event::BlockingOnQueuePeek { queue, name: "" }
