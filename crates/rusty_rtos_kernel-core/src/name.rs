@@ -165,7 +165,11 @@ mod tests {
                 "the sixteen-byte window must be valid UTF-8, not just the prefix"
             );
             assert!(
-                n.bytes.get(n.len()..).unwrap_or(&[]).iter().all(|b| *b == 0),
+                n.bytes
+                    .get(n.len()..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .all(|b| *b == 0),
                 "the tail past `len` must be NUL"
             );
         }

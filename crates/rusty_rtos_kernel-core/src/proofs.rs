@@ -132,7 +132,13 @@ type K = Kernel<
     NoTrace,
     NoTickHook,
     TASKS,
-    { list_slots_for(TASKS, TIMERS, lists_for(ProofConfig::MAX_PRIORITIES, QUEUES, GROUPS)) },
+    {
+        list_slots_for(
+            TASKS,
+            TIMERS,
+            lists_for(ProofConfig::MAX_PRIORITIES, QUEUES, GROUPS),
+        )
+    },
     { lists_for(ProofConfig::MAX_PRIORITIES, QUEUES, GROUPS) },
     QUEUES,
     SLOTS,

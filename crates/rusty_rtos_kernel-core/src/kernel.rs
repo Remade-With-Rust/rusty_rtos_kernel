@@ -168,6 +168,17 @@ pub(crate) struct Tcb {
     /// critical-section exit that samples the buffer, and must resume
     /// *after* that exit rather than repeat it.
     stream_resume: bool,
+    /// The same, for a blocking queue call.
+    ///
+    /// `xQueueGenericSend` and `xQueueReceive` exit their sampling section
+    /// before suspending the scheduler to block, and THAT exit can release
+    /// a tick which switches the caller away. The C's thread stops inside
+    /// the exit; everything below it -- `traceBLOCKING_ON_QUEUE_SEND` and
+    /// `vTaskPlaceOnEventList` -- runs when the task is next scheduled, and
+    /// so names the right task. Without this marker the trace attributes
+    /// the block to whoever the tick switched TO, which `IntQueue` catches
+    /// at tick 5 and no other scenario reaches.
+    queue_resume: bool,
     /// Whether a blocking `xStreamBufferSend` has already run its
     /// `vTaskSetTimeOutState`. See [`Kernel::take_stream_timed`].
     stream_timed: bool,
@@ -1113,6 +1124,7 @@ where
             notify_blocked: false,
             event_blocked: false,
             stream_resume: false,
+            queue_resume: false,
             stream_timed: false,
             stream_waited: false,
             stream_local: 0,
@@ -2231,6 +2243,28 @@ where
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
             tcb.stream_resume = true;
             tcb.stream_local = local;
+        }
+    }
+
+    /// Whether `task` has a queue call to resume below its sampling exit.
+    /// Taking it clears the marker.
+    pub(crate) fn take_queue_resume(&mut self, task: TaskHandle) -> bool {
+        let Ok(tcb) = self.tcbs.resolve_mut(task) else {
+            return false;
+        };
+        let resume = tcb.queue_resume;
+        tcb.queue_resume = false;
+        resume
+    }
+
+    /// Remember that a queue call was preempted at its sampling exit.
+    ///
+    /// No local travels with it, unlike [`Kernel::set_stream_resume`]: the C
+    /// re-reads the queue under `prvLockQueue` on the other side of the
+    /// exit, so there is nothing sampled to carry.
+    pub(crate) fn set_queue_resume(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.queue_resume = true;
         }
     }
 

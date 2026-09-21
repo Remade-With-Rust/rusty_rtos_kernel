@@ -311,6 +311,21 @@ where
         n
     }
 
+    /// `xQueueIsQueueFullFromISR`, which takes NO critical section.
+    ///
+    /// The C compares `uxMessagesWaiting` against `uxLength` and returns,
+    /// with nothing around it — it is meant to be called from an interrupt,
+    /// where a critical section would be the wrong thing. That is why this
+    /// takes `&self` and [`Kernel::queue_messages_waiting`] takes `&mut
+    /// self`: the borrow is the proof that this one cannot charge the
+    /// clock, and on the sim a charged section is a sixteenth of a tick.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_is_full_from_isr(&self, queue: QueueHandle) -> Result<bool> {
+        self.queues.resolve(queue).map(|q| q.waiting == q.length)
+    }
+
     /// `uxSemaphoreGetCount`, which is the same thing.
     ///
     /// # Errors
@@ -444,17 +459,26 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn queue_remove_from_set(&mut self, queue: QueueHandle, set: QueueHandle) -> Result<bool> {
+        // Both refusals are tested OUTSIDE the section and only the removal
+        // itself is inside it, which is what the C does -- and it is NOT
+        // what `xQueueAddToSet` does, three functions up, where the whole
+        // body including both refusals is inside one section. The asymmetry
+        // is upstream's and it is load-bearing here: a failing remove costs
+        // the clock nothing, and `QueueSet`'s setup makes one deliberately,
+        // to prove a queue cannot be removed from a set it is not in.
+        // Charging for it put a tick one event early, 30 lines in.
+        let member = *self.queues.resolve(queue)?;
+        if member.set_container != set || member.waiting != 0 {
+            return Ok(false);
+        }
         self.enter_critical();
-        let result = (|| {
-            let member = self.queues.resolve(queue)?;
-            if member.set_container != set || member.waiting != 0 {
-                return Ok(false);
-            }
-            self.queues.resolve_mut(queue)?.set_container = QueueHandle::NULL;
-            Ok(true)
-        })();
+        let result = self
+            .queues
+            .resolve_mut(queue)
+            .map(|q| q.set_container = QueueHandle::NULL);
         self.exit_critical();
-        result
+        result?;
+        Ok(true)
     }
 
     /// `xQueueSelectFromSet`: which member queue has something on it.
@@ -477,6 +501,32 @@ where
                 Ok(Ready((handle != QueueHandle::NULL).then_some(handle)))
             }
             Err(Error::Empty) => Ok(Ready(None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `xQueueSelectFromSetFromISR`: which queue in `set` has data, from
+    /// an interrupt.
+    ///
+    /// The C is three lines -- `xQueueReceiveFromISR` on the set itself,
+    /// with a NULL handle meaning "none" -- because a set IS a queue of
+    /// member handles. This is that, and it takes no critical section for
+    /// the same reason the rest of the FromISR surface does not.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn queue_select_from_set_from_isr(
+        &mut self,
+        set: QueueHandle,
+    ) -> Result<Option<QueueHandle>> {
+        match self.queue_receive_from_isr(set) {
+            Ok((raw, _woken)) => {
+                let handle = QueueHandle::from_raw(u32::try_from(raw).unwrap_or(0));
+                Ok((handle != QueueHandle::NULL).then_some(handle))
+            }
+            // An empty set is "no queue has data", which is what the C's
+            // NULL means; it is not a failure.
+            Err(Error::Empty) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -757,6 +807,13 @@ where
         position: Position,
     ) -> Result<Wait<()>> {
         let caller = self.current;
+        // Resuming below the sampling exit, as the C's thread does. See
+        // `Kernel::take_queue_resume`: the prologue has already run, and
+        // repeating it would spend a second critical-section exit that the
+        // C never spends.
+        if self.take_queue_resume(caller) {
+            return self.queue_send_blocking(caller, queue);
+        }
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
             Ok(q) => *q,
@@ -825,6 +882,21 @@ where
             return Err(Error::Full);
         }
         self.exit_critical();
+        // That exit can release a tick, and a tick can switch this task
+        // away. The C's thread stops INSIDE the exit, so everything below
+        // runs when the task is scheduled again -- and names that task.
+        if self.current != caller {
+            self.set_queue_resume(caller);
+            return Ok(Blocked);
+        }
+        self.queue_send_blocking(caller, queue)
+    }
+
+    /// Everything `xQueueGenericSend` does below its sampling exit.
+    ///
+    /// Split out so a call preempted at that exit re-enters here rather
+    /// than at the top. See [`Kernel::take_queue_resume`].
+    fn queue_send_blocking(&mut self, caller: TaskHandle, queue: QueueHandle) -> Result<Wait<()>> {
         self.suspend_all();
         self.lock_queue(queue);
         if self.check_for_timeout(caller) {
@@ -993,6 +1065,14 @@ where
         ticks: u64,
     ) -> Result<Wait<u64>> {
         let caller = self.current;
+        // Resuming below the sampling exit, as `queue_send_generic` does.
+        // The snapshot is re-read rather than carried: nothing below uses
+        // anything of it that a concurrent access could change, and the
+        // read takes no critical section, so it costs the clock nothing.
+        if self.take_queue_resume(caller) {
+            let snapshot = *self.queues.resolve(queue)?;
+            return self.queue_take_blocking::<PEEK>(caller, queue, snapshot);
+        }
         self.enter_critical();
         let snapshot = match self.queues.resolve(queue) {
             Ok(q) => *q,
@@ -1063,6 +1143,24 @@ where
             return Err(Error::Empty);
         }
         self.exit_critical();
+        // That exit can release a tick, and a tick can switch this task
+        // away. The C's thread stops INSIDE the exit, so everything below
+        // runs when the task is scheduled again -- and names that task.
+        if self.current != caller {
+            self.set_queue_resume(caller);
+            return Ok(Blocked);
+        }
+        self.queue_take_blocking::<PEEK>(caller, queue, snapshot)
+    }
+
+    /// Everything `xQueueReceive` and `xQueuePeek` do below their sampling
+    /// exit. See [`Kernel::take_queue_resume`].
+    fn queue_take_blocking<const PEEK: bool>(
+        &mut self,
+        caller: TaskHandle,
+        queue: QueueHandle,
+        snapshot: Queue,
+    ) -> Result<Wait<u64>> {
         self.suspend_all();
         self.lock_queue(queue);
         if self.check_for_timeout(caller) {

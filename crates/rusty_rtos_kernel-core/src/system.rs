@@ -1257,7 +1257,11 @@ pub(crate) mod tests {
         // `ITEMS` is the SLOT count now, not the item count: two list items
         // per task (8), plus one end-marker node per list (14), rounded up
         // to a power of two. 22 -> 32.
-        assert_eq!(demo::ITEMS, 32, "8 items + 14 markers, rounded to a power of two");
+        assert_eq!(
+            demo::ITEMS,
+            32,
+            "8 items + 14 markers, rounded to a power of two"
+        );
         assert_eq!(
             demo::ITEMS,
             crate::list_slots_for(demo::TASKS, demo::TIMERS, demo::LISTS),
