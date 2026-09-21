@@ -25,7 +25,8 @@ use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{
     EventGroup as EventGroupKind, EventGroupHandle, Queue as QueueKind, QueueHandle,
-    StreamBuffer as StreamKind, Task as TaskKind, TaskHandle, Timer as TimerKind, TimerHandle,
+    StreamBuffer as StreamKind, StreamBufferHandle, Task as TaskKind, TaskHandle,
+    Timer as TimerKind, TimerHandle,
 };
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
@@ -41,7 +42,7 @@ use crate::queue::Queue;
 use crate::queue::Wait;
 use crate::stream::StreamBuffer;
 use crate::timer::{MAX_TIMER_COMMANDS, Message, Timer};
-use crate::{OVERHEAD_LISTS, items_for, lists_for};
+use crate::{OVERHEAD_LISTS, list_slots_for, lists_for};
 
 /// A trace line owed by a task that was switched out before it could
 /// emit one. Only the queue failure paths can owe one: they are the only
@@ -94,6 +95,19 @@ pub(crate) enum OwedTrace {
         name: Name,
         command: i32,
         value: u64,
+    },
+    /// `traceSTREAM_BUFFER_CREATE`, which the C runs after the
+    /// `pvPortMalloc` that made the buffer.
+    ///
+    /// `heap_4` brackets that malloc with `vTaskSuspendAll` /
+    /// `xTaskResumeAll`, so a tick can land on its exit -- and the C's
+    /// thread then stops inside the allocator, with the trace still ahead
+    /// of it. Emitting it anyway puts the line in another task's run of the
+    /// trace. `StreamBufferDemo`'s echo client showed it at tick 429, one
+    /// line early and a whole task's work out of place.
+    StreamBufferCreate {
+        buffer: StreamBufferHandle,
+        is_message_buffer: bool,
     },
     /// `traceEVENT_GROUP_WAIT_BITS_END`, which the C runs after the
     /// `xTaskResumeAll` that ends the wait — so a resume that switched away
@@ -154,6 +168,12 @@ pub(crate) struct Tcb {
     /// critical-section exit that samples the buffer, and must resume
     /// *after* that exit rather than repeat it.
     stream_resume: bool,
+    /// Whether a blocking `xStreamBufferSend` has already run its
+    /// `vTaskSetTimeOutState`. See [`Kernel::take_stream_timed`].
+    stream_timed: bool,
+    /// Whether a stream-buffer call's notify wait has already finished.
+    /// See [`Kernel::take_stream_waited`].
+    stream_waited: bool,
     /// The stack local that exit produced — `xBytesAvailable` on a receive,
     /// `xSpace` on a send — kept because the frame it belonged to is gone.
     stream_local: usize,
@@ -427,7 +447,7 @@ where
     /// As [`Kernel::new`].
     pub fn with_tick_hook(port: P, trace: T, tick_hook: H) -> Result<Self> {
         C::validate()?;
-        if ITEMS != items_for(TASKS, TIMERS)
+        if ITEMS != list_slots_for(TASKS, TIMERS, LISTS)
             || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES, GROUPS)
             || TASKS == 0
             || C::MAX_TASK_NAME_LEN > crate::NAME_CAPACITY
@@ -862,6 +882,12 @@ where
     /// On the sim this is where time passes: the port raises a tick on
     /// every sixteenth outermost exit and the kernel takes it here, which
     /// is exactly where the C kernel's `SIGALRM` handler would have run.
+    ///
+    /// NOT in line, though it is three statements called 118,640 times in
+    /// a 20,000-tick `StreamBufferDemo`. `#[inline(always)]` was measured:
+    /// it saves that scenario 210,292 and costs `BlockQ` 200,912 and
+    /// `GenQTest` 280,540, for a net loss of 271,962 over six scenarios.
+    /// Whatever the hot sites gain, the switch-heavy ones lose more.
     pub fn exit_critical(&mut self) {
         self.port.exit_critical();
         if self.port.take_pending_tick() {
@@ -1087,6 +1113,8 @@ where
             notify_blocked: false,
             event_blocked: false,
             stream_resume: false,
+            stream_timed: false,
+            stream_waited: false,
             stream_local: 0,
         };
         let handle = match self.tcbs.try_insert(tcb) {
@@ -1289,7 +1317,39 @@ where
     /// preempted inside. The runner calls this before stepping a body;
     /// `true` means work was done and the current task may have changed
     /// again, so nothing else should be assumed.
+    #[inline(always)]
     pub fn resume_pending(&mut self) -> bool {
+        // The fast path, in line at the runner's one call site.
+        //
+        // `Runner::step_once` asks this before every step -- 214,488 times
+        // in a 20,000-tick `StreamBufferDemo` -- and the answer is "nothing
+        // owed" almost every time. Two loads and two branches decide it,
+        // and out of line they cost a call and a frame as well.
+        //
+        // The two tests are the entry conditions of the two things the
+        // body does: `settle_unwind` returns at once unless `unwinding` is
+        // set, and the rest returns at once unless this task owes
+        // something. Neither is duplicated -- the cold half still runs
+        // both in full.
+        if self.unwinding.is_none()
+            && !self
+                .owes_anything
+                .get(usize::from(self.current.index()))
+                .copied()
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        self.resume_pending_cold()
+    }
+
+    /// Everything [`Kernel::resume_pending`] does when something IS owed.
+    ///
+    /// Out of line on purpose: it is reached on a small fraction of steps,
+    /// and inlining it would put the whole `OwedTrace` match at the hot
+    /// site. Same body/symbol split the trace sink's `num` measured.
+    #[inline(never)]
+    fn resume_pending_cold(&mut self) -> bool {
         self.settle_unwind();
         let index = usize::from(self.current.index());
 
@@ -1380,6 +1440,24 @@ where
                 );
                 return true;
             }
+            Some(OwedTrace::StreamBufferCreate {
+                buffer,
+                is_message_buffer,
+            }) => {
+                if let Some(slot) = self.owed_trace.get_mut(index) {
+                    *slot = OwedTrace::None;
+                }
+                let tick = self.tick;
+                self.trace.note_exits(self.port.exits());
+                self.trace.event(
+                    tick,
+                    Event::StreamBufferCreate {
+                        buffer,
+                        is_message_buffer,
+                    },
+                );
+                return true;
+            }
             Some(OwedTrace::TimerCommandSend {
                 timer,
                 name,
@@ -1466,6 +1544,16 @@ where
                 OwedTrace::ReceiveFailed(queue) => self
                     .trace
                     .event(tick, Event::QueueReceiveFailed { queue, name: "" }),
+                OwedTrace::StreamBufferCreate {
+                    buffer,
+                    is_message_buffer,
+                } => self.trace.event(
+                    tick,
+                    Event::StreamBufferCreate {
+                        buffer,
+                        is_message_buffer,
+                    },
+                ),
                 OwedTrace::TimerCommandSend {
                     timer,
                     name,
@@ -2143,6 +2231,54 @@ where
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
             tcb.stream_resume = true;
             tcb.stream_local = local;
+        }
+    }
+
+    /// Has this task's blocking send already paid for `vTaskSetTimeOutState`?
+    ///
+    /// A one-shot, like [`Kernel::take_stream_resume`], and for the same
+    /// reason: `vTaskSetTimeOutState`'s own exit can release a tick and
+    /// switch the caller away, and the C's thread then resumes **below** it,
+    /// in the sampling loop. Running it again on re-entry would spend a
+    /// second exit the C never spends -- which is a sixteenth of a tick, and
+    /// `StreamBufferDemo`'s echo client hit it at tick 419.
+    pub(crate) fn take_stream_timed(&mut self, task: TaskHandle) -> bool {
+        let Ok(tcb) = self.tcbs.resolve_mut(task) else {
+            return false;
+        };
+        let was = tcb.stream_timed;
+        tcb.stream_timed = false;
+        was
+    }
+
+    /// Remember that the timeout state is set and must not be set again.
+    pub(crate) fn set_stream_timed(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.stream_timed = true;
+        }
+    }
+
+    /// Has this task's stream-buffer call already finished its wait?
+    ///
+    /// The other half of [`Kernel::take_stream_resume`]. A call can be
+    /// preempted at two different exits, and the two resume in different
+    /// places: at the SAMPLING exit the C goes on to block, and at the
+    /// WAIT's own exit it goes on to move the bytes and trace them. Without
+    /// this the second case is indistinguishable from the first, and a call
+    /// that had already waited would wait again.
+    pub(crate) fn take_stream_waited(&mut self, task: TaskHandle) -> bool {
+        let Ok(tcb) = self.tcbs.resolve_mut(task) else {
+            return false;
+        };
+        let was = tcb.stream_waited;
+        tcb.stream_waited = false;
+        was
+    }
+
+    /// Remember that the wait is done and only the transfer is left.
+    pub(crate) fn set_stream_waited(&mut self, task: TaskHandle) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.stream_waited = true;
         }
     }
 
@@ -2825,6 +2961,7 @@ where
     }
 
     /// `xTaskResumeAll`; `true` when it yielded on the caller's behalf.
+    #[inline(always)]
     pub fn resume_all(&mut self) -> bool {
         let mut already_yielded = false;
         self.enter_critical();
@@ -3300,7 +3437,7 @@ mod tests {
         NoTrace,
         NoTickHook,
         4,
-        { crate::items_for(4, 0) },
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
         1,
         1,
@@ -3489,7 +3626,13 @@ mod tests {
             NoTrace,
             NoTickHook,
             4,
-            2,
+            // Legal as a geometry — a power of two above `LISTS` — but not
+            // the derived value, which is 32. A grosser error (2 slots for
+            // 12 lists) is now a COMPILE error in `SIZES_FIT`, so it cannot
+            // be used to exercise the runtime guard any more. That the
+            // check moved earlier is the improvement; this keeps the later
+            // one honest.
+            16,
             { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
             1,
             1,
@@ -3500,7 +3643,7 @@ mod tests {
         >;
         assert!(
             WrongItems::new(TestPort::default(), NoTrace).is_err(),
-            "ITEMS must be items_for(TASKS, TIMERS)"
+            "ITEMS must be list_slots_for(TASKS, TIMERS, LISTS)"
         );
 
         // LISTS not derived from the priorities, queues and groups.
@@ -3510,7 +3653,9 @@ mod tests {
             NoTrace,
             NoTickHook,
             4,
-            { crate::items_for(4, 0) },
+            // Correct for the two lists declared below, so the refusal
+            // below is attributable to `LISTS` and nothing else.
+            { crate::list_slots_for(4, 0, 2) },
             2,
             1,
             1,
@@ -3531,7 +3676,7 @@ mod tests {
             NoTrace,
             NoTickHook,
             0,
-            { crate::items_for(0, 0) },
+            { crate::list_slots_for(0, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
             { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
             1,
             1,

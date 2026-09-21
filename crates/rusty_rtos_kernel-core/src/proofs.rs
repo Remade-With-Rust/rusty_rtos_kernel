@@ -59,7 +59,7 @@ use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::{Event, Trace};
 
 use crate::queue::{Position, Wait};
-use crate::{Kernel, items_for, lists_for};
+use crate::{Kernel, list_slots_for, lists_for};
 
 /// The smallest configuration with room for the properties to be about
 /// something: two priorities so preemption exists, and a timer daemon
@@ -132,7 +132,7 @@ type K = Kernel<
     NoTrace,
     NoTickHook,
     TASKS,
-    { items_for(TASKS, TIMERS) },
+    { list_slots_for(TASKS, TIMERS, lists_for(ProofConfig::MAX_PRIORITIES, QUEUES, GROUPS)) },
     { lists_for(ProofConfig::MAX_PRIORITIES, QUEUES, GROUPS) },
     QUEUES,
     SLOTS,

@@ -230,16 +230,19 @@ macro_rules! system {
             pub const BUFFERS: usize = 0;
             /// Stream-buffer bytes, as `TIMERS`.
             pub const BYTES: usize = 0;
-            /// Two list items per task plus one per timer, exactly the
-            /// `ListItem_t`s a C `TCB_t` carries.
-            pub const ITEMS: usize = $crate::items_for(TASKS, TIMERS);
             /// A ready list per priority, the fixed six, two per queue and
             /// one per event group.
+            ///
+            /// Declared BEFORE `ITEMS`, which now depends on it: the list
+            /// arena holds one end-marker node per list alongside the items.
             pub const LISTS: usize = $crate::lists_for(
                 <$cfg as ::rusty_rtos_core::config::Config>::MAX_PRIORITIES,
                 QUEUES,
                 GROUPS,
             );
+            /// Slots for two list items per task, one per timer, and one
+            /// end marker per list — rounded up to a power of two.
+            pub const ITEMS: usize = $crate::list_slots_for(TASKS, TIMERS, LISTS);
 
             // A declared priority the config has no ready list for is a
             // compile error, not a create that answers `Err` at startup on
@@ -940,7 +943,7 @@ pub(crate) mod tests {
         NoTrace,
         NoTickHook,
         4,
-        { crate::items_for(4, 0) },
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
         1,
         1,
@@ -1055,7 +1058,7 @@ pub(crate) mod tests {
         NoTrace,
         NoTickHook,
         5,
-        { crate::items_for(5, 1) },
+        { crate::list_slots_for(5, 1, crate::lists_for(SliceConfig::MAX_PRIORITIES, 1, 1)) },
         { crate::lists_for(SliceConfig::MAX_PRIORITIES, 1, 1) },
         1,
         1,
@@ -1077,7 +1080,7 @@ pub(crate) mod tests {
         NoTrace,
         NoTickHook,
         5,
-        { crate::items_for(5, 1) },
+        { crate::list_slots_for(5, 1, crate::lists_for(SliceConfig::MAX_PRIORITIES, 2, 1)) },
         { crate::lists_for(SliceConfig::MAX_PRIORITIES, 2, 1) },
         2,
         8,
@@ -1251,7 +1254,22 @@ pub(crate) mod tests {
         assert_eq!(demo::TASKS, 4, "plus the idle task and the timer daemon");
         assert_eq!(demo::QUEUES, 2, "the two declared queues");
         assert_eq!(demo::SLOTS, 13, "10 + 3, the declared lengths and no spare");
-        assert_eq!(demo::ITEMS, 8, "two list items per task, no timers");
+        // `ITEMS` is the SLOT count now, not the item count: two list items
+        // per task (8), plus one end-marker node per list (14), rounded up
+        // to a power of two. 22 -> 32.
+        assert_eq!(demo::ITEMS, 32, "8 items + 14 markers, rounded to a power of two");
+        assert_eq!(
+            demo::ITEMS,
+            crate::list_slots_for(demo::TASKS, demo::TIMERS, demo::LISTS),
+            "and it is derived, not written by hand"
+        );
+        // The slack is the price of the mask, and it is worth being able to
+        // see: this configuration carries 10 spare nodes.
+        assert_eq!(
+            demo::ITEMS - demo::LISTS,
+            18,
+            "item capacity: 8 needed, 18 available"
+        );
         assert_eq!(
             demo::LISTS,
             crate::lists_for(TestConfig::MAX_PRIORITIES, 2, 0),
@@ -1306,7 +1324,7 @@ pub(crate) mod tests {
             NoTrace,
             NoTickHook,
             24,
-            { crate::items_for(24, 32) },
+            { crate::list_slots_for(24, 32, crate::lists_for(TestConfig::MAX_PRIORITIES, 12, 4)) },
             { crate::lists_for(TestConfig::MAX_PRIORITIES, 12, 4) },
             12,
             128,

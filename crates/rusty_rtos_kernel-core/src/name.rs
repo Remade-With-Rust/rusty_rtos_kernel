@@ -75,8 +75,27 @@ impl Name {
         // `Option` into every read of a name -- and a trace prints two of
         // them on every context switch.
         let end = usize::from(self.len).min(NAME_CAPACITY);
-        let slice = self.bytes.get(..end).unwrap_or(&[]);
-        str::from_utf8(slice).unwrap_or("")
+        // Validate a WINDOW, not the used prefix.
+        //
+        // `run_utf8_validation` only reaches its word-at-a-time ASCII path
+        // when two `usize`s remain, so an eleven-byte task name -- which is
+        // every name in this corpus -- is checked a byte at a time. The
+        // profile put `from_utf8` at 9,776,286 instructions over 113,645
+        // calls, 86 each, and that is where they went.
+        //
+        // Sixteen bytes is the smallest window that reaches the fast path.
+        // The answer is unchanged because the tail is NULs: `Name::new`
+        // starts from a zeroed array and writes only a prefix, `Default` is
+        // all zeros, `bytes` is private and nothing else writes it. A NUL
+        // is valid UTF-8, so widening the check cannot change its verdict.
+        const WINDOW: usize = 16;
+        let window = if end <= WINDOW { WINDOW } else { NAME_CAPACITY };
+        match str::from_utf8(self.bytes.get(..window).unwrap_or(&[])) {
+            // Every byte is ASCII or NUL, so `end` is a character boundary
+            // and this is a length test rather than a scan.
+            Ok(all) => all.get(..end).unwrap_or(""),
+            Err(_) => "",
+        }
     }
 
     /// How many bytes the name occupies.
@@ -128,6 +147,32 @@ mod tests {
         assert!(Name::new("anything", 1).is_empty());
         assert_eq!(Name::new("anything", 2).as_str(), "a");
         assert_eq!(Name::new("", 12).as_str(), "");
+    }
+
+    /// `as_str` validates a sixteen-byte window and slices the answer out
+    /// of it, which is only right while the bytes past `len` stay valid
+    /// UTF-8. They are NULs today because `new` starts from a zeroed array
+    /// and writes only a prefix. Pin that: a `new` that left the tail dirty
+    /// would make `as_str` answer `""` for every name, and the conformance
+    /// gate would report a diff in twenty-two scenarios at once with no
+    /// clue which line caused it.
+    #[test]
+    fn the_tail_stays_valid_so_as_str_can_check_a_whole_window() {
+        for (text, limit) in [("StrTrig", 12), ("", 12), ("a", 2), ("IDLE", 12)] {
+            let n = Name::new(text, limit);
+            assert!(
+                str::from_utf8(n.bytes.get(..16).unwrap_or(&[])).is_ok(),
+                "the sixteen-byte window must be valid UTF-8, not just the prefix"
+            );
+            assert!(
+                n.bytes.get(n.len()..).unwrap_or(&[]).iter().all(|b| *b == 0),
+                "the tail past `len` must be NUL"
+            );
+        }
+        // And the window widens when the name fills it.
+        let long = Name::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ", NAME_CAPACITY);
+        assert!(long.len() > 16, "this case must exercise the wide window");
+        assert_eq!(long.as_str(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
     }
 
     #[test]

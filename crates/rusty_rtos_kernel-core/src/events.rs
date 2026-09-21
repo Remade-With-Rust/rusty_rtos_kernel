@@ -525,7 +525,7 @@ mod tests {
         NoTrace,
         NoTickHook,
         4,
-        { crate::items_for(4, 1) },
+        { crate::list_slots_for(4, 1, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 2)) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 2) },
         1,
         2,

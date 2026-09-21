@@ -26,7 +26,7 @@ use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::trace::{Event, Trace};
 
-use crate::kernel::{Kernel, NotifyAction};
+use crate::kernel::{Kernel, NotifyAction, OwedTrace};
 use crate::queue::{Blocked, Ready, Wait};
 
 /// One stream or message buffer.
@@ -156,6 +156,7 @@ where
         trigger: usize,
         is_message: bool,
     ) -> Result<StreamBufferHandle> {
+        let caller = self.current;
         if size == 0 || trigger > size {
             return Err(Error::InvalidArgument);
         }
@@ -178,11 +179,13 @@ where
             })
             .map_err(|_| Error::Full)?;
         self.account_for_allocation();
-        let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
-        self.trace.event(
-            tick,
-            Event::StreamBufferCreate {
+        // The malloc's `xTaskResumeAll` can release a tick and switch us
+        // away, and the C's thread then stops there with
+        // `traceSTREAM_BUFFER_CREATE` still ahead of it -- so the line
+        // belongs to this task's NEXT run, not to whoever took the CPU.
+        self.trace_failure_or_owe(
+            caller,
+            OwedTrace::StreamBufferCreate {
                 buffer: handle,
                 is_message_buffer: is_message,
             },
@@ -274,6 +277,16 @@ where
         let b = *self.buffers.resolve(buffer)?;
         let _ = self.buffers.remove(buffer);
         self.give_bytes(b.base, b.length);
+        // `vStreamBufferDelete` ends in `vPortFree` (stream_buffer.c:582),
+        // and `heap_4` brackets that with `vTaskSuspendAll` /
+        // `xTaskResumeAll` -- which takes a critical section, and on the sim
+        // a critical-section exit is the clock. The create paid for its
+        // `pvPortMalloc` and the delete did not, so every deleted buffer
+        // lost one exit. `StreamBufferDemo`'s trigger-level test deletes one
+        // per pass and drifted by exactly 1 at its second `vTaskDelay`.
+        //
+        // The timer service's `Delete` arm had the identical defect.
+        self.account_for_allocation();
         Ok(())
     }
 
@@ -399,6 +412,24 @@ where
 
     // ---------------------------------------------------------- sending --
 
+    /// `xTaskCheckForTimeOut`, the tail of `xStreamBufferSend`'s do-while.
+    ///
+    /// The C wraps the sample-and-wait in
+    /// `do { ... } while( xTaskCheckForTimeOut( &xTimeOut, &xTicksToWait )
+    /// == pdFALSE )`, and that call takes a critical section of its own
+    /// (tasks.c:5703) -- so on the sim it is one more exit, and one more
+    /// sixteenth of a tick.
+    ///
+    /// It runs **only when the wait actually blocked**: a send that finds
+    /// the space it needs on the first pass leaves the loop with a `break`
+    /// from inside the sampling section and never reaches the condition.
+    /// `xStreamBufferReceive` has no loop and no such call, which is why
+    /// this is on the send alone.
+    fn check_for_time_out(&mut self) {
+        self.enter_critical();
+        self.exit_critical();
+    }
+
     /// `xStreamBufferSend`.
     ///
     /// Returns how many bytes went in. `Blocked` means the caller must
@@ -407,7 +438,59 @@ where
     ///
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
+    /// Sim contract v2: what a kernel call costs when it took no critical
+    /// section.
+    ///
+    /// v1 had two tick sources, the idle hook and every 16th outermost
+    /// critical-section exit. Both are kernel-visible points, and between
+    /// them they left one hole: a task that is always ready and whose
+    /// no-progress path takes no critical section takes NO TIME, never
+    /// yields, and stops the clock for every other task.
+    ///
+    /// `xStreamBufferSend` and `xStreamBufferReceive` are the only calls in
+    /// this corpus that can return that way -- the zero-wait path reads the
+    /// ring and leaves. Every other object closes the hole by accident:
+    /// `uxQueueMessagesWaiting`, `eTaskGetState` and `uxTaskPriorityGet`
+    /// all take a section. `StreamBufferDemo`'s `prvNonBlockingReceiverTask`
+    /// is the task that found it, and under v1 the whole run froze at
+    /// `ticks=1 exits=16` (`docs/HOLES.md`, H9).
+    ///
+    /// So a blind call costs exactly one empty critical section. Not a new
+    /// clock -- the SAME one, so the count, the every-16th rule, the
+    /// running-task test and the switch all reuse paths v1 already proved,
+    /// and `exits` keeps its meaning: the number of kernel-visible points.
+    /// The C port does the identical thing from
+    /// `traceRETURN_xStreamBufferSend` / `..._Receive`; see
+    /// `vPortKairosApiReturn`.
+    ///
+    /// A call that BLOCKED is not blind: the C's thread stops inside it,
+    /// other tasks run, and the counter has moved by the time the return
+    /// hook is reached. Comparing the count is what says so on both sides.
+    fn blind_call(&mut self, exits_at_entry: u64) {
+        if self.port.exits() != exits_at_entry {
+            return;
+        }
+        self.enter_critical();
+        self.exit_critical();
+    }
+
+    /// `xStreamBufferSend`, with the contract-v2 bracket around it.
+    ///
+    /// # Errors
+    /// As [`Kernel::stream_buffer_send_inner`].
     pub fn stream_buffer_send(
+        &mut self,
+        buffer: StreamBufferHandle,
+        data: &[u8],
+        ticks: u64,
+    ) -> Result<Wait<usize>> {
+        let entry = self.port.exits();
+        let out = self.stream_buffer_send_inner(buffer, data, ticks);
+        self.blind_call(entry);
+        out
+    }
+
+    fn stream_buffer_send_inner(
         &mut self,
         buffer: StreamBufferHandle,
         data: &[u8],
@@ -429,16 +512,50 @@ where
         }
 
         let mut sampled = self.take_stream_resume(caller);
-        if sampled.is_some() {
-            // Resuming after the exit that sampled the space: fall through
-            // to the write with what that sample said.
+        if let Some(space) = sampled {
+            // Resuming after the exit that sampled the space. The same
+            // point as in `stream_buffer_receive`: the C tests `xSpace <
+            // xRequiredSpace` below the exit, against the sample taken
+            // inside it, so a task preempted there still blocks.
+            if space < required {
+                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                    Blocked => return Ok(Blocked),
+                    Ready(_) => {
+                        self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
+                        self.check_for_time_out();
+                        // The sample it went to sleep on is stale now, and
+                        // the C re-reads whenever that sample was zero.
+                        sampled = None;
+                    }
+                }
+            }
         } else if self.notify_wait_pending(caller) {
             match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
                 Blocked => return Ok(Blocked),
                 Ready(_) => {}
             }
             self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
+            self.check_for_time_out();
         } else if ticks > 0 {
+            // `vTaskSetTimeOutState( &xTimeOut )` (stream_buffer.c:878),
+            // which the C runs before it looks at the buffer at all.
+            //
+            // It is the PUBLIC entry point, so it takes a critical section
+            // of its own -- unlike the queue calls, which reach the same
+            // state through `vTaskInternalSetTimeOutState` from inside one.
+            // One exit per blocking send, and `StreamBufferDemo` makes the
+            // first of them 350 ticks in.
+            //
+            // ... and only once per call: a task preempted at this very
+            // exit resumes BELOW it, so re-entry must not buy it again.
+            if !self.take_stream_timed(caller) {
+                self.enter_critical();
+                self.exit_critical();
+                if self.current != caller {
+                    self.set_stream_timed(caller);
+                    return Ok(Blocked);
+                }
+            }
             self.enter_critical();
             let space = self.buffers.resolve(buffer)?.spaces_available();
             let must_block = space < required;
@@ -462,6 +579,7 @@ where
                     Blocked => return Ok(Blocked),
                     Ready(_) => {
                         self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
+                        self.check_for_time_out();
                     }
                 }
             }
@@ -536,11 +654,56 @@ where
 
     // -------------------------------------------------------- receiving --
 
+    /// What `xStreamBufferReceive` runs once its notify wait returns.
+    ///
+    /// `xTaskNotifyWaitIndexed`'s own trailing critical section can release
+    /// a tick and switch the caller away, and the C's thread then stops
+    /// THERE -- with `prvReadMessageFromBuffer` and
+    /// `traceSTREAM_BUFFER_RECEIVE` still ahead of it. So the bytes move,
+    /// and the line appears, on this task's next run and not inside
+    /// whoever took the CPU. `StreamBufferDemo`'s echo clients showed it
+    /// four times in a 2,000-tick run, each a receive traced six exits
+    /// early.
+    ///
+    /// `None` means "stop here"; the caller returns `Blocked` and the body
+    /// makes the same call again, which then takes the resume path.
+    fn after_stream_wait(
+        &mut self,
+        caller: TaskHandle,
+        buffer: StreamBufferHandle,
+    ) -> Result<Option<usize>> {
+        self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
+        let available = self.buffers.resolve(buffer)?.bytes_in_buffer();
+        if self.current != caller {
+            self.set_stream_waited(caller);
+            self.set_stream_resume(caller, available);
+            return Ok(None);
+        }
+        Ok(Some(available))
+    }
+
     /// `xStreamBufferReceive`: bytes into `out`, and how many arrived.
     ///
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
+    /// `xStreamBufferReceive`, with the contract-v2 bracket around it.
+    /// See [`Kernel::blind_call`].
+    ///
+    /// # Errors
+    /// As [`Kernel::stream_buffer_receive_inner`].
     pub fn stream_buffer_receive(
+        &mut self,
+        buffer: StreamBufferHandle,
+        out: &mut [u8],
+        ticks: u64,
+    ) -> Result<Wait<usize>> {
+        let entry = self.port.exits();
+        let received = self.stream_buffer_receive_inner(buffer, out, ticks);
+        self.blind_call(entry);
+        received
+    }
+
+    fn stream_buffer_receive_inner(
         &mut self,
         buffer: StreamBufferHandle,
         out: &mut [u8],
@@ -555,8 +718,28 @@ where
         };
         let mut available;
         if let Some(local) = self.take_stream_resume(caller) {
-            // As above: resume after the exit, with the sample it took.
+            // Resuming after the exit that sampled the buffer.
+            //
+            // The C's thread stops inside `taskEXIT_CRITICAL`, and when it
+            // runs again it still evaluates the `if( xBytesAvailable <=
+            // xBytesToStoreMessageLength )` BELOW that exit -- against the
+            // sample it took inside the section. So a task preempted there
+            // goes on to block exactly like one that was not.
+            //
+            // Falling straight through to the read instead returns 0 from a
+            // call that was told to wait 350 ticks, which is what
+            // `StreamBufferDemo`'s lower-priority echo server caught: the C
+            // blocked at tick 1 and the sim created its client instead.
             available = local;
+            if !self.take_stream_waited(caller) && available <= prefix {
+                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                    Blocked => return Ok(Blocked),
+                    Ready(_) => match self.after_stream_wait(caller, buffer)? {
+                        Some(now) => available = now,
+                        None => return Ok(Blocked),
+                    },
+                }
+            }
         } else if self.notify_wait_pending(caller) {
             // Resuming: the C's wait returns here, so its second half runs
             // whatever the buffer now holds.
@@ -564,8 +747,10 @@ where
                 Blocked => return Ok(Blocked),
                 Ready(_) => {}
             }
-            self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
-            available = self.buffers.resolve(buffer)?.bytes_in_buffer();
+            match self.after_stream_wait(caller, buffer)? {
+                Some(now) => available = now,
+                None => return Ok(Blocked),
+            }
         } else if ticks > 0 {
             self.enter_critical();
             available = self.buffers.resolve(buffer)?.bytes_in_buffer();
@@ -586,10 +771,10 @@ where
             if must_block {
                 match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
                     Blocked => return Ok(Blocked),
-                    Ready(_) => {
-                        self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
-                        available = self.buffers.resolve(buffer)?.bytes_in_buffer();
-                    }
+                    Ready(_) => match self.after_stream_wait(caller, buffer)? {
+                        Some(now) => available = now,
+                        None => return Ok(Blocked),
+                    },
                 }
             }
         } else {
@@ -651,6 +836,9 @@ where
     /// The application may replace it — that is what the macro is for, and
     /// `MessageBufferAMP` is the demo that does — so the hook gets first
     /// refusal and `true` means it handled the whole thing.
+    // No `inline`: one was tried and cost 323,801 instructions on
+    // `StreamBufferDemo`. The body is small but it is reached from inside
+    // `stream_buffer_send`, which is already large.
     fn send_completed(&mut self, buffer: StreamBufferHandle) -> Result<()> {
         if H::send_completed(self, buffer) {
             return Ok(());
@@ -971,7 +1159,7 @@ mod tests {
         NoTrace,
         NoTickHook,
         4,
-        { crate::items_for(4, 0) },
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
         { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
         1,
         1,

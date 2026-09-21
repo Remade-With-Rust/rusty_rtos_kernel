@@ -31,7 +31,7 @@ use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::trace::{Event, Trace};
 use rusty_rtos_kernel_core::kernel::NotifyAction;
-use rusty_rtos_kernel_core::{Kernel, items_for, lists_for};
+use rusty_rtos_kernel_core::{Kernel, list_slots_for, lists_for};
 
 const TASKS: usize = 8;
 const QUEUES: usize = 8;
@@ -96,7 +96,7 @@ type K = Kernel<
     Counting,
     NoTickHook,
     TASKS,
-    { items_for(TASKS, TIMERS) },
+    { list_slots_for(TASKS, TIMERS, lists_for(<PosixDemoConfig as Config>::MAX_PRIORITIES, QUEUES, GROUPS)) },
     { lists_for(<PosixDemoConfig as Config>::MAX_PRIORITIES, QUEUES, GROUPS) },
     QUEUES,
     SLOTS,
