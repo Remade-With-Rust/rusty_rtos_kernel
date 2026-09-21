@@ -8,8 +8,8 @@
 **Compliance**: none — no compliance framework in scope for an embedded kernel component; revisit at 1.0.0
 **Architect**: [Tim Almond](https://github.com/Ttimmahlax) — accountable for this unit's security design; rendered
 at the foot of the block in every README and mirror
-**Audit depth**: survey
-**Audited**: 2026-09-09 by kairos (K1 pass) · **Next review**: the rest of the nine-scenario corpus
+**Audit depth**: survey + threat model
+**Audited**: 2026-09-21 by kairos (threat model pass) · **Next review**: the fuzzing gates (H-26, H-27) and `cargo vet` (H-10), which are the three ★ rows left
 
 > Source of truth for this unit's hardening status. The README's status table is
 > **generated from this file** — edit here, then run:
@@ -40,7 +40,7 @@ Evidence; excluded from the totals).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-01 | ★ Threat model documented and linked from README | Incomplete | the sketch above; `docs/threat-model.md` is the first milestone's deliverable | |
+| H-01 | ★ Threat model documented and linked from README | Completed | `docs/threat-model.md` (model v1, 2026-09-21): assets, adversaries, five attack paths each with the gate that evidences it, and a residual-risk register. Linked from the README's `## Security` section | |
 | H-02 | Threat model revisited after last major change | Incomplete | no major change yet | |
 
 ### Phase 1 — Toolchain
@@ -74,7 +74,7 @@ Evidence; excluded from the totals).
 | H-17 | Arithmetic safety explicit | Completed | `arithmetic_side_effects = warn` under `-D warnings` is clean: every tick, index, priority and queue-slot operation is `checked_*`, `wrapping_*` or `saturating_*` by name, and the tick arithmetic is masked to the configuration's width | |
 | H-18 | ★ No `unwrap`/`expect`/panic on untrusted paths; typed errors | Completed | `unwrap_used`, `expect_used`, `panic` = deny at the workspace; tests opt out per file | |
 | H-19 | Input validation — external bytes treated as hostile | Completed | no byte parser in this crate; every externally supplied value (a task or queue handle, a priority, a block time, a list index) returns `Error` where the C kernel would `configASSERT`, and a stale handle is `Error::Gone` rather than a use-after-free | |
-| H-20 | ★ Secrets zeroized; never logged | Incomplete | no secret enters this crate by design; state it in the threat model | |
+| H-20 | ★ Secrets zeroized; never logged | Completed | `docs/threat-model.md` §5: no secret enters this unit by design -- no key material, no credentials, no entropy source -- so there is nothing to zeroize. Stated as a CONSTRAINT with the condition that reopens it, and the trace subsystem's position (event metadata, never payload) is stated with it | |
 | H-21 | Concurrency discipline | Completed | single-context by construction on the sim; no `static mut`, no interior mutability, no hand-written `Send`/`Sync`. The critical-section discipline is the C kernel's, and is proven to match it: the conformance diff would move every line if a section opened or closed anywhere else (ledger) | |
 
 ### Phase 4 — Static analysis
@@ -135,7 +135,7 @@ Evidence; excluded from the totals).
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | no release yet | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | `SECURITY.md`: contact, 5-day acknowledgement, 14-day updates, 90-day disclosure | |
 | H-40 | Advisory monitoring and scheduled re-audit | Incomplete | | |
-| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | the register below is empty until the first milestone | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Completed | `docs/threat-model.md` §7: seven residual risks, each with a severity, why it is accepted and **the condition that closes it** -- a waiver without a condition is a decision nobody revisits. R-4 carries the measured Kani convergence boundary rather than a claim | |
 
 ### Phase 12 — Compliance controls
 
@@ -202,6 +202,7 @@ Append one line per pass; never rewrite history. The trend is the point.
 |---|---|---|---|---|---|
 | 2026-09-09 | survey | kairos (scaffold pass) | 7 / 0 / 28 | 5 | first pass, at stamp time; every Completed row names a file that exists |
 | 2026-09-09 | survey + tool probes | kairos (K1 pass) | 15 / 0 / 21 | 9 | K1: the trace differential against the C kernel is live and is this unit's strongest evidence; deny, audit and Miri run on the developer box |
+| 2026-09-21 | model + re-count | kairos `harden` | 21 / 0 / 15 | 13 | `docs/threat-model.md` written (H-01), which closes H-20 (no secret enters this unit, stated as a constraint) and H-41 (seven residual risks, each with the condition that closes it). **The stamp matters as much as the number**: every README in the fleet carried "Audited 2026-09-16 (v0.1.0 release pass)" while no plan recorded that pass, so the tables did not regenerate from their plans and `kairos harden` silently reverted them. This row is what makes this one reproducible |
 
 ## v0.1.0 release decision — which gates are waived, and why (2026-09-16)
 
