@@ -49,7 +49,12 @@ type SchedKernel = Kernel<
     CountTrace,
     NoTickHook,
     24,
-    80,
+    // Derived, never restated: `ITEMS` is the list SLOT count, which
+    // must be a power of two and is what `Kernel::new` checks against
+    // `list_slots_for(TASKS, TIMERS, LISTS)`. A literal here was 80,
+    // which stopped being valid when slots became the unit, and broke
+    // every one of these benches at compile time.
+    { rusty_rtos_kernel_core::list_slots_for(24, 32, 41) },
     41,
     12,
     128,
