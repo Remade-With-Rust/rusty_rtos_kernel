@@ -1111,6 +1111,14 @@ where
 
     /// `xTaskCreate`.
     ///
+    /// Like the C, **the new task becomes current if its priority is at or
+    /// above the running one's**. On a hosted firmware that is the sharp
+    /// edge: the CPU is still on the caller's stack, so creating a
+    /// higher-priority task hands `current` to something that is not
+    /// running. See [`Kernel::start_scheduler`], which creates the timer
+    /// daemon at [`Config::TIMER_TASK_PRIORITY`] for exactly this reason and
+    /// documents the failure it produces — a clean run reporting zero laps.
+    ///
     /// # Errors
     /// [`Error::Full`] when the task arena is full (the C
     /// `errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY`).
@@ -1260,6 +1268,31 @@ where
     /// task, fires `TASK_SWITCHED_IN` for whichever task will run first and
     /// then `STARTING_SCHEDULER`, and returns the handles so the runner can
     /// attach their bodies.
+    ///
+    /// # ★ The timer daemon is created at [`Config::TIMER_TASK_PRIORITY`],
+    /// and it will outrank a task you created below it
+    ///
+    /// This is the C's behaviour and it is deliberate, but on a hosted
+    /// firmware it has a failure mode that looks like nothing at all.
+    ///
+    /// `Tmr Svc` is created here **unconditionally**, and
+    /// [`Kernel::create_task`] makes the highest-priority task current. So a
+    /// firmware whose own `main` runs below `TIMER_TASK_PRIORITY` leaves the
+    /// kernel believing a **stackless** task is running: `current` names the
+    /// daemon while the CPU is on `main`'s stack. Every
+    /// [`Kernel::switch_context`] then declines as `from == to`, the workers
+    /// never start, and the symptom is a clean run reporting **zero laps**
+    /// rather than a fault.
+    ///
+    /// Nothing here can detect it — a stackless kernel cannot see whose stack
+    /// the CPU is actually on — so it is a caller's invariant:
+    ///
+    /// > **Give the task that owns the CPU a priority at or above
+    /// > [`Config::TIMER_TASK_PRIORITY`]**, or lower `TIMER_TASK_PRIORITY`
+    /// > below it.
+    ///
+    /// Reported from the Janus side, where it cost a board run
+    /// (`docs/plans/janus-rtos.md` §5b), and seen again in the radio cell.
     ///
     /// # Errors
     /// As [`Kernel::create_task`].
