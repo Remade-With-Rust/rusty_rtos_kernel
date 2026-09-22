@@ -1,0 +1,11 @@
+# The C6 is RISC-V, so this builds on STABLE with an upstream target — no esp
+# toolchain and no build-std, unlike every Xtensa cell in this family. That
+# is the quiet advantage of the C6 for K3: the same cell CI could build.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+]

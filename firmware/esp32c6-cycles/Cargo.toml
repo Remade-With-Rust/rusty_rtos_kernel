@@ -1,0 +1,42 @@
+# A firmware example, so its own cargo project and its own workspace.
+[package]
+name = "esp32c6-cycles"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The thing under test, by path. No default features: no_std, no allocator.
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+
+# `mcycle`, the RISC-V retired-cycle CSR. On a C6 this is a REAL cycle
+# counter on real silicon — which is the whole reason K3 puts the cycle rows
+# on this part rather than on QEMU, where the same CSR is only a work count
+# under `-icount`.
+rusty_rtos_port-riscv = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-riscv", default-features = false }
+
+esp-hal = { version = "=1.2.1", features = ["esp32c6", "unstable"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32c6"] }
+esp-println = { version = "=0.18.0", default-features = false, features = [
+    "esp32c6",
+    "jtag-serial",
+] }
+esp-backtrace = { version = "=0.20.0", features = [
+    "esp32c6",
+    "panic-handler",
+    "println",
+] }
+
+# Matched to xiao-s3-cycles so the two parts' rows are comparable: same
+# optimisation, same LTO, same overflow policy.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
+[workspace]
