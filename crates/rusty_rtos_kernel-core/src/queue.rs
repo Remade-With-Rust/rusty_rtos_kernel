@@ -205,7 +205,33 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn queue_delete(&mut self, queue: QueueHandle) -> Result<()> {
-        self.queues.resolve(queue)?;
+        let q = *self.queues.resolve(queue)?;
+        // Give the item storage back when it is the last thing allocated.
+        //
+        // `new_queue` bump-allocates from `slots_used` and, until
+        // 2026-09-21, nothing ever lowered it: the DESCRIPTOR came back and
+        // the storage did not, so a create/delete loop exhausted `SLOTS`
+        // permanently. `AbortDelay` hits it after ~108 passes, which is how
+        // it was found, and any application with a queue per connection or
+        // per job hits it too.
+        //
+        // This is the same move `give_bytes` already makes for the byte
+        // arena — that allocator exists because "a bump allocator would run
+        // out in a few hundred ticks", and the identical argument applies
+        // here and was simply never made.
+        //
+        // Deliberately the END-OF-ARENA case only, and not a free list.
+        // The pattern that needs this is create-then-delete of the same
+        // object, where the deleted extent IS the last one, and it is what
+        // the corpus exercises. An out-of-order delete still strands its
+        // slots; that wants the full `free_blocks` treatment and is a
+        // larger change with more to prove.
+        if q.kind.carries_data() {
+            let end = q.base.saturating_add(q.length);
+            if end == self.slots_used {
+                self.slots_used = q.base;
+            }
+        }
         let _ = self.queues.remove(queue);
         // `vPortFree( pxQueue )`.
         self.account_for_allocation();
