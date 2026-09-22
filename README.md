@@ -55,6 +55,7 @@ counters.
 | | |
 |---|---|
 | scenarios identical to the C kernel, on the host | **22** |
+| ticks per scenario | 2,000 pinned · verified again at **100,000** |
 | on each emulator, Cortex-M3 and RV32 | **24 of 25** — see below |
 | architectures | host, ARMv7-M, RV32, Xtensa LX7 |
 | soak, both emulators | RV32 18/18 in 58 min · M3 18/18 in 75 min |
