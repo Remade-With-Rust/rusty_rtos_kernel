@@ -227,10 +227,7 @@ where
         // slots; that wants the full `free_blocks` treatment and is a
         // larger change with more to prove.
         if q.kind.carries_data() {
-            let end = q.base.saturating_add(q.length);
-            if end == self.slots_used {
-                self.slots_used = q.base;
-            }
+            self.give_slots(q.base, q.length);
         }
         let _ = self.queues.remove(queue);
         // `vPortFree( pxQueue )`.
@@ -288,22 +285,104 @@ where
         Ok(handle)
     }
 
+    /// Take `length` slots: first fit from what deleted queues gave back,
+    /// and only then from the untouched end.
+    ///
+    /// First fit rather than best fit for the same reason `take_bytes` uses
+    /// it — the pattern that needs an allocator at all is create-then-delete
+    /// of the *same size*, which first fit serves exactly and without
+    /// fragmenting.
+    fn take_slots(&mut self, length: usize) -> Option<usize> {
+        if length == 0 {
+            return Some(self.slots_used);
+        }
+        for i in 0..self.free_slot_count {
+            let (base, free) = *self.free_slots.get(i)?;
+            if free < length {
+                continue;
+            }
+            if free == length {
+                self.drop_free_slot(i);
+            } else if let Some(slot) = self.free_slots.get_mut(i) {
+                *slot = (base.saturating_add(length), free.saturating_sub(length));
+            }
+            return Some(base);
+        }
+        let end = self.slots_used.checked_add(length)?;
+        if end > SLOTS {
+            return None;
+        }
+        let base = self.slots_used;
+        self.slots_used = end;
+        Some(base)
+    }
+
+    /// Give an extent back, coalescing with whichever neighbours touch it so
+    /// the list cannot grow past one entry per hole.
+    pub(crate) fn give_slots(&mut self, base: usize, length: usize) {
+        if length == 0 {
+            return;
+        }
+        let mut base = base;
+        let mut length = length;
+        let mut i = 0;
+        while i < self.free_slot_count {
+            let Some(&(other_base, other_len)) = self.free_slots.get(i) else {
+                break;
+            };
+            if other_base.saturating_add(other_len) == base {
+                base = other_base;
+                length = length.saturating_add(other_len);
+                self.drop_free_slot(i);
+                continue;
+            }
+            if base.saturating_add(length) == other_base {
+                length = length.saturating_add(other_len);
+                self.drop_free_slot(i);
+                continue;
+            }
+            i = i.saturating_add(1);
+        }
+        // An extent at the very end goes back to the bump pointer instead of
+        // the list, which is what keeps a create/delete loop free.
+        if base.saturating_add(length) == self.slots_used {
+            self.slots_used = base;
+            return;
+        }
+        if let Some(slot) = self.free_slots.get_mut(self.free_slot_count) {
+            *slot = (base, length);
+            self.free_slot_count = self.free_slot_count.saturating_add(1);
+        }
+    }
+
+    fn drop_free_slot(&mut self, index: usize) {
+        let last = self.free_slot_count.saturating_sub(1);
+        if index < last {
+            if let Some(&moved) = self.free_slots.get(last) {
+                if let Some(slot) = self.free_slots.get_mut(index) {
+                    *slot = moved;
+                }
+            }
+        }
+        self.free_slot_count = last;
+    }
+
     fn new_queue(&mut self, length: usize, kind: Kind) -> Result<QueueHandle> {
         if length == 0 {
             return Err(Error::InvalidArgument);
         }
         // A zero-item-size queue needs no storage; only real queues do.
         let slots = if kind.carries_data() { length } else { 0 };
-        let base = self.slots_used;
-        let end = base.checked_add(slots).ok_or(Error::Full)?;
-        if end > SLOTS {
-            return Err(Error::Full);
-        }
-        let handle = self
-            .queues
-            .try_insert(Queue::new(base, length, kind))
-            .map_err(|_| Error::Full)?;
-        self.slots_used = end;
+        let base = self.take_slots(slots).ok_or(Error::Full)?;
+        let handle = match self.queues.try_insert(Queue::new(base, length, kind)) {
+            Ok(handle) => handle,
+            Err(_) => {
+                // The descriptor arena refused after the slots were taken,
+                // so give them straight back rather than stranding them.
+                self.give_slots(base, slots);
+                return Err(Error::Full);
+            }
+        };
         // `xQueueGenericCreate` takes the queue and its storage from the
         // heap before it initialises anything.
         self.account_for_allocation();

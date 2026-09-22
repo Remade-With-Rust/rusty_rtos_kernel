@@ -343,6 +343,20 @@ pub struct Kernel<
     /// them, which is why the list is that long and cannot overflow.
     pub(crate) free_blocks: [(usize, usize); BUFFERS],
     pub(crate) free_count: usize,
+    /// Extents of the SLOT arena that a deleted queue gave back, as
+    /// `(base, length)`, coalesced the same way `free_blocks` is.
+    ///
+    /// The byte arena has had this since `MessageBufferDemo` needed it. The
+    /// slot arena did not, so `queue_delete` returned the descriptor while
+    /// the storage stayed spent and a create/delete loop exhausted `SLOTS`
+    /// permanently — found through `AbortDelay` on 2026-09-21, after nine
+    /// hypotheses and eight refutations, because the descriptor arena works
+    /// perfectly and that is where everyone looked.
+    ///
+    /// At most `QUEUES` queues are alive, so at most `QUEUES` holes can sit
+    /// between them and the list cannot overflow.
+    pub(crate) free_slots: [(usize, usize); QUEUES],
+    pub(crate) free_slot_count: usize,
     pub(crate) slots_used: usize,
     /// `pxCurrentTCB`.
     pub(crate) current: TaskHandle,
@@ -504,6 +518,8 @@ where
             bytes_used: 0,
             free_blocks: [(0, 0); BUFFERS],
             free_count: 0,
+            free_slots: [(0, 0); QUEUES],
+            free_slot_count: 0,
             current: TaskHandle::NULL,
             top_ready_priority: 0,
             tick: C::INITIAL_TICK_COUNT,
