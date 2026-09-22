@@ -79,6 +79,12 @@ impl Port for TestPort {
 struct Counting(u64);
 
 impl Trace for Counting {
+// Nothing here reads a task name, so the kernel is told not to build one.
+    // Without this the trait default is `true` and every traced event costs a
+    // name lookup plus a UTF-8 validation for a sink that drops it: measured
+    // at 3.86x on one row (2026-09-21).
+    const WANTS_NAMES: bool = false;
+
     fn event(&mut self, _tick: u64, _event: Event<'_>) {
         self.0 = self.0.wrapping_add(1);
     }

@@ -7,7 +7,7 @@ members = ["crates/*"]
 exclude = ["firmware/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/rusty_rtos_kernel"
@@ -38,14 +38,14 @@ arithmetic_side_effects = "warn"
 [workspace.dependencies]
 # Internal crates carry BOTH path and version so the set publishes to crates.io
 # in lockstep (the rusty_time pattern).
-rusty_rtos_kernel-core = { path = "crates/rusty_rtos_kernel-core", version = "0.1.0", default-features = false }
+rusty_rtos_kernel-core = { path = "crates/rusty_rtos_kernel-core", version = "0.2.0", default-features = false }
 
 # Siblings in the Kairos family are consumed BY GIT URL, with a version beside
 # it (a bare git dep is a `*` wildcard to cargo-deny), so this repo deploys on
 # its own. Inside the Kairos umbrella folder `kairos patches` writes a
 # `.cargo/config.toml` that patches the URL to the sibling checkout, so local
 # edits are visible without a push.
-rusty_rtos_core = { version = "0.1.0", default-features = false }
+rusty_rtos_core = { version = "0.2.0", default-features = false }
 
 [profile.release]
 # use-protection-please H-05: overflow checks stay on in release; LTO and

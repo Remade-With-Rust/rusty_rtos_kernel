@@ -64,7 +64,7 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::tick::Bits32;
-use rusty_rtos_core::trace::{Event, Trace};
+use rusty_rtos_core::trace::NoTrace;
 use rusty_rtos_kernel_core::{list_slots_for, lists_for, Kernel};
 use rusty_rtos_port_core::sim::SimPort;
 
@@ -102,16 +102,6 @@ impl Config for SigningConfig {
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 2;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
-}
-
-/// A trace that keeps nothing: this cell measures scheduling, it does not
-/// assert a trace. Keeping one would put a formatter inside the timed
-/// region, which is the instrument becoming the experiment
-/// (`codec-measurement` §6).
-#[derive(Debug, Default)]
-struct NoTrace;
-impl Trace for NoTrace {
-    fn event(&mut self, _tick: u64, _event: Event<'_>) {}
 }
 
 const TASKS: usize = 6;

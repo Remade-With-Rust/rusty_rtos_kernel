@@ -23,8 +23,9 @@ Naming: `<board>-<demo>/`, for example `lm3s6965-qemu-flash/` or
 
 | cell | what it claims | needs |
 |---|---|---|
-| [`xiao-s3-signing`](xiao-s3-signing) | **what the kernel costs a real Janus workload**: a scheduling round is 8,313 ns / 1,995 cycles, 88 ppm of a P-256 signature (K5a) | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
-| [`xiao-s3-cycles`](xiao-s3-cycles) | **K3's cycle rows on silicon**: a tick is 131 cycles, a switch 623, an ISR wake 949 — `ccount` at one cycle of resolution, with the instrument's own tax measured and subtracted. No C arm: that half of the clause is blocked on ESP-IDF | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
+| [`xiao-s3-signing`](xiao-s3-signing) | **what the kernel costs a real Janus workload**: a scheduling round is **3,724 ns / 893 cycles, 39 ppm** of a P-256 signature (K5a). **Re-measured 2026-09-21**: 8,313 ns / 1,995 / 88 ppm until the shadowed `NoTrace` was found | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
+| [`xiao-s3-cycles`](xiao-s3-cycles) | **K3's cycle rows on silicon**: a tick is **54** cycles, a switch **166**, an ISR wake **430** -- `ccount` at one cycle of resolution, with the instrument's own tax measured and subtracted. **Re-measured 2026-09-21**: the figures here were 131 / 623 / 949 until a hand-rolled `NoTrace` shadowing the crate's own was found, which made every traced event build a task name for a sink that drops it. No C arm on this part: cycles here still have nothing beside them, blocked on ESP-IDF | a XIAO ESP32-S3 on a serial port, and the `esp` toolchain. Never started by a gate: its runner is `espflash` |
+| [`riscv32-qemu-tick-work`](riscv32-qemu-tick-work) | **K3's tick and switch rows AGAINST THE C**, in retired instructions: tick 15 (C) against 56, selection 27 against 79, and a whole cooperative switch 110 against 109 -- parity -- once `bench/switch-cost`'s register half is added. The C arm is FreeRTOS V11.3.1 out of the pinned oracle, unmodified. Driven by `bench/tick-work/run.sh`, which gates on work-parity anchors AND a poison build | `qemu-system-riscv32`, plus `clang` and `ld.lld` for the C arm. Runs headless, gates on an exit code |
 
 Rules:
 

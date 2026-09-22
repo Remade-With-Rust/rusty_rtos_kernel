@@ -77,7 +77,7 @@ Rust, as independent packages that expose the API a FreeRTOS developer already
 knows and prove every scheduling decision against the C kernel's own trace.
 
 **Where this sits for Mata.** Kairos is the real-time layer on the device
-itself, and [`rusty_rtos_mqtt`](https://github.com/Remade-With-Rust/rusty_rtos_mqtt) is the way out of it.
+itself, and [`rusty_rtos_mqtt`](https://crates.io/crates/rusty_rtos_mqtt) is the way out of it.
 Paired with the **MATA distributed cloud**, robotics and sensor data has two
 routes — read it on the machine, or reach it through the cloud — with the same
 memory-safe crates at both ends.
@@ -87,13 +87,13 @@ The family:
 [`rusty_rtos_kernel`](https://crates.io/crates/rusty_rtos_kernel) (the scheduler),
 [`rusty_rtos_port`](https://crates.io/crates/rusty_rtos_port) (the architecture seam),
 [`rusty_rtos_heap`](https://crates.io/crates/rusty_rtos_heap) (the allocators),
-[`rusty_rtos_json`](https://github.com/Remade-With-Rust/rusty_rtos_json) (coreJSON),
-[`rusty_rtos_sntp`](https://github.com/Remade-With-Rust/rusty_rtos_sntp) (coreSNTP),
-[`rusty_rtos_mqtt`](https://github.com/Remade-With-Rust/rusty_rtos_mqtt) (coreMQTT),
-[`rusty_rtos_backoff`](https://github.com/Remade-With-Rust/rusty_rtos_backoff) (backoffAlgorithm),
-[`rusty_rtos-capi`](https://github.com/Remade-With-Rust/rusty_rtos-capi) (the C ABI) and
-[`rusty_rtos_demo`](https://github.com/Remade-With-Rust/rusty_rtos_demo) (the conformance corpus).
-The last six are on GitHub and not yet on crates.io. Also check out
+[`rusty_rtos_json`](https://crates.io/crates/rusty_rtos_json) (coreJSON),
+[`rusty_rtos_sntp`](https://crates.io/crates/rusty_rtos_sntp) (coreSNTP),
+[`rusty_rtos_mqtt`](https://crates.io/crates/rusty_rtos_mqtt) (coreMQTT),
+[`rusty_rtos_backoff`](https://crates.io/crates/rusty_rtos_backoff) (backoffAlgorithm),
+[`rusty_rtos-capi`](https://crates.io/crates/rusty_rtos-capi) (the C ABI) and
+[`rusty_rtos_demo`](https://crates.io/crates/rusty_rtos_demo) (the conformance corpus).
+All ten are on crates.io. Also check out
 the rest of **[github.com/remade-with-rust](https://github.com/remade-with-rust)**.
 
 ## About Mata Network

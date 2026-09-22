@@ -3,15 +3,24 @@
 K5a's measurement clause, answered on silicon.
 
 ```
-SIGN kernel_only rounds=20000 batch_us=166267 per_round_ns=8313 per_round_cycles=1995
+SIGN kernel_only rounds=20000 batch_us=74490 per_round_ns=3724 per_round_cycles=893
 SIGN kernel_only switches=40000 per_round=2
-SIGN kernel_share_of_one_signature = 88 ppm  (8313 ns of 94349000 ns)
+SIGN kernel_share_of_one_signature = 39 ppm  (3724 ns of 94390000 ns)
 SIGN work_parity=OK bare=100s/100v/100ok scheduled=100s/100v/100ok
 ```
 
 **One full scheduling round — a queue send, a queue receive and two real
-context switches — costs 8,313 ns (1,995 cycles at 240 MHz), which is 88
+context switches — costs 3,724 ns (893 cycles at 240 MHz), which is 39
 parts per million of a single P-256 signature.**
+
+> **Re-measured 2026-09-21.** This cell used to report 8,313 ns / 1,995 cycles
+> / 88 ppm. It hand-rolled its own `NoTrace` instead of the one
+> `rusty_rtos_core::trace` ships, inheriting the trait default
+> `WANTS_NAMES = true`, so every traced event built a 16-byte task name and
+> UTF-8 validated it for a sink whose body is `{}`. **The round fell 2.23x
+> with no kernel change**, and the sibling `xiao-s3-cycles` fell by 2.2-3.8x
+> on the same one-line fix. The conclusion this cell exists to support is
+> unchanged and strengthened: the kernel is noise against the workload.
 
 ## The workload is not ours
 

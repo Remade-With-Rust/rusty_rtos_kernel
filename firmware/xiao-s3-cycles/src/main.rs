@@ -60,7 +60,7 @@ use xtensa_lx::timer::get_cycle_count;
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::tick::Bits32;
-use rusty_rtos_core::trace::{Event, Trace};
+use rusty_rtos_core::trace::NoTrace;
 use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_kernel_core::{list_slots_for, lists_for, Kernel};
 use rusty_rtos_port_core::sim::SimPort;
@@ -84,15 +84,6 @@ impl Config for CycleConfig {
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 2;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
-}
-
-/// A trace that keeps nothing: this cell measures scheduling, it does not
-/// assert a trace. Keeping one would put a formatter inside the timed
-/// region, which is the instrument becoming the experiment.
-#[derive(Debug, Default)]
-struct NoTrace;
-impl Trace for NoTrace {
-    fn event(&mut self, _tick: u64, _event: Event<'_>) {}
 }
 
 const TASKS: usize = 6;
@@ -298,18 +289,44 @@ fn main() -> ! {
         (switch.median as u64 * 1000) / 240
     );
     println!();
-    println!("  The delayed tick is CHEAPER, which is not what was expected and");
-    println!("  is the more interesting of the two numbers. Blocking a task takes");
-    println!("  it off the ready list, so the tick no longer makes a time-slice");
-    println!("  round-robin decision between two runnable tasks at one priority.");
-    println!("  That saving is larger than the cost of looking at a delayed entry");
-    println!("  whose wake time is far away. The check that asserted the opposite");
-    println!("  failed on the board and was replaced, rather than the number.");
+    // Printed from the numbers rather than asserted in prose, because the
+    // prose here was WRONG for ten days and said so confidently.
+    //
+    // Until 2026-09-21 this cell reported the delayed tick as CHEAPER than
+    // the idle one (129 against 131) and carried a paragraph explaining why
+    // that was profound. It was an artefact: the cell hand-rolled its own
+    // `NoTrace` instead of using the one `rusty_rtos_core::trace` ships, so
+    // it inherited `WANTS_NAMES = true` and every traced event built a
+    // 16-byte task name for a sink that dropped it. With the real `NoTrace`
+    // the whole table fell -- tick 131 -> 54, switch 623 -> 166, ISR wake
+    // 949 -> 430 -- and the ordering came back the obvious way round.
+    if tick_delayed.median < tick.median {
+        println!(
+            "  The delayed tick is CHEAPER ({} against {}), which is not the",
+            tick_delayed.median, tick.median
+        );
+        println!("  obvious way round. Blocking a task takes it off the ready list,");
+        println!("  so the tick no longer makes a time-slice round-robin decision");
+        println!("  between two runnable tasks at one priority, and that saving");
+        println!("  can exceed the cost of looking at a delayed entry that is not");
+        println!("  due. Read it as a real effect only if it survives a rerun.");
+    } else {
+        println!(
+            "  The delayed tick costs {} more than the idle one ({} against {}),",
+            tick_delayed.median - tick.median,
+            tick_delayed.median,
+            tick.median
+        );
+        println!("  which is the obvious way round: a non-empty delayed list is one");
+        println!("  more comparison against a wake time the tick will not reach.");
+    }
 
     println!();
     println!("what this row does NOT contain:");
-    println!("  * a C arm. The clause asks for these AGAINST the C demo, and");
-    println!("    that half is blocked: FreeRTOS on the S3 needs the ESP-IDF");
+    println!("  * a C arm ON THIS PART. A C arm now exists as a WORK row on");
+    println!("    rv32 -- bench/tick-work, FreeRTOS V11.3.1 out of the pinned");
+    println!("    oracle, unmodified -- but CYCLES here still have nothing");
+    println!("    beside them: FreeRTOS on the S3 needs the ESP-IDF");
     println!("    header tree and a generated sdkconfig.h, and its Xtensa");
     println!("    port's #ifs key off CONFIG_FREERTOS_*, so a stubbed build");
     println!("    would not be the kernel anyone runs.");

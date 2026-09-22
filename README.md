@@ -17,10 +17,11 @@ software timers, event groups, and stream and message buffers. No C, no FFI.
 Its correctness claim is not a test suite. It is a line-by-line diff against
 the C kernel's own execution trace.
 
-- **Proven**: 19 conformance scenarios produce traces **byte-identical** to the
-  C kernel's for 100,000 ticks each, on four architectures — and the same
-  corpus runs on silicon. Separately, **26 unmodified C demo files** from the
-  FreeRTOS distribution link against it through
+- **Proven**: **22 conformance scenarios** produce traces identical to the C
+  kernel's own, and the same corpus runs on four architectures — the last of
+  them silicon. On the two emulators it is 24 of 25 today, with the one
+  exception named and numbered under Conformance. Separately, **26 unmodified
+  C demo files** from the FreeRTOS distribution link against it through
   [`rusty_rtos-capi`](https://github.com/Remade-With-Rust/rusty_rtos-capi) and
   pass their own checkers.
 - **The switch is not here.** A context switch is a stack swap and a stack swap
@@ -53,11 +54,11 @@ counters.
 
 | | |
 |---|---|
-| scenarios byte-identical to the C kernel | **19** |
-| ticks per scenario | 100,000 |
+| scenarios identical to the C kernel, on the host | **22** |
+| on each emulator, Cortex-M3 and RV32 | **24 of 25** — see below |
 | architectures | host, ARMv7-M, RV32, Xtensa LX7 |
 | soak, both emulators | RV32 18/18 in 58 min · M3 18/18 in 75 min |
-| on silicon (XIAO ESP32-S3) | **18/18 byte-identical** |
+| on silicon (XIAO ESP32-S3) | 18/18, measured 2026-09-11 |
 | unmodified C demo files linking against it | **26** |
 
 ```sh
@@ -80,10 +81,19 @@ to a freed object gets a new ordinal where our arena reuses the freed index.
 It is recorded, not hidden, and runs on its own with `kairos conform
 AbortDelay`.
 
+**Also open, and found by the 0.2.0 release gate:** `StreamBufferDemo` passes
+on the host — identical to the C kernel — and **diverges on both emulators**,
+identically. Every counter and the line count match (2,000 ticks, 2,424
+yields, 28,002 exits, 20,927 lines); only the trace *text* differs, by 194
+bytes. A scheduling defect moves a counter, and none moved. It looks like a
+value whose digit count depends on `size_of::<usize>()` reaching the trace,
+which is a 32-bit-target text defect rather than a kernel one — but it is
+named here with its numbers rather than left out.
+
 ## Tickless idle
 
 Three functions, each the C's, and all inert unless
-`Config::USE_TICKLESS_IDLE` is set — with it off the 19-scenario differential
+`Config::USE_TICKLESS_IDLE` is set — with it off the conformance differential
 is unchanged, byte for byte.
 
 | ours | the C | note |
@@ -148,7 +158,7 @@ Two rows matter, and the second is the one that makes the first readable.
 `portYIELD()` pends `PendSV` and so does ours — so the shapes match and so do
 the counts.
 
-| RV32, preemptive switch | cycles | vs C |
+| RV32, preemptive switch | instructions | vs C |
 |---|---:|---:|
 | FreeRTOS | 83 | 1.00× |
 | Kairos | **74** | **1.12× cheaper** |
@@ -160,19 +170,66 @@ that: the RISC-V gap is about *where a yield is taken* — FreeRTOS's
 everything an interrupt could have clobbered — not about one kernel moving
 registers more cheaply.
 
-On a real part, a full scheduling round (queue send, queue receive, two context
-switches) costs **8,313 ns / 1,995 cycles** on a XIAO ESP32-S3, which is 88 ppm
-of the P-256 signature it was measured beside.
+### The tick and the scheduler, against the C, on one machine
+
+Both arms run on QEMU `virt` under `-icount shift=0`, where `minstret` is
+exactly reproducible. The C arm is **FreeRTOS V11.3.1 from the pinned oracle,
+unmodified**, with the oracle's own first-party RISC-V port.
+
+| rv32, retired instructions per call | FreeRTOS | Kairos | |
+|---|---:|---:|---:|
+| tick, empty delayed list | 15 | 56 | 3.73× |
+| tick, one task delayed | 15 | 56 | 3.73× |
+| scheduler selection | 27 | 79 | 2.93× |
+
+**Two of those are against us and are published as findings, not caveats.**
+But a switch is selection *plus* the register file, and the two kernels put
+their weight in opposite halves — so quoting the selection row alone is
+quoting a third of the answer:
+
+| whole switch, rv32 | FreeRTOS | Kairos | |
+|---|---:|---:|---:|
+| cooperative | 27 + 83 = 110 | 79 + 30 = **109** | **parity** |
+| preemptive | 27 + 83 = 110 | 79 + 74 = **153** | 1.39× against us |
+
+Gated twice: identical work-parity anchors — with the tick count read back, so
+FreeRTOS's `uxSchedulerSuspended` early-out cannot pass as a tick — and a
+**poison** build of every arm that makes the measured call twice per bracket
+and requires every row to move.
+
+### On silicon
+
+XIAO ESP32-S3, Xtensa `ccount` at one cycle of resolution, median of 512 with
+the instrument's own tax measured and subtracted:
+
+| | cycles | at 240 MHz |
+|---|---:|---:|
+| tick | **54** | 225 ns |
+| context switch | **166** | 691 ns |
+| ISR-API wake, to the task holding the value | **430** | 1,792 ns |
+
+A full scheduling round (queue send, queue receive, two switches) costs
+**3,724 ns / 893 cycles**, which is **39 ppm** of the P-256 signature it was
+measured beside.
+
+> Those silicon figures replaced a set measured through a harness defect on
+> 2026-09-21 — they read 131 / 623 / 949 and 1,995. No kernel code changed:
+> the measurement cells hand-rolled a `NoTrace` that shadowed the one this
+> family ships, inheriting `WANTS_NAMES = true`, so every traced event built a
+> task name for a sink that discards it. Three instruments on three
+> architectures agree on the correction, and the whole episode is written up
+> in the umbrella's ledger — including the finding it withdrew.
 
 ```sh
-bench/switch-cost/run.sh     # from the Kairos umbrella
+bench/tick-work/run.sh       # the tick and selection rows, both arms
+bench/switch-cost/run.sh     # the register half
 ```
 
 ## Portability
 
 | target | corpus | notes |
 |---|---|---|
-| host (x86-64 Windows, Linux) | ✅ 19/19 | the sim port, and a threaded host port |
+| host (x86-64 Windows, Linux) | ✅ **22 identical to the C kernel** | the sim port, and a threaded host port |
 | `thumbv7m-none-eabi` (Cortex-M3) | ✅ 18/18 | QEMU `mps2-an385` |
 | `riscv32imac-unknown-none-elf` | ✅ 18/18 | QEMU `virt` |
 | `xtensa-esp32s3-none-elf` | ✅ 18/18 | **on silicon**, a XIAO ESP32-S3 |
@@ -215,7 +272,7 @@ a FreeRTOS developer already knows and prove every scheduling decision against
 the C kernel's own trace. `rusty_rtos_kernel` is the scheduler at the centre of it.
 
 **Where this sits for Mata.** Kairos is the real-time layer on the device
-itself, and [`rusty_rtos_mqtt`](https://github.com/Remade-With-Rust/rusty_rtos_mqtt) is the way out of it.
+itself, and [`rusty_rtos_mqtt`](https://crates.io/crates/rusty_rtos_mqtt) is the way out of it.
 Paired with the **MATA distributed cloud**, robotics and sensor data has two
 routes — read it on the machine, or reach it through the cloud — with the same
 memory-safe crates at both ends.
@@ -225,13 +282,13 @@ The family:
 [`rusty_rtos_kernel`](https://crates.io/crates/rusty_rtos_kernel) (the scheduler),
 [`rusty_rtos_port`](https://crates.io/crates/rusty_rtos_port) (the architecture seam),
 [`rusty_rtos_heap`](https://crates.io/crates/rusty_rtos_heap) (the allocators),
-[`rusty_rtos_json`](https://github.com/Remade-With-Rust/rusty_rtos_json) (coreJSON),
-[`rusty_rtos_sntp`](https://github.com/Remade-With-Rust/rusty_rtos_sntp) (coreSNTP),
-[`rusty_rtos_mqtt`](https://github.com/Remade-With-Rust/rusty_rtos_mqtt) (coreMQTT),
-[`rusty_rtos_backoff`](https://github.com/Remade-With-Rust/rusty_rtos_backoff) (backoffAlgorithm),
-[`rusty_rtos-capi`](https://github.com/Remade-With-Rust/rusty_rtos-capi) (the C ABI) and
-[`rusty_rtos_demo`](https://github.com/Remade-With-Rust/rusty_rtos_demo) (the conformance corpus).
-The last six are on GitHub and not yet on crates.io. Also check out
+[`rusty_rtos_json`](https://crates.io/crates/rusty_rtos_json) (coreJSON),
+[`rusty_rtos_sntp`](https://crates.io/crates/rusty_rtos_sntp) (coreSNTP),
+[`rusty_rtos_mqtt`](https://crates.io/crates/rusty_rtos_mqtt) (coreMQTT),
+[`rusty_rtos_backoff`](https://crates.io/crates/rusty_rtos_backoff) (backoffAlgorithm),
+[`rusty_rtos-capi`](https://crates.io/crates/rusty_rtos-capi) (the C ABI) and
+[`rusty_rtos_demo`](https://crates.io/crates/rusty_rtos_demo) (the conformance corpus).
+All ten are on crates.io. Also check out
 the rest of **[github.com/remade-with-rust](https://github.com/remade-with-rust)**.
 
 ## About Mata Network

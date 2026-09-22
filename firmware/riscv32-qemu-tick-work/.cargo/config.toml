@@ -1,0 +1,17 @@
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# `-bios none` because the ELF IS the firmware: there is no SBI here and
+# nothing to chain to. `-semihosting-config` is what lets the guest set
+# QEMU's exit code, which is what makes this a gate rather than something
+# a person reads.
+# `-icount shift=0` is what makes the counters MEAN something.
+#
+# Without it `mcycle`/`minstret` advance but are not reproducible: three
+# runs of this cell read 1,932,185 / 2,107,644 / 2,320,843, a 20% spread,
+# because QEMU is tracking host time rather than emulated work. With it,
+# three runs read 199,902 / 199,902 / 199,902 -- identical to the
+# instruction. That is the difference between a number and a measurement.
+runner = "qemu-system-riscv32 -machine virt -cpu rv32 -nographic -semihosting-config enable=on,target=native -bios none -icount shift=0 -kernel"
+rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x"]

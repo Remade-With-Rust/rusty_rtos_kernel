@@ -7,15 +7,19 @@ method  median of 512, bracket tax measured and subtracted
   bracket tax            1 cycles (an empty ccount pair, subtracted below)
 
 cycles per operation, on the part:
-  tick (nothing delayed) median=131    min=131    max=3901
-  tick (one task delayed) median=129   min=129    max=201
-  switch                 median=623    min=621    max=6994
-  ISR-API wake -> task has it median=949   min=949    max=12388
+  tick (nothing delayed) median=54     min=54     max=1308
+  tick (one task delayed) median=55     min=55     max=1949
+  switch                 median=166    min=165    max=5841
+  ISR-API wake -> task has it median=430    min=430    max=9614
 
   at 240 MHz, one cycle is 4.17 ns.
-  tick   ~545 ns idle, ~537 ns with a task delayed
-  switch ~2595 ns
+  tick   ~225 ns idle, ~229 ns with a task delayed
+  switch ~691 ns
 ```
+
+> **These numbers replaced a set measured through a harness defect on
+> 2026-09-21** — tick was 131/129, switch 623, ISR wake 949. Nothing in the
+> kernel changed. See *The defect* below.
 
 Run it:
 
@@ -57,32 +61,72 @@ that a non-empty delayed list can only add work. **The board said otherwise:
 129 cycles against 131.** The assumption was what was wrong, so the check was
 replaced and the number kept.
 
-The explanation is that blocking a task takes it *off the ready list*. With two
-runnable tasks at one priority the tick has to make a time-slice round-robin
-decision; with one, it does not. That saving is larger than the cost of looking
-at a single delayed entry whose wake time is far away.
+**★ And on 2026-09-21 the finding itself was withdrawn.** With the harness
+defect below removed, the ordering came back the obvious way round —
+**55 against 54**, the delayed tick costing one cycle *more*. The original
+2-cycle inversion was noise inside a much larger number that should not have
+been there at all.
 
-So the two figures are not "idle vs loaded" — they are "two ready tasks" vs
-"one ready task and one delayed", and the ready-list population dominates.
+The paragraph that used to sit here explained the inversion confidently, in
+terms of ready-list population dominating the delayed-list check. It was a
+good story about an artefact. The cell now prints whichever sentence its own
+numbers support, rather than carrying a conclusion in prose that the next run
+can contradict.
 
 ## A cross-check against the sibling cell
 
 `xiao-s3-signing` measured a scheduling round — queue send, queue receive, two
 context switches — at **1,995 cycles**, by amortising 20,000 of them through a
-1 µs clock. The rows here predict roughly `2 × 623 + (949 − 623) ≈ 1,570` for
-the same shape. Same order, about 20% apart, by two different instruments on
-two different arrangements. That agreement is worth as much as either number
-alone; a factor-of-several disagreement would have meant one of them was
-measuring something else.
+1 µs clock. Against the old rows this cell predicted `2 × 623 + (949 − 623) ≈
+1,570`: same order, about 20% apart, which read as agreement.
+
+**That agreement was between two measurements of the same defect.** The
+sibling cell hand-rolls the same shadowed `NoTrace`, so both were paying the
+name lookup. Against the corrected rows the prediction is
+`2 × 166 + (430 − 166) ≈ 596`, and until the sibling is re-run at its own
+corrected numbers there is **no cross-check here** — only a prediction that
+the sibling should fall by roughly the same factor this cell did.
+
+That is the honest state of it. Two instruments agreeing is worth as much as
+either alone *only* when they are independent, and a common-mode defect makes
+them one instrument wearing two hats.
 
 ## What this does NOT claim
 
-**There is no C arm, and that is the clause's other half still open.** K3 asks
-for these rows *against the C demo*. Building FreeRTOS for the S3 needs the
-ESP-IDF header tree and a generated `sdkconfig.h`, and its Xtensa port's `#if`s
-key off `CONFIG_FREERTOS_*` — a stubbed build would not be the kernel anyone
-runs, so the number would be of our own construction. These are our numbers on
-silicon; the comparison is not done.
+**No C arm ON THIS PART.** A C arm now exists as a **work** row on rv32 —
+`bench/tick-work`, FreeRTOS V11.3.1 out of the pinned oracle, unmodified,
+under `minstret` — so the clause's comparison is no longer entirely open. But
+*cycles* here still have nothing beside them: building FreeRTOS for the S3
+needs the ESP-IDF header tree and a generated `sdkconfig.h`, and its Xtensa
+port's `#if`s key off `CONFIG_FREERTOS_*`, so a stubbed build would not be the
+kernel anyone runs. These are our cycles on silicon; the cycle comparison is
+not done.
+
+## The defect
+
+This cell hand-rolled its own `NoTrace` rather than using the one
+`rusty_rtos_core::trace` ships. The crate's carries
+`const WANTS_NAMES: bool = false`; the trait's default is `true`. So every
+traced event built a 16-byte task name, validated it as UTF-8, and handed it
+to a sink whose body is `{}`.
+
+Deleting the twin — no kernel change of any kind — moved every row:
+
+| row | through the defect | corrected | |
+|---|---:|---:|---:|
+| tick (idle) | 131 | **54** | 2.43x |
+| tick (delayed) | 129 | **55** | 2.35x |
+| switch | 623 | **166** | 3.75x |
+| ISR-API wake | 949 | **430** | 2.21x |
+
+Corroborated on a different architecture by a different instrument: the same
+fix moved `riscv32-qemu-tick-work`'s selection row from **305 to 79 retired
+instructions, 3.86x**, against this cell's **3.75x** in Xtensa cycles. Two
+instruments that share no code agreeing on the size of the defect is what
+makes it a defect rather than a story.
+
+**Ten other sites in the repo still hand-roll the same twin** — see
+`docs/LEDGER.md` for the survey.
 
 **Not the full ISR-to-task latency the clause names.** No interrupt is taken:
 `queue_send_from_isr` is the API an ISR would call, invoked inline. The row is

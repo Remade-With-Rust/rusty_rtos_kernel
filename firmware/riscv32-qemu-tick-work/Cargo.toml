@@ -1,0 +1,46 @@
+# A firmware example, so its own cargo project and its own workspace.
+[package]
+name = "riscv32-qemu-tick-work"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The thing under test, by path. No default features: no_std, no allocator.
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+
+# `minstret`, the architectural retired-instruction CSR. This is the whole
+# reason an rv32 cell can carry a work row where the Cortex-M cells cannot:
+# DWT is unimplemented under QEMU, and `minstret` is not optional debug
+# hardware.
+rusty_rtos_port-riscv = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-riscv", default-features = false }
+
+riscv-rt = "0.12"
+# Single-hart, so disabling interrupts IS the critical section.
+riscv = { version = "0.12", features = ["critical-section-single-hart"] }
+riscv-semihosting = "0.1"
+panic-halt = "1"
+
+# -O2 with no LTO, to match the C arm's `-O2` per translation unit.
+#
+# This is a deliberate match and not a default. The C arm compiles each kernel
+# file separately and links; giving the Rust arm fat LTO would let it inline
+# across a boundary the C arm cannot cross, and the row would measure the
+# build, not the kernel.
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
+[workspace]
+
+[features]
+# The POISON arm. run.sh builds this cell BOTH ways and requires every row to
+# move by one call's worth; a bracket that measures the loop rather than the
+# callee does not move, and the run fails.
+poison = []
