@@ -1322,7 +1322,7 @@ where
                 return self.queue_take_blocking(caller, queue, peek);
             }
             QueueResume::BelowTimedOutResume => {
-                return self.queue_take_timed_out(caller, queue, peek);
+                return self.queue_take_timed_out(queue, peek);
             }
         }
         self.enter_critical();
@@ -1451,7 +1451,7 @@ where
                 self.set_queue_resume(caller, QueueResume::BelowTimedOutResume);
                 return Ok(Blocked);
             }
-            return self.queue_take_timed_out(caller, queue, peek);
+            return self.queue_take_timed_out(queue, peek);
         }
         // `left` is `Some` here, and it carries the block time
         // `check_for_timeout` has just written into the TCB.
@@ -1459,13 +1459,16 @@ where
     }
 
     /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.
+    /// `caller` is read here rather than passed, for the reason given on
+    /// [`Kernel::queue_take_blocking`]: both call sites have already
+    /// established that it is `self.current`.
     #[cold]
     fn queue_take_timed_out(
         &mut self,
-        caller: TaskHandle,
         queue: QueueHandle,
         peek: bool,
     ) -> Result<Wait<u64>> {
+        let caller = self.current;
         // `kind` is read HERE rather than handed down from the caller,
         // because it is the one field of the descriptor that cannot change
         // after `new_queue` sets it -- so resolving it late reads the same
