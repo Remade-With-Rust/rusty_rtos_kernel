@@ -32,11 +32,74 @@ const _: () = assert!(
 
 /// A task name: at most [`NAME_CAPACITY`] bytes, truncated to the
 /// configuration's `MAX_TASK_NAME_LEN` exactly as C truncates it.
+///
+/// # Why this is aligned to eight ON A 64-BIT HOST ONLY
+///
+/// `as_str` validates a sixteen-byte window so that `run_utf8_validation`
+/// takes its word-at-a-time ASCII path instead of walking the name a byte at
+/// a time. That path has TWO conditions and the window size is only one of
+/// them: `core`'s loop reads two `usize`s at a time and declines unless the
+/// slice is `usize`-ALIGNED (`align_offset(size_of::<usize>()) == 0`).
+///
+/// Nothing said so, and on the host the alignment was absent. `Tcb` holds a
+/// `Name` as its first field and is four-aligned deliberately -- see
+/// `WaitFrame`, whose `Split64` fields exist to keep it that way -- and
+/// `Slot<Tcb>` puts a `u32` generation in front of it, so `bytes` landed at
+/// offset four of every slot. Measured with callgrind on a sixteen-byte
+/// window holding `CNT_INC`:
+///
+/// | window offset | Ir per `from_utf8` |
+/// |---|---:|
+/// | 0 (`usize`-aligned) | **46** |
+/// | 4 (what `Slot<Tcb>` gave it) | **143** |
+/// | 1 | 161 |
+///
+/// `bench/kernel-ir` measured 142.7 in production -- offset four to within a
+/// third of an instruction. The optimisation was documented, tested, and off.
+///
+/// # ★ And it was off only on the HOST, which is why it survived
+///
+/// `usize` is FOUR bytes on every target this kernel ships to, so offset four
+/// is already `usize`-aligned there and the ASCII path was being taken all
+/// along. The defect existed only where `usize` is eight -- the 64-bit host
+/// that runs the sim and the conformance suite. That is the pointer-width
+/// asymmetry this project has paid for before (`docs/LEDGER.md`), and it is
+/// why the alignment is requested with a `cfg_attr` rather than outright:
+/// asking for eight unconditionally would grow `Tcb` on a 32-bit target, and
+/// spend real firmware RAM to fix a host-only cost.
+///
+/// So this buys the sim and `kairos conform --all` about ten percent of their
+/// instructions and buys firmware nothing, by design. It changes no layout a
+/// target sees.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_pointer_width = "64", repr(align(8)))]
 pub struct Name {
     bytes: [u8; NAME_CAPACITY],
     len: u8,
 }
+
+// `as_str`'s fast path depends on the window being `usize`-aligned, and a
+// layout change removes that silently -- which is exactly what happened here.
+// Fail the build instead.
+//
+// ONLY on the 64-bit host, because that is the only place the attribute above
+// promises anything. `Name`'s own alignment is ONE -- every field is a `u8` --
+// so on a 32-bit target the alignment does not come from this type at all: it
+// comes from the container. `Tcb` holds a `Name` at offset zero and is itself
+// four-aligned (`WaitFrame`'s `Split64` fields are what keep it so), and
+// `Slot<Tcb>` puts a `u32` in front, so the window lands on a multiple of four
+// -- which IS `usize`-aligned where `usize` is four bytes. That is why the
+// defect never existed on a target, and why asking for four here would only
+// grow `Tcb` for nothing.
+//
+// This assertion was written the other way round first, unconditionally, and
+// it failed the rv32 build immediately: `align_of::<Name>()` is 1, not 4. The
+// failure is the reason the paragraph above exists.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    core::mem::align_of::<Name>() >= core::mem::size_of::<usize>(),
+    "Name must be usize-aligned on the host or as_str's word-at-a-time UTF-8      path stops being taken and every name a trace prints costs three times      what it should."
+);
 
 impl Default for Name {
     fn default() -> Self {
