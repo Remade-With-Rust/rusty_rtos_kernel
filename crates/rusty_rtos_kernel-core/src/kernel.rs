@@ -2109,7 +2109,35 @@ where
             if next == 0 {
                 self.switch_delayed_lists();
             }
-            if next >= self.next_unblock_time {
+            // The mask is not arithmetic, it is INFORMATION. Both sides are
+            // tick values and every writer of either has already masked with
+            // `MAX_DELAY` -- `next` two lines above, `next_unblock_time` from a
+            // `wake_at` that `add_current_task_to_delayed_list` masked, or from
+            // `MAX_DELAY` itself. So at a 32-bit tick width the high half of
+            // both is invariantly zero.
+            //
+            // LLVM proves that for `next`, which it just computed, and cannot
+            // for `next_unblock_time`, which it loaded -- so the comparison was
+            // emitted as a full 64-bit one: a second `lw` for the high word,
+            // then `sltu`/`snez`/`or` to combine. Masking says the high half is
+            // zero and the compare collapses to the single `bltu` the values
+            // deserve. At a 64-bit width `MAX_DELAY` is `u64::MAX` and the mask
+            // folds to nothing, so this costs those configurations no
+            // instruction at all.
+            // The mask is only sound while every writer of the field has
+            // already applied it. All six do -- three store `MAX_DELAY`, two
+            // store a delayed list's head value, and the one place that MINTS
+            // such a value masks it (`add_current_task_to_delayed_list`'s
+            // `wake_at`). This is the proof, and it costs nothing in release:
+            // a writer that forgets fails the kernel's own tests, the Kani
+            // proofs and the conformance corpus instead of silently changing a
+            // comparison. Same guard shape as `current_priority`'s.
+            debug_assert_eq!(
+                self.next_unblock_time,
+                self.next_unblock_time & Self::MAX_DELAY,
+                "next_unblock_time holds a value wider than the tick, so masking                  it in the comparison below would change the answer"
+            );
+            if next >= self.next_unblock_time & Self::MAX_DELAY {
                 switch_required = self.wake_due_tasks(next);
             }
             // `!switch_required` first: when the tick already woke a
@@ -2929,9 +2957,51 @@ where
     }
 
     /// `prvResetNextTaskUnblockTime`.
+    ///
+    /// ★ The EMPTY case is `MAX_DELAY`, not the list's own maximum.
+    ///
+    /// `head_value` cannot answer "empty": on an empty list the head IS the end
+    /// marker, whose value is `u64::MAX` so that sorted inserts always find a
+    /// larger value to stop at. So `unwrap_or` never fired and a reset over an
+    /// empty delayed list stored `u64::MAX`, where the C stores `portMAX_DELAY`:
+    ///
+    /// ```c
+    /// if( listLIST_IS_EMPTY( pxDelayedTaskList ) != pdFALSE ) {
+    ///     xNextTaskUnblockTime = portMAX_DELAY;
+    /// ```
+    ///
+    /// Unobservable in the corpus -- the difference only shows at a tick equal
+    /// to `MAX_DELAY`, and `switch_delayed_lists` resets at the wrap anyway --
+    /// which is why a test had PINNED the divergence rather than a gate
+    /// catching it. Asking the emptiness question directly matches the C and
+    /// makes `next_unblock_time <= MAX_DELAY` an invariant of the field.
+    ///
+    /// That invariant is worth five instructions per TICK: `increment_tick`
+    /// compares `next` against this field, and while the field could hold a
+    /// value wider than the tick that comparison had to be a full 64-bit one on
+    /// a 32-bit target -- a second load, a `snez` and an `or` on top of the
+    /// ordinary compare. With the invariant true, the comparison masks to the
+    /// tick width and collapses. `bench/tick-work`: tick_idle and tick_delayed
+    /// 14 -> 9 against the C's 15, 0.93x -> 0.60x.
+    /// # Out of line, and that is load-bearing
+    ///
+    /// `switch_delayed_lists` is `#[inline(always)]` (win 26) and it calls this,
+    /// so this body lands inside `increment_tick` -- on the arm taken when the
+    /// tick WRAPS, i.e. once in `MAX_DELAY` ticks. Asking the emptiness question
+    /// above made the body bigger, and in line that cost the tick row
+    /// **14 -> 34** on `bench/tick-work`: twenty instructions of register
+    /// pressure on every tick, to serve an arm that had not run once in the
+    /// measurement. `rusty-compiler-leverage` A2, and the largest single
+    /// instance of it this kernel has produced.
+    #[cold]
+    #[inline(never)]
     fn reset_next_task_unblock_time(&mut self) {
         let delayed = self.delayed_list();
-        self.next_unblock_time = self.lists.head_value(delayed).unwrap_or(Self::MAX_DELAY);
+        self.next_unblock_time = if self.lists.is_empty_of(delayed) {
+            Self::MAX_DELAY
+        } else {
+            self.lists.head_value(delayed).unwrap_or(Self::MAX_DELAY)
+        };
     }
 
     // ------------------------------------------------------------- delay --
@@ -4503,13 +4573,30 @@ mod tests {
         k.switch_delayed_lists();
         assert_eq!(
             k.next_unblock_time,
-            u64::MAX,
+            K::MAX_DELAY,
             "the list that is now 'delayed' is empty, so nothing is due"
         );
     }
 
-    /// The sentinel for "nothing is due" is NOT the same value in the two
-    /// places this kernel writes it, and this pins both.
+    /// The sentinel for "nothing is due" is the SAME value in both places this
+    /// kernel writes it, and this pins that.
+    ///
+    /// ★ It used to differ, and this test used to pin the difference. A reset
+    /// over an empty delayed list stored `u64::MAX` because `head_value` cannot
+    /// answer "empty" -- on an empty list the head IS the end marker, whose
+    /// value is `u64::MAX` so sorted inserts always find something larger to
+    /// stop at -- so the `unwrap_or(MAX_DELAY)` never fired. The C stores
+    /// `portMAX_DELAY` there.
+    ///
+    /// The divergence was unobservable (it shows only at a tick equal to
+    /// `MAX_DELAY`, and the wrap resets anyway), which is why a test pinned it
+    /// instead of a gate catching it -- and the test one screen up had said in
+    /// prose that `MAX_DELAY` "must" be the answer while asserting `u64::MAX`.
+    /// The prose was right.
+    ///
+    /// Worth five instructions per tick: with the field provably no wider than
+    /// the tick, `increment_tick`'s comparison against it stops being a 64-bit
+    /// one on a 32-bit target. See `reset_next_task_unblock_time`.
     ///
     /// `new()` starts it at `MAX_DELAY` -- the tick mask, and what the C's
     /// `portMAX_DELAY` is. `reset_next_task_unblock_time` instead takes
@@ -4540,13 +4627,18 @@ mod tests {
         k.reset_next_task_unblock_time();
         assert_eq!(
             k.next_unblock_time,
-            u64::MAX,
-            "and a reset over an empty list uses the LIST's maximum instead"
+            K::MAX_DELAY,
+            "and a reset over an empty list uses the SAME sentinel, as the C does"
         );
         assert_ne!(
             K::MAX_DELAY,
             u64::MAX,
-            "the two are genuinely different values, or this test is vacuous"
+            "MAX_DELAY must be narrower than u64::MAX at this width, or the              invariant this test defends is vacuous"
+        );
+        assert_eq!(
+            k.next_unblock_time & K::MAX_DELAY,
+            k.next_unblock_time,
+            "the field must never hold a value wider than the tick: that is what              lets increment_tick's comparison stay 32-bit"
         );
     }
 
