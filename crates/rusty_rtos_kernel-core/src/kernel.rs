@@ -3134,6 +3134,16 @@ where
         let now = self.tick & Self::MAX_DELAY;
         let ticks = ticks & Self::MAX_DELAY;
         let current = self.current;
+        // B1, and this function is where it pays most: by its own note below it
+        // is the single largest consumer of the blocking workload, and it
+        // derives FOUR bound-checked accesses from an index it read out of
+        // memory -- `delay_aborted`, then `state_item` feeding `lists.remove`
+        // and one of three inserts. `self.current` is a live task on every path
+        // that reaches here, but it is a FIELD, so nothing carries that across
+        // the calls above.
+        if current.index() as usize >= TASKS {
+            return Err(Error::Gone);
+        }
         // About to enter a delayed list, so the abort flag is cleared here
         // and can only be seen set by a task that really was aborted.
         if let Some(f) = self.delay_aborted.get_mut(current.index() as usize) {
