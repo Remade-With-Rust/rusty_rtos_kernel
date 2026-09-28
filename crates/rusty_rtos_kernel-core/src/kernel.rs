@@ -3786,15 +3786,26 @@ where
     /// draws from zero ticks left anyway.
     pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> Option<NonZeroU64> {
         self.enter_critical();
+        // Prove the index in range ONCE. Three bounded reads below key on the
+        // same task -- the abort flag, its clear, and the TCB resolve -- and an
+        // out-of-range task already answers `None` through every one of them, so
+        // saying so up front is free of behaviour and lets their checks fold.
+        // `rusty-compiler-leverage` B1, the lever that took `switch_context`
+        // -969,669 and the tick 14 -> 9 today.
+        //
+        // AFTER `enter_critical`, and the exit below is not optional: on the sim
+        // an outermost critical-section exit IS the clock, so a return that
+        // skipped it would move every later event in the trace and `conform`
+        // would fail on all twenty-six scenarios.
+        let index = task.index() as usize;
+        if index >= TASKS {
+            self.exit_critical();
+            return None;
+        }
         // An aborted delay is not the same as a time out, but it has the
         // same result: stop waiting.
-        if self
-            .delay_aborted
-            .get(task.index() as usize)
-            .copied()
-            .unwrap_or(false)
-        {
-            if let Some(f) = self.delay_aborted.get_mut(task.index() as usize) {
+        if self.delay_aborted.get(index).copied().unwrap_or(false) {
+            if let Some(f) = self.delay_aborted.get_mut(index) {
                 *f = false;
             }
             self.exit_critical();
