@@ -1696,6 +1696,14 @@ where
             // — so on this shape both are skipped and the owed body is
             // entered directly.
             let index = self.current.index() as usize;
+            // B1, the shape win 7 established: `self.current` is read RAW here -- no
+            // bound-checking accessor between the field and the use -- and `index` then
+            // feeds `owes_anything.get(index)`. Contrast `remove_from_event_list`, where
+            // the same proof measured EXACTLY +0 because its handle comes back from
+            // `handle_at`, which bound-checks, so the fact was already local.
+            if index >= TASKS {
+                return false;
+            }
             if !self.owes_anything.get(index).copied().unwrap_or(true) {
                 return false;
             }
@@ -1713,6 +1721,14 @@ where
     fn resume_pending_cold(&mut self) -> bool {
         self.settle_unwind();
         let index = self.current.index() as usize;
+        // B1, the shape win 7 established: `self.current` is read RAW here -- no
+        // bound-checking accessor between the field and the use -- and `index` then
+        // feeds `owes_anything.get(index)`. Contrast `remove_from_event_list`, where
+        // the same proof measured EXACTLY +0 because its handle comes back from
+        // `handle_at`, which bound-checks, so the fact was already local.
+        if index >= TASKS {
+            return false;
+        }
 
         // One load and one test for the overwhelmingly common case. The
         // combined check below is the fallback, and it is what clears the hint
