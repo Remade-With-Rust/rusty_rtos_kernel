@@ -3114,7 +3114,25 @@ where
         ticks: u64,
         can_block_indefinitely: bool,
     ) -> Result<()> {
-        let now = self.tick;
+        // Both masked, and for the reason `increment_tick`'s comparison is: at a
+        // 32-bit tick width the high half of every tick value is invariantly
+        // zero, LLVM cannot know that of a field it loaded or a parameter it was
+        // handed, and without being told it emits full 64-bit compares on a
+        // 32-bit target. Three of them live below -- `ticks == MAX_DELAY`,
+        // `wake_at < now`, and `wake_at < next_unblock_time`.
+        //
+        // `self.tick` is masked by every writer (`increment_tick` and
+        // `step_tick` both `& MAX_DELAY`). `ticks` reaches here from
+        // `check_for_timeout`, whose answers are all at most `MAX_DELAY`, and
+        // from `begin_wait`, which truncates what it stores. At a 64-bit width
+        // `MAX_DELAY` is `u64::MAX` and both masks fold to nothing.
+        debug_assert_eq!(
+            self.tick,
+            self.tick & Self::MAX_DELAY,
+            "the tick is wider than its own width"
+        );
+        let now = self.tick & Self::MAX_DELAY;
+        let ticks = ticks & Self::MAX_DELAY;
         let current = self.current;
         // About to enter a delayed list, so the abort flag is cleared here
         // and can only be seen set by a task that really was aborted.
@@ -3174,7 +3192,23 @@ where
             // Both were silent when wrong. See `ListsOf::insert_sorted`,
             // and `ListsOf::is_sorted` for checking the one that is left.
             self.lists.insert_sorted(list, item, wake_at)?;
-            if wake_at < self.next_unblock_time {
+            // Masked for the same reason `increment_tick`'s comparison is, and
+            // it is the second site of that win: `next_unblock_time <=
+            // MAX_DELAY` is an invariant of the field (see
+            // `reset_next_task_unblock_time`, which is what made it one), and
+            // `wake_at` was masked where it was computed above. So at a 32-bit
+            // tick width the high half of both is invariantly zero, and without
+            // saying so LLVM emits a full 64-bit compare on a 32-bit target --
+            // a second load, a `snez` and an `or` on top of the ordinary one.
+            //
+            // At a 64-bit width `MAX_DELAY` is `u64::MAX` and the mask folds to
+            // nothing, so that configuration pays no instruction for this.
+            debug_assert_eq!(
+                self.next_unblock_time,
+                self.next_unblock_time & Self::MAX_DELAY,
+                "next_unblock_time holds a value wider than the tick"
+            );
+            if wake_at < self.next_unblock_time & Self::MAX_DELAY {
                 self.next_unblock_time = wake_at;
             }
         }
