@@ -1646,8 +1646,20 @@ where
             return;
         };
         self.top_ready_priority = top;
-        if next != current {
-            self.hand_over(current, next);
+        // INDICES, and `hand_over` takes only the incoming handle: together
+        // those two delete the load of `current`'s generation word entirely.
+        // Either alone leaves it live -- the full-handle `!=` compares both
+        // halves, and a `hand_over` taking the outgoing handle needs both -- so
+        // the index compare measured 0 on its own. `rusty-compiler-leverage`
+        // A2: price the SET, not the halves.
+        //
+        // Comparing indices is sound because both handles are LIVE: `next` came
+        // out of a slot whose generation was just matched, and `current` names
+        // the running task. The arena issues one live handle per slot at a time,
+        // so two live handles sharing an index share a generation. That is the
+        // same argument `Handle::is_null` makes in the other direction.
+        if next.index() != current.index() {
+            self.hand_over(next);
         }
         // `top` is `next`'s priority by construction: the loop above found
         // the highest non-empty ready list and `next` came out of it.
@@ -2060,11 +2072,17 @@ where
     /// [`Kernel::settle_unwind`] collects the tally once the frame has
     /// finished. A task being switched in for the first time has a fresh
     /// stack and owes nothing.
-    fn hand_over(&mut self, outgoing: TaskHandle, incoming: TaskHandle) {
+    /// Takes only the INCOMING handle. The outgoing one is `self.current`, which
+    /// this reads for itself -- `set_current_at` has not run yet, so the field
+    /// still names the task being left. Passing it in made `switch_context` load
+    /// BOTH words of the handle at the top of the function, and the generation
+    /// half is read only on the unwind arm below, which is skipped on every
+    /// switch after the first.
+    fn hand_over(&mut self, incoming: TaskHandle) {
         // A tail that switches again is still the first frame's tail: the
         // code after the second switch is on the same abandoned stack.
         if self.unwinding.is_null() {
-            self.unwinding = outgoing;
+            self.unwinding = self.current;
             self.port.begin_unwind();
         }
         let index = incoming.index() as usize;
