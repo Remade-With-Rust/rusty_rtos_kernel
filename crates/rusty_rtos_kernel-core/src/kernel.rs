@@ -4226,6 +4226,21 @@ where
         Ok(should_delay)
     }
 
+    /// Which error `task_of_event_item` would have produced, re-derived out of
+    /// line so its two discriminants do not sit in the caller's entry block.
+    // `#[inline(never)]` is load-bearing, not decoration: with `#[cold]` alone
+    // LLVM inlines this back and re-materialises the constants in the caller's
+    // entry block -- measured EXACTLY +0 Ir for -2 B. The hint only reweights
+    // the branch; MOVING the code is what sinks the constants.
+    #[cold]
+    #[inline(never)]
+    fn event_item_error(&self, item: ItemId) -> Error {
+        match item.checked_sub(Self::task_item_base()) {
+            None => Error::InvalidArgument,
+            Some(_) => Error::Gone,
+        }
+    }
+
     /// `xTaskRemoveFromEventList`; `true` when the woken task outranks the
     /// running one and a yield is therefore required.
     /// `#[cold]` because the call is GUARDED and reached from many sites on
@@ -4238,7 +4253,16 @@ where
         let Some(item) = self.lists.head(list)? else {
             return Ok(false);
         };
-        let task = self.task_of_event_item(item)?;
+        // The `?` put FIVE constants in the entry block -- `xor %eax,%eax`,
+        // `mov $0x0,%edx`, `mov $0x1,%al`, `mov $0x8,%dl`, `mov $0x5,%dl` --
+        // the Ok/Err tags and both error discriminants, materialised before the
+        // tests that would use them. The census says ALL 21,487 BlockQ calls
+        // pass every one of those tests, so that is five instructions of dead
+        // setup on the only path anybody takes. Producing the error inside a
+        // `#[cold]` callee sinks them out of the entry block.
+        let Ok(task) = self.task_of_event_item(item) else {
+            return Err(self.event_item_error(item));
+        };
         let _ = self.lists.remove(item);
         if self.suspended_depth == 0 {
             let _ = self.lists.remove(Self::state_item(task));
