@@ -3636,6 +3636,26 @@ where
         queue: QueueHandle,
         ticks: u64,
     ) -> Option<u64> {
+        // ★ TRUNCATE TO THE TICK WIDTH, at the boundary, because that is what
+        // the C does and it is what makes every later comparison 32-bit.
+        //
+        // C's `xTicksToWait` is a `TickType_t`. At a 32-bit configuration a
+        // caller CANNOT express a wait longer than `MAX_DELAY` -- the value is
+        // truncated by the assignment, so `2^32` ticks becomes 0 and
+        // `u64::MAX` becomes `portMAX_DELAY`, i.e. forever. This API takes a
+        // `u64` so the kernel is width-independent, which means it must do that
+        // truncation itself rather than let a value the C could not represent
+        // reach a wait frame.
+        //
+        // The masking is BEFORE the zero test on purpose: C's truncation
+        // happens at the assignment, so a caller asking for exactly `2^32`
+        // ticks gets C's answer -- do not block -- and not a very long wait.
+        //
+        // What it buys: every field of a `WaitFrame` is then provably no wider
+        // than the tick, so `check_for_timeout`'s comparisons against them stop
+        // being 64-bit ones on a 32-bit target. That is the same lever that took
+        // `tick_idle` 14 -> 9; see `reset_next_task_unblock_time`.
+        let ticks = ticks & Self::MAX_DELAY;
         // The zero-block-time exit, taken before anything is read. `wait_set`
         // mirrors the TCB's `entry_set` in one byte, which is the same trade
         // `end_wait` documents and makes — so the frame can be ruled out
@@ -3744,8 +3764,22 @@ where
         let overflows = self.overflows;
         let result = match self.tcbs.resolve_mut(task) {
             Ok(tcb) => {
-                let entering = tcb.wait.entering.get();
-                let held = tcb.wait.ticks.get();
+                // Masked: `begin_wait` truncates what it stores to the tick
+                // width, so these are no-ops on the VALUE and information to
+                // LLVM, which cannot otherwise know a field it loaded is
+                // narrow. Without them every comparison below is a 64-bit one.
+                debug_assert_eq!(
+                    tcb.wait.entering.get(),
+                    tcb.wait.entering.get() & Self::MAX_DELAY,
+                    "a wait frame's `entering` is wider than the tick"
+                );
+                debug_assert_eq!(
+                    tcb.wait.ticks.get(),
+                    tcb.wait.ticks.get() & Self::MAX_DELAY,
+                    "a wait frame's `ticks` is wider than the tick"
+                );
+                let entering = tcb.wait.entering.get() & Self::MAX_DELAY;
+                let held = tcb.wait.ticks.get() & Self::MAX_DELAY;
                 let elapsed = now.wrapping_sub(entering) & Self::MAX_DELAY;
                 if held == Self::MAX_DELAY {
                     // An indefinite block never times out.
