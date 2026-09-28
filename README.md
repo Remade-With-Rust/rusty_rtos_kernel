@@ -19,8 +19,8 @@ the C kernel's own execution trace.
 
 - **Proven**: **22 conformance scenarios** produce traces identical to the C
   kernel's own, and the same corpus runs on four architectures — the last of
-  them silicon. On the two emulators it is 24 of 25 today, with the one
-  exception named and numbered under Conformance. Separately, **26 unmodified
+  them silicon. On the two emulators it is **25 of 25**, identical field for
+  field between them. Separately, **26 unmodified
   C demo files** from the FreeRTOS distribution link against it through
   [`rusty_rtos-capi`](https://github.com/Remade-With-Rust/rusty_rtos-capi) and
   pass their own checkers.
@@ -56,10 +56,11 @@ counters.
 |---|---|
 | scenarios identical to the C kernel, on the host | **22** |
 | ticks per scenario | 2,000 pinned · verified again at **100,000** |
-| on each emulator, Cortex-M3 and RV32 | **24 of 25** — see below |
+| on each emulator, Cortex-M3 and RV32 | **25 of 25**, identical field for field |
 | architectures | host, ARMv7-M, RV32, Xtensa LX7 |
-| soak, both emulators | RV32 18/18 in 58 min · M3 18/18 in 75 min |
-| on silicon (XIAO ESP32-S3) | 18/18, measured 2026-09-11 |
+| soak, both emulators | **RV32 25/25 · M3 25/25**, identical field for field (≈11.5 min each, run concurrently — a contended wall, not a timing) |
+| soak, **on silicon** | **25/25** at 3,600,000 ticks on a XIAO ESP32-S3 — every row identical to both emulator hours (2026-09-23) |
+| on silicon (XIAO ESP32-S3) | **25/25**, re-run 2026-09-23 — identical field for field to both emulators |
 | unmodified C demo files linking against it | **26** |
 
 ```sh
@@ -82,14 +83,14 @@ to a freed object gets a new ordinal where our arena reuses the freed index.
 It is recorded, not hidden, and runs on its own with `kairos conform
 AbortDelay`.
 
-**Also open, and found by the 0.2.0 release gate:** `StreamBufferDemo` passes
-on the host — identical to the C kernel — and **diverges on both emulators**,
-identically. Every counter and the line count match (2,000 ticks, 2,424
-yields, 28,002 exits, 20,927 lines); only the trace *text* differs, by 194
-bytes. A scheduling defect moves a counter, and none moved. It looks like a
-value whose digit count depends on `size_of::<usize>()` reaching the trace,
-which is a 32-bit-target text defect rather than a kernel one — but it is
-named here with its numbers rather than left out.
+**Closed 2026-09-21, and it was never a kernel defect:** the 0.2.0 release
+gate found `StreamBufferDemo` diverging on both emulators. The cause was in
+the *scenario* — the echo client's send length wraps at
+`sbSTREAM_BUFFER_LENGTH_BYTES - sizeof(size_t)`, and `sizeof(size_t)` was
+spelled as the running machine's pointer width rather than the oracle's, so
+the length walked 1..=22 on the host and 1..=26 on every 32-bit target. It was
+not trace text: the scenario sent different data, and no counter could see it
+because the number of sends never changed. Both emulators are now 25 of 25.
 
 ## Tickless idle
 
@@ -231,9 +232,13 @@ bench/switch-cost/run.sh     # the register half
 | target | corpus | notes |
 |---|---|---|
 | host (x86-64 Windows, Linux) | ✅ **22 identical to the C kernel** | the sim port, and a threaded host port |
-| `thumbv7m-none-eabi` (Cortex-M3) | ✅ 18/18 | QEMU `mps2-an385` |
-| `riscv32imac-unknown-none-elf` | ✅ 18/18 | QEMU `virt` |
-| `xtensa-esp32s3-none-elf` | ✅ 18/18 | **on silicon**, a XIAO ESP32-S3 |
+| `thumbv7m-none-eabi` (Cortex-M3) | ✅ **25/25** | QEMU `mps2-an385` |
+| `riscv32imac-unknown-none-elf` | ✅ **25/25** | QEMU `virt` |
+| `xtensa-esp32s3-none-elf` | ✅ **25/25** | **on silicon**, a XIAO ESP32-S3 |
+
+All three carry **identical rows, field for field** — same ticks, yields,
+exits, line counts and digests on three instruction sets, two of them emulated
+and one a real part.
 
 Xtensa needed no context-switch port to run the corpus at all — a scenario is a
 state machine and a task owns no stack, so the switch is what you need to host

@@ -14,7 +14,21 @@ use core::str;
 /// The C default is 16 and the `Posix_GCC` demo uses 12; a configuration
 /// asking for more than this is refused by [`Name::new`] rather than
 /// truncated silently at a limit nobody wrote down.
-pub const NAME_CAPACITY: usize = 32;
+pub const NAME_CAPACITY: usize = 16;
+
+// `as_str` validates a FIXED 16-byte window because that is the smallest one
+// `run_utf8_validation` will take its word-at-a-time ASCII path for. While the
+// capacity equals that window, `end <= WINDOW` is provably true and the
+// widening branch folds away — which is why `as_str` needs no `if` at run
+// time and why the test below has no wide-window case.
+//
+// Raise the capacity above 16 and that stops being true: the widening path
+// goes live, untested, on the hot path that prints two names per context
+// switch. This makes that a build failure instead.
+const _: () = assert!(
+    NAME_CAPACITY <= 16,
+    "NAME_CAPACITY above 16 makes as_str's widening branch live again: give      it a test case, and re-measure the trace rows, before raising this."
+);
 
 /// A task name: at most [`NAME_CAPACITY`] bytes, truncated to the
 /// configuration's `MAX_TASK_NAME_LEN` exactly as C truncates it.
@@ -43,6 +57,9 @@ impl Name {
     /// ASCII and a name that is not is a configuration error, not a silent
     /// mojibake.
     #[must_use]
+    // In line at both callers (`rusty-compiler-leverage` A3): win 24, -20 B of
+    // flash. `#[inline]` alone was a hint LLVM declined at this size.
+    #[inline(always)]
     pub fn new(name: &str, max_len: usize) -> Self {
         let limit = max_len.saturating_sub(1).min(NAME_CAPACITY).min(name.len());
         // Walk back to a character boundary; for ASCII this is `limit`.
@@ -52,8 +69,20 @@ impl Name {
         }
         let src = name.as_bytes().get(..end).unwrap_or(&[]);
         let mut bytes = [0u8; NAME_CAPACITY];
-        for (slot, byte) in bytes.iter_mut().zip(src.iter()) {
-            *slot = *byte;
+        // A zip, NOT `copy_from_slice`. The slice version lowers to `memcpy`
+        // and reads like the better choice -- but its length-mismatch arm
+        // panics with TWO FORMATTED INTEGERS, and that drags
+        // `core::fmt::Formatter::pad_integral` (596 B), `Display for usize`
+        // (362 B) and `str::count::do_count_chars` (376 B) into a `no_std`
+        // kernel that formats nothing anywhere else. Measured at **1,052
+        // bytes** of flash for a branch that cannot be taken: `dst` is
+        // `bytes[..src.len()]`, so the lengths are equal by construction and
+        // LLVM still would not prove it.
+        //
+        // The zip has no panicking arm at all, so none of that machinery is
+        // reachable. It copies at most NAME_CAPACITY (16) bytes.
+        for (d, s) in bytes.iter_mut().zip(src.iter()) {
+            *d = *s;
         }
         Self {
             bytes,
@@ -96,6 +125,23 @@ impl Name {
             Ok(all) => all.get(..end).unwrap_or(""),
             Err(_) => "",
         }
+    }
+
+    /// Whether this name is `other`.
+    ///
+    /// Compares BYTES. Two `str`s are equal exactly when their bytes are, so
+    /// this answers what `self.as_str() == other` answered — without the
+    /// UTF-8 validation that makes a `&str`, which is the only thing that
+    /// pulled `core::str::from_utf8` into a kernel built with `NoTrace`.
+    /// Measured on `bench/kernel-flash`: **534 bytes**, 3.2 % of the arm, for
+    /// one comparison in `task_get_handle`.
+    #[must_use]
+    // A3: ONE caller in the linked kernel, so this pays a prologue and epilogue
+    // for a single call. Inlining moves the body rather than duplicating it.
+    #[inline(always)]
+    pub fn matches(&self, other: &str) -> bool {
+        let end = usize::from(self.len).min(NAME_CAPACITY);
+        self.bytes.get(..end) == Some(other.as_bytes())
     }
 
     /// How many bytes the name occupies.
@@ -173,10 +219,32 @@ mod tests {
                 "the tail past `len` must be NUL"
             );
         }
-        // And the window widens when the name fills it.
-        let long = Name::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ", NAME_CAPACITY);
-        assert!(long.len() > 16, "this case must exercise the wide window");
-        assert_eq!(long.as_str(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        // A name that FILLS the capacity still reads back whole. This used
+        // to assert `len() > 16` to prove it exercised `as_str`'s WIDE
+        // window -- and when `NAME_CAPACITY` came down to 16 that assertion
+        // failed, correctly: at capacity 16 the wide window cannot be
+        // reached, because `end` is clamped to the capacity and the window
+        // IS the capacity. The branch folds at compile time and the case it
+        // guarded no longer exists.
+        //
+        // The guard below is what replaces it. If anyone raises the capacity
+        // above the window, the widening path becomes live again and this
+        // test must grow a case for it — so the coupling fails the build
+        // rather than going quietly untested.
+        // `NAME_CAPACITY - 1`, not `NAME_CAPACITY`: `max_len` counts the C
+        // array's NUL slot, exactly as `prvInitialiseNewTask` does, so a
+        // configuration asking for 16 gets 15 characters. Asserting 16 here
+        // is the mistake this comment exists to stop being made twice.
+        let full = Name::new(&"A".repeat(NAME_CAPACITY), NAME_CAPACITY);
+        assert_eq!(full.len(), NAME_CAPACITY - 1);
+        assert_eq!(full.as_str(), "A".repeat(NAME_CAPACITY - 1));
+        // And the buffer CAN be filled to the last byte, when the caller asks
+        // for more than the capacity — `as_str` reads `len` rather than
+        // scanning for a NUL, so a name with no terminator still reads back.
+        // This is also the case that keeps `end == WINDOW` reachable.
+        let brim = Name::new(&"B".repeat(NAME_CAPACITY * 2), usize::MAX);
+        assert_eq!(brim.len(), NAME_CAPACITY);
+        assert_eq!(brim.as_str(), "B".repeat(NAME_CAPACITY));
     }
 
     #[test]

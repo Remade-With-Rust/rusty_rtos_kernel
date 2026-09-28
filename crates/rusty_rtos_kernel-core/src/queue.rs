@@ -66,14 +66,17 @@ pub enum Position {
 }
 
 /// What a queue is underneath (`ucQueueType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Kind {
     // ORDER IS LOAD-BEARING, and only for the two predicates below. The kinds
     // that carry data are first and the two mutex kinds are last, so
     // `carries_data` and `is_mutex` are each a range the compiler can test
     // with one comparison instead of two. Nothing reads a discriminant, so
     // the order carries no other meaning.
-    /// A queue of values.
+    /// A queue of values. `#[default]` so a free arena slot holds something
+    /// real without unsafe; the ORDER above is untouched, and nothing reads
+    /// a free slot.
+    #[default]
     Queue,
     /// A queue set: a queue whose items are the handles of the queues in
     /// it. `xQueueSelectFromSet` is a receive from this one.
@@ -104,7 +107,7 @@ impl Kind {
 /// of the kernel's shared slot pool, and the read and write cursors follow
 /// C's `pcReadFrom` / `pcWriteTo` exactly — `pcReadFrom` points at the item
 /// last read, which is what makes `queueSEND_TO_FRONT` a single step back.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Queue {
     pub(crate) base: usize,
     /// `uxLength`.
@@ -137,6 +140,9 @@ pub(crate) const UNLOCKED: i8 = -1;
 pub(crate) const LOCKED_UNMODIFIED: i8 = 0;
 
 impl Queue {
+    // A3: ONE caller, so the out-of-line body pays a prologue and epilogue for
+    // a single call. Inlining moves the body rather than duplicating it.
+    #[inline]
     pub(crate) const fn new(base: usize, length: usize, kind: Kind) -> Self {
         Self {
             base,
@@ -169,7 +175,8 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    const TIMER_CMDS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS, TIMER_CMDS>
 where
     H: TickHook<Self>,
 {
@@ -229,7 +236,7 @@ where
         if q.kind.carries_data() {
             self.give_slots(q.base, q.length);
         }
-        let _ = self.queues.remove(queue);
+        let _ = self.queues.discard(queue);
         // `vPortFree( pxQueue )`.
         self.account_for_allocation();
         Ok(())
@@ -275,13 +282,31 @@ where
         self.new_mutex(Kind::RecursiveMutex)
     }
 
+    /// `prvInitialiseMutex`: give the mutex once so it starts available.
+    ///
+    /// This goes through the general send for the same reason the C does — and
+    /// the byte count is the argument. Until 2026-09-25 a private `prime_mutex`
+    /// carried a hand-written copy of the send, specialised on the four
+    /// constants supplied below, because inlining the general body here cost
+    /// **534 bytes**. That defence was aimed at the wrong thing: the choice is
+    /// not "specialise or inline", it is *which symbol to call*, and
+    /// [`Self::send_generic_outlined`] — the A4 handle that already existed for
+    /// the cold callers — costs a five-argument frame, not a body.
+    ///
+    /// Calling it instead and deleting the specialisation measured
+    /// **−316 bytes** of flash (19,302 → 18,986), `mv` − 8, `slli` − 5,
+    /// `andi` − 2 and 99 fewer rv32 instructions — every pin down, none up.
+    /// `conform --all` stays at 26/26, which is what proves the trace is
+    /// unchanged: one critical section, `QueueSend` at the same point, the same
+    /// `exits`. A mutex therefore still shows a `QUEUE_SEND` line immediately
+    /// after its `QUEUE_CREATE`, before any task exists.
+    ///
+    /// The law: a specialisation written to escape an unwanted INLINE is only
+    /// worth its bytes if no out-of-line handle on the general body exists.
+    /// Check for the handle first.
     fn new_mutex(&mut self, kind: Kind) -> Result<QueueHandle> {
         let handle = self.new_queue(1, kind)?;
-        // `prvInitialiseMutex` gives the mutex once so it starts available,
-        // and it does so through `xQueueGenericSend` — which fires
-        // `traceQUEUE_SEND`. A mutex therefore has a `QUEUE_SEND` line
-        // immediately after its `QUEUE_CREATE`, before any task exists.
-        let _ = self.queue_send_generic(handle, 0, 0, Position::Back)?;
+        let _ = self.send_generic_outlined(handle, 0, 0, Position::Back)?;
         Ok(handle)
     }
 
@@ -304,7 +329,7 @@ where
             if free == length {
                 self.drop_free_slot(i);
             } else if let Some(slot) = self.free_slots.get_mut(i) {
-                *slot = (base.saturating_add(length), free.saturating_sub(length));
+                *slot = (base.saturating_add(length), free.wrapping_sub(length));
             }
             return Some(base);
         }
@@ -341,7 +366,7 @@ where
                 self.drop_free_slot(i);
                 continue;
             }
-            i = i.saturating_add(1);
+            i = i.wrapping_add(1);
         }
         // An extent at the very end goes back to the bump pointer instead of
         // the list, which is what keeps a create/delete loop free.
@@ -351,7 +376,7 @@ where
         }
         if let Some(slot) = self.free_slots.get_mut(self.free_slot_count) {
             *slot = (base, length);
-            self.free_slot_count = self.free_slot_count.saturating_add(1);
+            self.free_slot_count = self.free_slot_count.wrapping_add(1);
         }
     }
 
@@ -391,7 +416,7 @@ where
         self.enter_critical();
         self.exit_critical();
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(
             tick,
             Event::QueueCreate {
@@ -493,7 +518,7 @@ where
                 q.tx_lock = UNLOCKED;
             }
             let senders = Self::queue_send_list(queue);
-            if self.lists.is_empty(senders) == Ok(false) && self.remove_from_event_list(senders)? {
+            if !self.lists.is_empty_of(senders) && self.remove_from_event_list(senders)? {
                 // queueYIELD_IF_USING_PREEMPTION(), inside the section.
                 self.port_yield();
             }
@@ -549,7 +574,7 @@ where
                 return Ok(false);
             }
             let member = self.queues.resolve(queue)?;
-            if member.set_container != QueueHandle::NULL || member.waiting != 0 {
+            if !member.set_container.is_null() || member.waiting != 0 {
                 return Ok(false);
             }
             self.queues.resolve_mut(queue)?.set_container = set;
@@ -603,7 +628,7 @@ where
             Ok(Blocked) => Ok(Blocked),
             Ok(Ready(raw)) => {
                 let handle = QueueHandle::from_raw(u32::try_from(raw).unwrap_or(0));
-                Ok(Ready((handle != QueueHandle::NULL).then_some(handle)))
+                Ok(Ready((!handle.is_null()).then_some(handle)))
             }
             Err(Error::Empty) => Ok(Ready(None)),
             Err(e) => Err(e),
@@ -627,7 +652,7 @@ where
         match self.queue_receive_from_isr(set) {
             Ok((raw, _woken)) => {
                 let handle = QueueHandle::from_raw(u32::try_from(raw).unwrap_or(0));
-                Ok((handle != QueueHandle::NULL).then_some(handle))
+                Ok((!handle.is_null()).then_some(handle))
             }
             // An empty set is "no queue has data", which is what the C's
             // NULL means; it is not a failure.
@@ -639,6 +664,12 @@ where
     /// `prvNotifyQueueSetContainer`: put `queue`'s handle on the set it
     /// belongs to. `true` when that woke a task that outranks the current
     /// one.
+    /// `#[cold]` because the call is GUARDED and reached from many sites on
+    /// one hot path, which is the shape that pays: it lets LLVM keep the
+    /// caller's frame setup out of the likely route. Measured on
+    /// `riscv32-qemu-tick-work`, one attribute at a time.
+    /// Worth queue -1 on its own.
+    #[cold]
     fn notify_queue_set_container(&mut self, queue: QueueHandle) -> Result<bool> {
         let set = self.queues.resolve(queue)?.set_container;
         let container = *self.queues.resolve(set)?;
@@ -648,7 +679,7 @@ where
         }
         let tx_lock = container.tx_lock;
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         // `traceQUEUE_SET_SEND` is `traceQUEUE_SEND` unless a port says
         // otherwise, and this port does not.
         self.trace.event(
@@ -662,7 +693,7 @@ where
             self.copy_data_to_queue(set, &container, u64::from(queue.to_raw()), Position::Back)?;
         if tx_lock == UNLOCKED {
             let receivers = Self::queue_receive_list(set);
-            if self.lists.is_empty(receivers) == Ok(false)
+            if !self.lists.is_empty_of(receivers)
                 && self.remove_from_event_list(receivers)?
             {
                 woke = true;
@@ -683,7 +714,7 @@ where
     /// # Errors
     /// As [`Kernel::queue_send`].
     pub fn queue_overwrite(&mut self, queue: QueueHandle, value: u64) -> Result<Wait<()>> {
-        self.queue_send_generic(queue, value, 0, Position::Overwrite)
+        self.send_generic_outlined(queue, value, 0, Position::Overwrite)
     }
 
     // ------------------------------------------------------- from an ISR --
@@ -733,14 +764,14 @@ where
         }
         let tx_lock = snapshot.tx_lock;
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace
             .event(tick, Event::QueueSendFromIsr { queue, name: "" });
         let previously_waiting = snapshot.waiting;
         let _ = self.copy_data_to_queue(queue, &snapshot, value, position)?;
         let mut woken = Woken::NO;
         if tx_lock == UNLOCKED {
-            if snapshot.set_container != QueueHandle::NULL {
+            if C::USE_QUEUE_SETS && !snapshot.set_container.is_null() {
                 let overwrote = position == Position::Overwrite && previously_waiting > 0;
                 if !overwrote && self.notify_queue_set_container(queue)? {
                     woken = Woken::YES;
@@ -748,7 +779,7 @@ where
                 return Ok(woken);
             }
             let receivers = Self::queue_receive_list(queue);
-            if self.lists.is_empty(receivers) == Ok(false)
+            if !self.lists.is_empty_of(receivers)
                 && self.remove_from_event_list(receivers)?
             {
                 woken = Woken::YES;
@@ -815,14 +846,21 @@ where
         }
         let rx_lock = snapshot.rx_lock;
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace
             .event(tick, Event::QueueReceiveFromIsr { queue, name: "" });
-        let value = self.copy_data_from_queue(queue, &snapshot, false)?;
+        let value = self.copy_data_from_queue(
+            queue,
+            snapshot.kind,
+            snapshot.base,
+            snapshot.length,
+            snapshot.read_from,
+            false,
+        )?;
         let mut woken = Woken::NO;
         if rx_lock == UNLOCKED {
             let senders = Self::queue_send_list(queue);
-            if self.lists.is_empty(senders) == Ok(false) && self.remove_from_event_list(senders)? {
+            if !self.lists.is_empty_of(senders) && self.remove_from_event_list(senders)? {
                 woken = Woken::YES;
             }
         } else {
@@ -844,7 +882,14 @@ where
         let result = match self.queues.resolve(queue) {
             Ok(q) if q.waiting > 0 => {
                 let snapshot = *q;
-                self.copy_data_from_queue(queue, &snapshot, true)
+                self.copy_data_from_queue(
+                    queue,
+                    snapshot.kind,
+                    snapshot.base,
+                    snapshot.length,
+                    snapshot.read_from,
+                    true,
+                )
             }
             Ok(_) => Err(Error::Empty),
             Err(e) => Err(e),
@@ -857,8 +902,13 @@ where
     fn increment_tx_lock(&mut self, queue: QueueHandle, tx_lock: i8) {
         let tasks = self.task_count();
         if let Ok(q) = self.queues.resolve_mut(queue) {
-            if i64::from(tx_lock) < tasks as i64 {
-                q.tx_lock = tx_lock.saturating_add(1);
+            // 32-bit throughout. This was `i64::from(lock) < tasks as i64`,
+            // which is a SIXTY-FOUR-bit signed compare on a target whose
+            // registers are 32 -- to order an `i8` against a task count. The
+            // `< 0` arm is what makes the unsigned cast safe and is the
+            // UNLOCKED sentinel's case, which cannot reach the increment.
+            if tx_lock < 0 || (tx_lock as usize) < tasks {
+                q.tx_lock = tx_lock.wrapping_add(1);
             }
         }
     }
@@ -867,8 +917,13 @@ where
     fn increment_rx_lock(&mut self, queue: QueueHandle, rx_lock: i8) {
         let tasks = self.task_count();
         if let Ok(q) = self.queues.resolve_mut(queue) {
-            if i64::from(rx_lock) < tasks as i64 {
-                q.rx_lock = rx_lock.saturating_add(1);
+            // 32-bit throughout. This was `i64::from(lock) < tasks as i64`,
+            // which is a SIXTY-FOUR-bit signed compare on a target whose
+            // registers are 32 -- to order an `i8` against a task count. The
+            // `< 0` arm is what makes the unsigned cast safe and is the
+            // UNLOCKED sentinel's case, which cannot reach the increment.
+            if rx_lock < 0 || (rx_lock as usize) < tasks {
+                q.rx_lock = rx_lock.wrapping_add(1);
             }
         }
     }
@@ -883,7 +938,7 @@ where
         value: u64,
         ticks: u64,
     ) -> Result<Wait<()>> {
-        self.queue_send_generic(queue, value, ticks, Position::Front)
+        self.send_generic_outlined(queue, value, ticks, Position::Front)
     }
 
     /// `xSemaphoreGive`: a send with no data.
@@ -891,7 +946,25 @@ where
     /// # Errors
     /// [`Error::Full`] when the semaphore is already at its maximum count.
     pub fn semaphore_give(&mut self, semaphore: QueueHandle) -> Result<Wait<()>> {
-        self.queue_send_generic(semaphore, 0, 0, Position::Back)
+        self.send_generic_outlined(semaphore, 0, 0, Position::Back)
+    }
+
+    /// The out-of-line handle on [`Kernel::queue_send_generic`]'s body.
+    ///
+    /// One shared copy for the wrappers that are not on a measured hot row --
+    /// `queue_send_to_front`, `queue_overwrite`, `semaphore_give` and the
+    /// timer daemon's post. `queue_send` keeps the inlined body because
+    /// `send_full`, `queue_roundtrip` and `block_cycle` all go through it and
+    /// all three pay for the call.
+    #[inline(never)]
+    pub(crate) fn send_generic_outlined(
+        &mut self,
+        queue: QueueHandle,
+        value: u64,
+        ticks: u64,
+        position: Position,
+    ) -> Result<Wait<()>> {
+        self.queue_send_generic(queue, value, ticks, position)
     }
 
     /// `xQueueGenericSend`, one pass of its `for(;;)`.
@@ -903,6 +976,30 @@ where
     /// epilogue on every one of khot-ir's 48,000 sends, so that `xQueueSend`
     /// and its siblings could pass four arguments through unchanged. This
     /// one pays on every instrument, `kernel-ir` included.
+    ///
+    /// **But only the HOT site wants it.** With the flash probe fixed so that
+    /// real bodies link at all (2026-09-24), this was inlined at five places
+    /// and cost about 1,666 bytes of duplicate.
+    ///
+    /// RE-PRICED 2026-09-25, because that figure was taken at FIVE inline sites
+    /// and there is now one. Dropping the hint today measures:
+    ///
+    /// * flash **19,302 -> 18,704, i.e. -598 B**, with `mv` -31, `andi` -7,
+    ///   `slli` -8 and 221 fewer instructions;
+    /// * rv32 work rows **+118 instructions** over seven of them —
+    ///   `queue_roundtrip` 122 -> 169, `block_cycle` 983 -> 1022,
+    ///   `send_full` 36 -> 62, and +1 or +2 on four more.
+    ///
+    /// That is **5.07 bytes of flash per instruction**, a worse rate than the
+    /// `queue_peek` trade declined at 7.3 and than the 10.7 this hint was
+    /// originally kept at. So it stays — but the K3 flash row is the one
+    /// FAILING its target while the work rows are absolutes with no C
+    /// comparison, so if that priority ever inverts this is the single largest
+    /// item in the send path and the numbers are here. `rusty-compiler-leverage` A4: a function has one
+    /// body, so one inlining decision serves callers who want different
+    /// things -- give it two names instead of averaging them.
+    /// [`Kernel::send_generic_outlined`] is the out-of-line handle, and the
+    /// four colder wrappers call that.
     #[inline(always)]
     pub fn queue_send_generic(
         &mut self,
@@ -942,12 +1039,12 @@ where
         // what `configASSERT( pxQueue )` means in the C.
         // `( uxMessagesWaiting < uxLength ) || ( xCopyPosition == queueOVERWRITE )`
         if snapshot.waiting < snapshot.length || position == Position::Overwrite {
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             let tick = self.tick;
             self.trace.event(tick, Event::QueueSend { queue, name: "" });
             let previously_waiting = snapshot.waiting;
             let yield_required = self.copy_data_to_queue(queue, &snapshot, value, position)?;
-            if snapshot.set_container != QueueHandle::NULL {
+            if C::USE_QUEUE_SETS && !snapshot.set_container.is_null() {
                 // A queue in a set announces the arrival there, not here.
                 // An overwrite of an item that was already present is not an
                 // arrival: the count did not change, so the set is not told.
@@ -960,7 +1057,7 @@ where
                 return Ok(Ready(()));
             }
             let receivers = Self::queue_receive_list(queue);
-            let woke_higher = if self.lists.is_empty(receivers) == Ok(false) {
+            let woke_higher = if !self.lists.is_empty_of(receivers) {
                 self.remove_from_event_list(receivers)?
             } else {
                 false
@@ -972,21 +1069,23 @@ where
             // pure, so the order is free to choose. (The read cannot be
             // hoisted above the removal above it -- removing the last
             // waiter is exactly what changes the answer.)
-            if woke_higher || (yield_required && self.lists.is_empty(receivers) != Ok(false)) {
+            if woke_higher || (yield_required && self.lists.is_empty_of(receivers)) {
                 self.port_yield();
             }
             self.exit_critical();
             self.end_wait(caller);
             return Ok(Ready(()));
         }
-        if let Err(e) = self.begin_wait(caller, queue, ticks) {
-            self.exit_critical();
-            return Err(e);
-        }
-        if self.remaining_ticks(caller) == 0 {
+        let remaining = self.begin_wait(caller, queue, ticks);
+        if remaining.unwrap_or(0) == 0 {
             self.exit_critical();
             self.trace_failure_or_owe(caller, OwedTrace::SendFailed(queue));
-            self.end_wait(caller);
+            if remaining.is_some() {
+                // A frame was written, so it has to be torn down. `None` means
+                // `begin_wait` took its zero-block-time exit and wrote
+                // nothing, and then `end_wait` is a provable no-op.
+                self.end_wait(caller);
+            }
             return Err(Error::Full);
         }
         self.exit_critical();
@@ -1004,10 +1103,12 @@ where
     ///
     /// Split out so a call preempted at that exit re-enters here rather
     /// than at the top. See [`Kernel::take_queue_resume`].
+    #[cold]
     fn queue_send_blocking(&mut self, caller: TaskHandle, queue: QueueHandle) -> Result<Wait<()>> {
         self.suspend_all();
         self.lock_queue(queue);
-        if self.check_for_timeout(caller) {
+        let left = self.check_for_timeout(caller);
+        if left.is_none() {
             self.unlock_queue(queue)?;
             let _ = self.resume_all();
             self.trace_failure_or_owe(caller, OwedTrace::SendFailed(queue));
@@ -1015,11 +1116,14 @@ where
             return Err(Error::Full);
         }
         if self.is_queue_full(queue) {
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             let tick = self.tick;
             self.trace
                 .event(tick, Event::BlockingOnQueueSend { queue, name: "" });
-            let ticks_left = self.remaining_ticks(caller);
+            // `check_for_timeout` above already resolved the TCB and wrote
+            // this field; `remaining_ticks` resolved it a second time to read
+            // it back.
+            let ticks_left = left.unwrap_or(0);
             self.place_on_event_list(Self::queue_send_list(queue), ticks_left)?;
             self.unlock_queue(queue)?;
             if !self.resume_all() {
@@ -1041,11 +1145,30 @@ where
     /// disagree, because the writer's caller does not keep its snapshot
     /// live across the call and the reader's does.
     ///
-    /// In line on purpose. `queue_send_generic` is its only caller, and out
-    /// of line it paid a call and a frame on all 48,000 sends to move one
-    /// value into a slot the caller had already resolved. Its reader twin
-    /// was already being inlined by LLVM; this one was over the size
-    /// threshold and was not.
+    /// In line on purpose, at ALL THREE call sites.
+    ///
+    /// The rationale here used to say `queue_send_generic` was its only caller.
+    /// That is no longer true — `queue_add_to_set` and
+    /// `queue_send_generic_from_isr` call it too — so an A4 split was tried on
+    /// 2026-09-25, keeping the hint for the hot caller and routing the cold ones
+    /// through an out-of-line handle. It measured **+72 B of flash**, `mv` +12
+    /// and 49 more instructions, and was reverted. `prime_mutex` was a fourth
+    /// caller when that was measured; it was deleted later the same day (see
+    /// [`Self::new_mutex`]) and the split was **re-tested at three callers**:
+    /// **+6 B**, still a loss but only a twelfth of the old one. So ~66 of the
+    /// original 72 bytes were `prime_mutex`'s own site — an A4 verdict can be
+    /// carried almost entirely by ONE caller, which is why §9's re-test law
+    /// exists. At three callers this is now a near-tie held by 6 bytes.
+    ///
+    /// The reason is worth keeping: the cold callers pass CONSTANT arguments
+    /// (`Position::Back` from `queue_add_to_set`), so each inlined copy is
+    /// SPECIALISED and folds well below the 138 bytes C's `prvCopyDataToQueue`
+    /// occupies. Out of line they pay a five-argument frame and force
+    /// `&snapshot` into memory, which costs more than the copies they remove.
+    ///
+    /// The hot reason also still stands: out of line it paid a call and a frame
+    /// on all 48,000 sends of `bench/kernel-ir` to move one value into a slot
+    /// the caller had already resolved.
     #[inline(always)]
     fn copy_data_to_queue(
         &mut self,
@@ -1116,13 +1239,30 @@ where
 
     // ----------------------------------------------------------- receive --
 
+    /// The out-of-line handle on [`Kernel::queue_take`]s body.
+    ///
+    /// `peek` was a `const PEEK: bool`, which gave the whole take chain TWO
+    /// monomorphisations and three inlined copies of a ~600-byte body that no
+    /// A4 split could share, because `<true>` and `<false>` are different
+    /// functions. As a runtime flag there is one body to share.
+    ///
+    /// Only `semaphore_take` uses this handle. `queue_receive` and `queue_peek`
+    /// keep the inlined body because all four of `recv_empty`, `peek_ok`,
+    /// `queue_roundtrip` and `block_cycle` go through one or the other --
+    /// routing `queue_peek` here cost `peek_ok` **45 -> 108**, which is what a
+    /// call and a frame are worth on a row that short.
+    #[inline(never)]
+    fn take_outlined(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
+        self.queue_take(queue, ticks, peek)
+    }
+
     /// `xQueueReceive`.
     ///
     /// # Errors
     /// [`Error::Empty`] when the block time expires with the queue still
     /// empty; [`Error::Gone`] for a stale handle.
     pub fn queue_receive(&mut self, queue: QueueHandle, ticks: u64) -> Result<Wait<u64>> {
-        self.queue_take::<false>(queue, ticks)
+        self.queue_take(queue, ticks, false)
     }
 
     /// `xQueuePeek`: read the head without removing it.
@@ -1130,7 +1270,7 @@ where
     /// # Errors
     /// As [`Kernel::queue_receive`].
     pub fn queue_peek(&mut self, queue: QueueHandle, ticks: u64) -> Result<Wait<u64>> {
-        self.queue_take::<true>(queue, ticks)
+        self.queue_take(queue, ticks, true)
     }
 
     /// `xSemaphoreTake`, which is `xQueueSemaphoreTake`: a receive with no
@@ -1138,8 +1278,11 @@ where
     ///
     /// # Errors
     /// [`Error::Empty`] on timeout; [`Error::Gone`] for a stale handle.
+    // A3: ONE caller, so the out-of-line body pays a prologue and epilogue for
+    // a single call. Inlining moves the body rather than duplicating it.
+    #[inline]
     pub fn semaphore_take(&mut self, semaphore: QueueHandle, ticks: u64) -> Result<Wait<()>> {
-        match self.queue_take::<false>(semaphore, ticks)? {
+        match self.take_outlined(semaphore, ticks, false)? {
             Blocked => Ok(Blocked),
             Ready(_) => Ok(Ready(())),
         }
@@ -1147,7 +1290,7 @@ where
 
     /// The shared body of `xQueueReceive`, `xQueuePeek` and
     /// `xQueueSemaphoreTake` — one pass of the C `for(;;)`.
-    /// `PEEK` is a const because it is one at every call site: a receive
+    /// `peek` is a const because it is one at every call site: a receive
     /// passes `false`, a peek `true`, and a semaphore take `false`. As a
     /// parameter it cost an argument to set up and a branch at each of the
     /// ten places this function and its copy helper consult it.
@@ -1167,11 +1310,7 @@ where
     /// the receive site leaves it 190,238 up and gives back 1,104,183 -- so
     /// the regression is the wrappers growing, not any one call site.
     #[inline(always)]
-    fn queue_take<const PEEK: bool>(
-        &mut self,
-        queue: QueueHandle,
-        ticks: u64,
-    ) -> Result<Wait<u64>> {
+    fn queue_take(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
         let caller = self.current;
         // Resuming below the sampling exit, as `queue_send_generic` does.
         // The snapshot is re-read rather than carried: nothing below uses
@@ -1180,17 +1319,23 @@ where
         match self.take_queue_resume(caller) {
             QueueResume::No => {}
             QueueResume::BelowSample => {
-                let snapshot = *self.queues.resolve(queue)?;
-                return self.queue_take_blocking::<PEEK>(caller, queue, snapshot);
+                return self.queue_take_blocking(caller, queue, peek);
             }
             QueueResume::BelowTimedOutResume => {
-                let snapshot = *self.queues.resolve(queue)?;
-                return self.queue_take_timed_out::<PEEK>(caller, queue, snapshot);
+                return self.queue_take_timed_out(caller, queue, peek);
             }
         }
         self.enter_critical();
-        let snapshot = match self.queues.resolve(queue) {
-            Ok(q) => *q,
+        // ONLY the fields the fast path reads. This was `*q` -- the whole
+        // eleven-field descriptor copied to reach five of them, and on rv32
+        // that is nine words of `usize` where four are dead on every
+        // successful receive. Eleven live fields is also more than LLVM will
+        // keep in hand, which is why this function claimed callee-saved
+        // registers it had no use for. The blocking tail below still wants
+        // the whole thing and re-resolves for it, outside the section and at
+        // no cost to the clock, exactly as the resume arms above do.
+        let (waiting, kind, base, length, read_from) = match self.queues.resolve(queue) {
+            Ok(q) => (q.waiting, q.kind, q.base, q.length, q.read_from),
             Err(e) => {
                 self.exit_critical();
                 return Err(e);
@@ -1206,34 +1351,34 @@ where
         // It also has to be after the resolve, so that a handle naming
         // nothing leaves the caller exactly as it found it -- which is
         // what `configASSERT( pxQueue )` means in the C.
-        if snapshot.waiting > 0 {
-            let value = self.copy_data_from_queue(queue, &snapshot, PEEK)?;
-            self.trace.note_exits(self.port.exits());
+        if waiting > 0 {
+            let value = self.copy_data_from_queue(queue, kind, base, length, read_from, peek)?;
+            self.note_exits();
             let tick = self.tick;
             // `xQueuePeek` is its own function in the C with its own trace
             // macro; `xQueueSemaphoreTake` shares `xQueueReceive`'s.
-            let event = if PEEK {
+            let event = if peek {
                 Event::QueuePeek { queue, name: "" }
             } else {
                 Event::QueueReceive { queue, name: "" }
             };
             self.trace.event(tick, event);
-            if PEEK {
-                // A PEEK wakes another *receiver*, not a sender: the item
+            if peek {
+                // A peek wakes another *receiver*, not a sender: the item
                 // is still there.
                 let receivers = Self::queue_receive_list(queue);
-                if self.lists.is_empty(receivers) == Ok(false)
+                if !self.lists.is_empty_of(receivers)
                     && self.remove_from_event_list(receivers)?
                 {
                     self.port_yield();
                 }
             } else {
-                if snapshot.kind.is_mutex() {
+                if kind.is_mutex() {
                     self.queues.resolve_mut(queue)?.holder = caller;
                     self.increment_mutexes_held(caller);
                 }
                 let senders = Self::queue_send_list(queue);
-                if self.lists.is_empty(senders) == Ok(false)
+                if !self.lists.is_empty_of(senders)
                     && self.remove_from_event_list(senders)?
                 {
                     self.port_yield();
@@ -1243,18 +1388,17 @@ where
             self.end_wait(caller);
             return Ok(Ready(value));
         }
-        if let Err(e) = self.begin_wait(caller, queue, ticks) {
+        let remaining = self.begin_wait(caller, queue, ticks);
+        if remaining.unwrap_or(0) == 0 {
             self.exit_critical();
-            return Err(e);
-        }
-        if self.remaining_ticks(caller) == 0 {
-            self.exit_critical();
-            // `traceQUEUE_PEEK_FAILED` is not one of the harness's hooks,
-            // so a failed PEEK says nothing on either side.
-            if !PEEK {
+            // `traceQUEUE_peek_FAILED` is not one of the harness's hooks,
+            // so a failed peek says nothing on either side.
+            if !peek {
                 self.trace_failure_or_owe(caller, OwedTrace::ReceiveFailed(queue));
             }
-            self.end_wait(caller);
+            if remaining.is_some() {
+                self.end_wait(caller);
+            }
             return Err(Error::Empty);
         }
         self.exit_critical();
@@ -1265,20 +1409,35 @@ where
             self.set_queue_resume(caller, QueueResume::BelowSample);
             return Ok(Blocked);
         }
-        self.queue_take_blocking::<PEEK>(caller, queue, snapshot)
+        self.queue_take_blocking(caller, queue, peek)
     }
 
     /// Everything `xQueueReceive` and `xQueuePeek` do below their sampling
     /// exit. See [`Kernel::take_queue_resume`].
-    fn queue_take_blocking<const PEEK: bool>(
+    #[cold]
+    fn queue_take_blocking(
         &mut self,
         caller: TaskHandle,
         queue: QueueHandle,
-        snapshot: Queue,
+        peek: bool,
     ) -> Result<Wait<u64>> {
+        // `kind` is read HERE rather than handed down from the caller, because
+        // it is the one field of the descriptor that cannot change after
+        // `new_queue` sets it -- so resolving it late reads the same byte, and
+        // resolving it early only lengthened a live range across the hot
+        // function's whole body.
+        //
+        // SINKING it below the timed-out branch -- which never reads it, and
+        // whose callee resolves `kind` for itself -- removes a resolve from
+        // that path and measured **+2 B** on 2026-09-25. Refuted: the resolve
+        // is still emitted once at the later site and the branch around it grew
+        // by more. Both paths are `#[cold]`, so there was no runtime case to
+        // weigh against the bytes.
+        let kind = self.queues.resolve(queue)?.kind;
         self.suspend_all();
         self.lock_queue(queue);
-        if self.check_for_timeout(caller) {
+        let left = self.check_for_timeout(caller);
+        if left.is_none() {
             self.unlock_queue(queue)?;
             let _ = self.resume_all();
             // `xTaskResumeAll` replays any tick that pended while the
@@ -1292,21 +1451,30 @@ where
                 self.set_queue_resume(caller, QueueResume::BelowTimedOutResume);
                 return Ok(Blocked);
             }
-            return self.queue_take_timed_out::<PEEK>(caller, queue, snapshot);
+            return self.queue_take_timed_out(caller, queue, peek);
         }
-        self.queue_take_locked::<PEEK>(caller, queue, snapshot)
+        // `left` is `Some` here, and it carries the block time
+        // `check_for_timeout` has just written into the TCB.
+        self.queue_take_locked(caller, queue, peek, kind, left.unwrap_or(0))
     }
 
     /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.
-    fn queue_take_timed_out<const PEEK: bool>(
+    #[cold]
+    fn queue_take_timed_out(
         &mut self,
         caller: TaskHandle,
         queue: QueueHandle,
-        snapshot: Queue,
+        peek: bool,
     ) -> Result<Wait<u64>> {
+        // `kind` is read HERE rather than handed down from the caller,
+        // because it is the one field of the descriptor that cannot change
+        // after `new_queue` sets it -- so resolving it late reads the same
+        // byte, and resolving it early only lengthened a live range across
+        // the hot function's whole body.
+        let kind = self.queues.resolve(queue)?.kind;
         {
             if self.is_queue_empty(queue) {
-                if snapshot.kind.is_mutex() && self.wait_inherited(caller) {
+                if kind.is_mutex() && self.wait_inherited(caller) {
                     // `vTaskPriorityDisinheritAfterTimeout`: the holder
                     // keeps only what the still-waiting tasks justify.
                     self.enter_critical();
@@ -1315,7 +1483,7 @@ where
                     self.priority_disinherit_after_timeout(holder, highest)?;
                     self.exit_critical();
                 }
-                if !PEEK {
+                if !peek {
                     self.trace_failure_or_owe(caller, OwedTrace::ReceiveFailed(queue));
                 }
                 self.end_wait(caller);
@@ -1326,22 +1494,35 @@ where
     }
 
     /// `xQueueReceive` below its timeout test, with the queue still locked.
-    fn queue_take_locked<const PEEK: bool>(
+    fn queue_take_locked(
         &mut self,
         caller: TaskHandle,
         queue: QueueHandle,
-        snapshot: Queue,
+        peek: bool,
+        // The descriptor's `kind`, and ONLY that. All three of these
+        // functions took the whole `Queue` by value -- thirty-six bytes on
+        // rv32, copied at every hop of a three-deep chain -- to read
+        // `kind.is_mutex()` twice. Nothing else of it was ever touched.
+        kind: Kind,
+        ticks_left: u64,
     ) -> Result<Wait<u64>> {
-        if self.is_queue_empty(queue) {
-            let event = if PEEK {
+        // Both arms end the same way -- unlock, then resume -- and
+        // `resume_all_inline` is exactly that: INLINE. Written as two arms it
+        // was two copies of its body in one function. The sequence below is
+        // the sequence both arms had, in the same order, because on the sim a
+        // critical-section exit is the clock and reordering one is a
+        // divergence.
+        let was_empty = self.is_queue_empty(queue);
+        if was_empty {
+            let event = if peek {
                 Event::BlockingOnQueuePeek { queue, name: "" }
             } else {
                 Event::BlockingOnQueueReceive { queue, name: "" }
             };
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             let tick = self.tick;
             self.trace.event(tick, event);
-            if snapshot.kind.is_mutex() {
+            if kind.is_mutex() {
                 self.enter_critical();
                 let holder = self.queues.resolve(queue).map(|q| q.holder)?;
                 let inherited = self.priority_inherit(holder)?;
@@ -1350,22 +1531,18 @@ where
                     self.set_wait_inherited(caller);
                 }
             }
-            let ticks_left = self.remaining_ticks(caller);
             self.place_on_event_list(Self::queue_receive_list(queue), ticks_left)?;
-            self.unlock_queue(queue)?;
-            if !self.resume_all() {
-                self.yield_or_owe(caller);
-            }
-        } else {
-            self.unlock_queue(queue)?;
-            let _ = self.resume_all();
+        }
+        self.unlock_queue(queue)?;
+        let yielded = self.resume_all_inline();
+        if was_empty && !yielded {
+            self.yield_or_owe(caller);
         }
         Ok(Blocked)
     }
 
     /// `prvCopyDataFromQueue`, with the peek variant putting the cursor
-    /// back as `xQueuePeek` does.
-    /// `prvCopyDataFromQueue`, over a snapshot its caller already took.
+    /// back as `xQueuePeek` does -- over fields its caller already read.
     ///
     /// Every caller resolves this queue to decide whether there is
     /// anything to read; this used to resolve it again to do the reading.
@@ -1382,10 +1559,13 @@ where
     fn copy_data_from_queue(
         &mut self,
         queue: QueueHandle,
-        snapshot: &Queue,
+        kind: Kind,
+        base: usize,
+        length: usize,
+        read_from: usize,
         peek: bool,
     ) -> Result<u64> {
-        if !snapshot.kind.carries_data() {
+        if !kind.carries_data() {
             if !peek {
                 let q = self.queues.resolve_mut(queue)?;
                 // Wrapping: all three callers reach here under
@@ -1395,10 +1575,10 @@ where
             }
             return Ok(0);
         }
-        let next = wrap_next(snapshot.read_from, snapshot.length);
+        let next = wrap_next(read_from, length);
         let value = self
             .slots
-            .get(snapshot.base.wrapping_add(next))
+            .get(base.wrapping_add(next))
             .copied()
             .unwrap_or(0);
         // `xQueuePeek` saves and restores `pcReadFrom` — which is to
@@ -1454,7 +1634,7 @@ where
             if q.holder != caller {
                 return Err(Error::NotActive);
             }
-            q.recursions = q.recursions.saturating_sub(1);
+            q.recursions = q.recursions.wrapping_sub(1);
             q.recursions
         };
         if remaining == 0 {
@@ -1472,6 +1652,11 @@ where
     /// lists while a task walks them. An interrupt that finds the queue
     /// locked counts what it did instead, and [`Kernel::unlock_queue`] pays
     /// it back.
+    // In line at both callers (`rusty-compiler-leverage` A3): win 23, which
+    // took this and `is_queue_empty`/`lock_queue`'s siblings together for
+    // -48 B of flash. A two-caller body this small pays two frames for a
+    // resolve and a critical section; `#[inline]` alone was declined.
+    #[inline(always)]
     fn lock_queue(&mut self, queue: QueueHandle) {
         self.enter_critical();
         if let Ok(q) = self.queues.resolve_mut(queue) {
@@ -1498,15 +1683,37 @@ where
             // One resolve for both fields. They were two, and a resolve
             // is a null test, a bounds check, a generation compare and an
             // `Option` unwrap -- all of it repeated to reach the same slot.
-            let (mut tx_lock, container) = self
-                .queues
-                .resolve(queue)
-                .map_or((UNLOCKED, QueueHandle::NULL), |q| {
-                    (q.tx_lock, q.set_container)
-                });
+            // The unlock is written on the SAME lookup that read the lock,
+            // whenever the loop below is not going to run -- which is every
+            // call where nothing was sent while the queue was held, i.e. the
+            // common one. It used to take a second `resolve_mut` after the
+            // loop to store a value already known here.
+            let (mut tx_lock, container) = match self.queues.resolve_mut(queue) {
+                Ok(q) => {
+                    // The container is read only when queue sets exist. With
+                    // `USE_QUEUE_SETS` false nothing ever writes `set_container`,
+                    // so the const makes it a known NULL and the whole branch
+                    // below folds -- the other two queue-set sites already put
+                    // the const FIRST and this one tested the field first.
+                    let read = (
+                        q.tx_lock,
+                        if C::USE_QUEUE_SETS {
+                            q.set_container
+                        } else {
+                            QueueHandle::NULL
+                        },
+                    );
+                    if read.0 <= LOCKED_UNMODIFIED {
+                        q.tx_lock = UNLOCKED;
+                    }
+                    read
+                }
+                Err(_) => (UNLOCKED, QueueHandle::NULL),
+            };
+            let tx_looped = tx_lock > LOCKED_UNMODIFIED;
             while tx_lock > LOCKED_UNMODIFIED {
-                if container != QueueHandle::NULL {
-                    if self.notify_queue_set_container(queue)? {
+                if C::USE_QUEUE_SETS && !container.is_null() {
+                    if C::USE_QUEUE_SETS && self.notify_queue_set_container(queue)? {
                         self.missed_yield();
                     }
                     // Wrapping: the loop runs only while this is above
@@ -1515,7 +1722,7 @@ where
                     continue;
                 }
                 let receivers = Self::queue_receive_list(queue);
-                if self.lists.is_empty(receivers) == Ok(true) {
+                if self.lists.is_empty_of(receivers) {
                     break;
                 }
                 if self.remove_from_event_list(receivers)? {
@@ -1524,21 +1731,30 @@ where
                 // Wrapping: bounded by the loop, as above.
                 tx_lock = tx_lock.wrapping_sub(1);
             }
-            if let Ok(q) = self.queues.resolve_mut(queue) {
-                q.tx_lock = UNLOCKED;
+            if tx_looped {
+                if let Ok(q) = self.queues.resolve_mut(queue) {
+                    q.tx_lock = UNLOCKED;
+                }
             }
         }
         self.exit_critical();
         self.enter_critical();
         {
-            let mut rx_lock = self
-                .queues
-                .resolve(queue)
-                .map(|q| q.rx_lock)
-                .unwrap_or(UNLOCKED);
+            // Same trade as the tx half above.
+            let mut rx_lock = match self.queues.resolve_mut(queue) {
+                Ok(q) => {
+                    let read = q.rx_lock;
+                    if read <= LOCKED_UNMODIFIED {
+                        q.rx_lock = UNLOCKED;
+                    }
+                    read
+                }
+                Err(_) => UNLOCKED,
+            };
+            let rx_looped = rx_lock > LOCKED_UNMODIFIED;
             while rx_lock > LOCKED_UNMODIFIED {
                 let senders = Self::queue_send_list(queue);
-                if self.lists.is_empty(senders) == Ok(true) {
+                if self.lists.is_empty_of(senders) {
                     break;
                 }
                 if self.remove_from_event_list(senders)? {
@@ -1547,8 +1763,10 @@ where
                 // Wrapping: bounded by the loop, as above.
                 rx_lock = rx_lock.wrapping_sub(1);
             }
-            if let Ok(q) = self.queues.resolve_mut(queue) {
-                q.rx_lock = UNLOCKED;
+            if rx_looped {
+                if let Ok(q) = self.queues.resolve_mut(queue) {
+                    q.rx_lock = UNLOCKED;
+                }
             }
         }
         self.exit_critical();
@@ -1605,6 +1823,11 @@ where
     /// `prvIsQueueEmpty`, critical section and all — it is one of the
     /// four the blocking path spends, and therefore a sixteenth of a tick
     /// every four calls.
+    // In line at both callers (`rusty-compiler-leverage` A3): win 23, which
+    // took this and `is_queue_empty`/`lock_queue`'s siblings together for
+    // -48 B of flash. A two-caller body this small pays two frames for a
+    // resolve and a critical section; `#[inline]` alone was declined.
+    #[inline(always)]
     fn is_queue_empty(&mut self, queue: QueueHandle) -> bool {
         self.enter_critical();
         let empty = self
@@ -1644,6 +1867,10 @@ where
 }
 
 /// The next index in a ring of `length`.
+///
+/// Five instructions behind a call at six sites. `#[inline]` lets the ring
+/// bound fold into the caller, which already knows it.
+#[inline]
 const fn wrap_next(index: usize, length: usize) -> usize {
     // `wrapping_add`, and it is the SAME function, not an approximation
     // of it: at `usize::MAX` saturating yields `usize::MAX`, which is
@@ -1655,6 +1882,7 @@ const fn wrap_next(index: usize, length: usize) -> usize {
 }
 
 /// The previous index in a ring of `length`.
+#[inline]
 const fn wrap_prev(index: usize, length: usize) -> usize {
     match index.checked_sub(1) {
         Some(prev) => prev,
@@ -1683,8 +1911,24 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
+    const TIMER_CMDS: usize,
 > crate::typed::Raw
-    for Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    for Kernel<
+        C,
+        P,
+        T,
+        H,
+        TASKS,
+        ITEMS,
+        LISTS,
+        QUEUES,
+        SLOTS,
+        BUFFERS,
+        BYTES,
+        TIMERS,
+        GROUPS,
+        TIMER_CMDS,
+    >
 where
     H: TickHook<Self>,
 {

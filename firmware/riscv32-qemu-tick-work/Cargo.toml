@@ -44,3 +44,6 @@ overflow-checks = false
 # move by one call's worth; a bracket that measures the loop rather than the
 # callee does not move, and the run fails.
 poison = []
+# The reachability arm: prints how many times the failure funnel was entered.
+# Proves a row reaches the path a change is aimed at, BEFORE the change.
+census = ["rusty_rtos_kernel-core/census"]

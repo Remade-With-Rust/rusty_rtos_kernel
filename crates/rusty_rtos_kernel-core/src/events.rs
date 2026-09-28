@@ -70,7 +70,8 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    const TIMER_CMDS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS, TIMER_CMDS>
 where
     H: TickHook<Self>,
 {
@@ -102,12 +103,21 @@ where
         // `vListInitialise( &( pxEventBits->xTasksWaitingForBits ) )`. The
         // arena hands slots back out, so a group's list is whatever the
         // last group at that index left behind.
-        let list = Self::event_group_list(group);
-        while let Ok(Some(item)) = self.lists.head(list) {
-            let _ = self.lists.remove(item);
-        }
+        // C calls `vListInitialise( &( pxEventBits->xTasksWaitingForBits ) )`
+        // here because its list is a field of memory `pvPortMalloc` just
+        // handed over, so it holds garbage. Ours is a slot in a shared list
+        // array indexed by the group's arena index, and it is already empty:
+        // `event_group_delete` unblocks every waiter before it discards the
+        // slot. Mirroring the C literally -- draining the list on every
+        // create -- cost **84 bytes of flash** for a loop that cannot iterate.
+        //
+        // What makes that safe is not this comment but
+        // `a_reused_group_slot_does_not_inherit_the_last_groups_waiters`, which
+        // blocks a real waiter, deletes the group under it, and checks the
+        // reused slot comes back clean. It was poison-verified: with delete's
+        // drain disabled it is the ONE test that fails.
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(tick, Event::EventGroupCreate { group });
         Ok(group)
     }
@@ -124,10 +134,12 @@ where
         self.groups.resolve(group)?;
         self.suspend_all();
         let list = Self::event_group_list(group);
+        // Every waiter comes off here, which is what lets `event_group_create`
+        // skip a drain of its own -- see the slot-reuse test.
         while let Ok(Some(item)) = self.lists.head(list) {
             self.remove_from_unordered_event_list(item, UNBLOCKED_DUE_TO_BIT_SET)?;
         }
-        let _ = self.groups.remove(group);
+        let _ = self.groups.discard(group);
         let _ = self.resume_all();
         // `vPortFree( pxEventBits )`, outside the resume — and every
         // `heap_N.c` wraps free the same way it wraps malloc, so it costs
@@ -181,22 +193,34 @@ where
         let list = Self::event_group_list(group);
         self.suspend_all();
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace
             .event(tick, Event::EventGroupSetBits { group, bits });
+        // Keep what the set produced: when no waiter asks for a clear — which
+        // is every call that wakes nobody, and the common one — it is already
+        // the answer, and the tail below need not resolve the group again.
+        let mut after: u32 = 0;
         if let Ok(g) = self.groups.resolve_mut(group) {
             g.bits |= bits;
+            after = g.bits;
         }
         let mut to_clear: u32 = 0;
         let mut item = self.lists.head(list)?;
         while let Some(this) = item {
             // The next one is read before this one is unblocked, because
             // unblocking takes it off the list this walk is standing in.
-            let next = self.lists.next(this)?;
-            let value = self.lists.value(this)?;
+            // One lookup for both: see `ListsOf::next_and_value`.
+            let (next, value) = self.lists.next_and_value(this)?;
             let control = value & EVENT_BITS_CONTROL_BYTES;
             let waited_for = (value & !EVENT_BITS_CONTROL_BYTES) as u32;
-            let current = self.groups.resolve(group)?.bits;
+            // `after` IS this value. The walk only takes waiters OFF the
+            // list -- the comment on `to_clear` below says so, and the clear
+            // is applied after the loop -- so the group's bits cannot change
+            // while it runs, and resolving them again per waiter was an arena
+            // lookup per iteration to re-read a word already in hand. LLVM
+            // cannot hoist it because `remove_from_unordered_event_list` takes
+            // `&mut self` and stands between the read and the next one.
+            let current = after;
             if Self::wait_condition_met(current, waited_for, control & WAIT_FOR_ALL_BITS != 0) {
                 if control & CLEAR_EVENTS_ON_EXIT != 0 {
                     to_clear |= waited_for;
@@ -208,14 +232,21 @@ where
             }
             item = next;
         }
-        let result = match self.groups.resolve_mut(group) {
-            Ok(g) => {
-                g.bits &= !to_clear;
-                g.bits
+        let result = if to_clear == 0 {
+            // `bits &= !0` is the identity, so there is nothing to write, and
+            // the walk above only ever takes waiters OFF the list — it does
+            // not touch the group's bits.
+            after
+        } else {
+            match self.groups.resolve_mut(group) {
+                Ok(g) => {
+                    g.bits &= !to_clear;
+                    g.bits
+                }
+                Err(_) => 0,
             }
-            Err(_) => 0,
         };
-        let _ = self.resume_all();
+        let _ = self.resume_all_inline();
         Ok(result)
     }
 
@@ -327,6 +358,12 @@ where
         let mut timed_out = false;
         let mut result = current;
         if Self::wait_condition_met(current, wait_for, wait_for_all) {
+            // Merging this clear into the resolve above -- one `resolve_mut`
+            // serving both the read and the write, which the borrow checker
+            // allows because `wait_condition_met` takes no borrow of `self` --
+            // removes one arena lookup (`slli` -1) and measured **+20 B** on
+            // 2026-09-25. Refuted: what it costs is branch shape, which is the
+            // same wall `list.rs`'s five passes hit.
             if clear_on_exit {
                 if let Ok(g) = self.groups.resolve_mut(group) {
                     g.bits &= !wait_for;
@@ -349,7 +386,7 @@ where
             )?;
             result = 0;
             let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             self.trace.event(
                 tick,
                 Event::EventGroupWaitBitsBlock {
@@ -359,7 +396,7 @@ where
             );
             blocked = true;
         }
-        let already_yielded = self.resume_all();
+        let already_yielded = self.resume_all_inline();
         if blocked {
             if !already_yielded {
                 self.yield_or_owe(caller);
@@ -391,7 +428,11 @@ where
         let caller = self.current();
         if self.take_event_resume(caller) {
             let value = self.reset_event_item_value(caller)?;
-            return Ok(Ready(self.finish_sync(group, value, wait_for)?));
+            // `xEventGroupSync`'s tail IS the wait tail with both flags true:
+            // its re-test is always wait-for-all, and its clear is not
+            // conditional on a flag. This used to be a separate `finish_sync`
+            // holding its own copy of the twenty lines below.
+            return Ok(Ready(self.finish_wait(group, value, wait_for, true, true)?));
         }
 
         self.groups.resolve(group)?;
@@ -430,6 +471,21 @@ where
     /// The tail of `xEventGroupWaitBits` past the switch: a task woken by
     /// the unblocker already has its answer in the item value, and one
     /// woken by the tick has to look at the group again.
+    /// The tail both `xEventGroupWaitBits` and `xEventGroupSync` run once the
+    /// wait is over: re-test the bits, clear what was waited for, answer what
+    /// the group held.
+    ///
+    /// `sync`'s tail was a second copy of this with `wait_for_all` and
+    /// `clear_on_exit` frozen true (`wait_condition_met(b, w, true)` is exactly
+    /// `b & w == w`). Folding the two together is **byte-identical** and takes
+    /// twenty duplicated lines out -- but ONLY with the attribute below.
+    ///
+    /// Deleting the twin alone measured **+34 B**: at two callers LLVM stopped
+    /// inlining and emitted a shared symbol, which costs more than the copy it
+    /// saves because each caller freezes different constants. `inline(always)`
+    /// restores the two specialising copies, so this is a source-duplication
+    /// win at zero flash cost, not a flash win.
+    #[inline(always)]
     fn finish_wait(
         &mut self,
         group: EventGroupHandle,
@@ -445,25 +501,6 @@ where
         let bits = self.groups.resolve(group).map(|g| g.bits);
         if let Ok(bits) = bits {
             if Self::wait_condition_met(bits, wait_for, wait_for_all) && clear_on_exit {
-                if let Ok(g) = self.groups.resolve_mut(group) {
-                    g.bits &= !wait_for;
-                }
-            }
-        }
-        self.exit_critical();
-        Ok((u64::from(bits?) & !EVENT_BITS_CONTROL_BYTES) as u32)
-    }
-
-    /// The same tail for `xEventGroupSync`, whose re-test is always
-    /// wait-for-all and whose clear is not conditional on a flag.
-    fn finish_sync(&mut self, group: EventGroupHandle, value: u64, wait_for: u32) -> Result<u32> {
-        if value & UNBLOCKED_DUE_TO_BIT_SET != 0 {
-            return Ok((value & !EVENT_BITS_CONTROL_BYTES) as u32);
-        }
-        self.enter_critical();
-        let bits = self.groups.resolve(group).map(|g| g.bits);
-        if let Ok(bits) = bits {
-            if bits & wait_for == wait_for {
                 if let Ok(g) = self.groups.resolve_mut(group) {
                     g.bits &= !wait_for;
                 }
@@ -533,6 +570,7 @@ mod tests {
         0,
         1,
         2,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     fn kernel() -> K {
@@ -715,6 +753,67 @@ mod tests {
             k.event_group_bits(g),
             Ok(0b1100),
             "and only bit 0 was taken: the other two were nobody's business"
+        );
+    }
+
+    /// ★ A group's waiting list lives in a SHARED array indexed by the group's
+    /// arena slot, so a new group is handed whatever list the last group at
+    /// that index left behind. C has no such hazard -- its list is a field of
+    /// freshly-`pvPortMalloc`'d memory, which is why `xEventGroupCreate` calls
+    /// `vListInitialise` on it.
+    ///
+    /// `event_group_create` used to mirror that literally, draining the list on
+    /// every create. It does not need to: `event_group_delete` unblocks every
+    /// waiter before it discards the slot, so the list is already empty. The
+    /// drain was worth **84 bytes of flash** (2026-09-25) and this test is the
+    /// entire reason it is safe to have removed it.
+    ///
+    /// Without a BLOCKED waiter this proves nothing -- an empty list is empty
+    /// either way -- so the waiter here is real and on the CPU, and the middle
+    /// assertion checks the list is genuinely non-empty before the delete.
+    #[test]
+    fn a_reused_group_slot_does_not_inherit_the_last_groups_waiters() {
+        let mut k = kernel();
+        let g = k.event_group_create().expect("a group");
+        k.create_task("w", 1).expect("a waiter");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        let list = K::event_group_list(g);
+        let mut blocked = false;
+        for _ in 0..50_u32 {
+            if k.name_of(k.current()).expect("a name").as_str() == "w" {
+                assert_eq!(
+                    k.event_group_wait_bits(g, 0b0011, false, true, 50),
+                    Ok(Wait::Blocked),
+                    "ALL of two bits, neither set"
+                );
+                blocked = true;
+                break;
+            }
+            k.switch_context();
+        }
+        assert!(blocked, "never got the waiter onto the CPU");
+        assert!(
+            k.lists.head(list).expect("a list").is_some(),
+            "the premise: a blocked waiter IS on the group's list, so the              list this test is about is not trivially empty"
+        );
+
+        k.event_group_delete(g).expect("delete");
+        assert!(
+            k.lists.head(list).expect("a list").is_none(),
+            "delete unblocks every waiter, so it leaves the list empty -- this              is the invariant that replaced create's drain"
+        );
+
+        let g2 = k.event_group_create().expect("a second group");
+        assert_eq!(
+            g2.index(),
+            g.index(),
+            "the premise of the hazard: the arena reused the same slot, so              both groups name the SAME list"
+        );
+        assert!(
+            k.lists.head(K::event_group_list(g2)).expect("a list").is_none(),
+            "and the fresh group has inherited no waiters"
         );
     }
 

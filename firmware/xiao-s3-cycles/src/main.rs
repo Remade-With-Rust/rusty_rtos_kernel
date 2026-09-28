@@ -106,6 +106,7 @@ type K = Kernel<
     8,
     TIMERS,
     GROUPS,
+    { <CycleConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
 >;
 
 /// Median, min and max of a sample set, with the bracket tax already taken

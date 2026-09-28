@@ -41,8 +41,19 @@ use crate::name::Name;
 use crate::queue::Queue;
 use crate::queue::Wait;
 use crate::stream::StreamBuffer;
-use crate::timer::{MAX_TIMER_COMMANDS, Message, Timer};
+use crate::timer::{Message, Timer};
 use crate::{OVERHEAD_LISTS, list_slots_for, lists_for};
+
+/// How many times [`Kernel::trace_failure_or_owe`] has been entered.
+///
+/// A reachability anchor, not a measurement. Every row of
+/// `riscv32-qemu-tick-work` read **zero** here until the failure rows were
+/// added, which is why a change to the `OwedTrace` machinery measured as pure
+/// code layout. It is behind its own feature because the `fetch_add` sits
+/// INSIDE the measured bracket, so a build that quotes instruction counts must
+/// not carry it.
+#[cfg(feature = "census")]
+pub static CENSUS_OWE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// A trace line owed by a task that was switched out before it could
 /// emit one. Only the queue failure paths can owe one: they are the only
@@ -165,7 +176,7 @@ pub(crate) enum QueueResume {
 
 /// One task control block: the C `TCB_t` minus everything that is a
 /// pointer. No stack, no TLS, no `pxTopOfStack`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Tcb {
     name: Name,
     /// `uxPriority`, the possibly-inherited one the scheduler sorts by.
@@ -217,6 +228,15 @@ pub(crate) struct Tcb {
     /// event item value — so the second call has to know it is the far side
     /// of the switch and not a fresh wait.
     event_blocked: bool,
+    /// Padding that rounds `Slot<Tcb>` up to a POWER OF TWO (128 bytes), so
+    /// `index * size_of::<Slot<Tcb>>()` is a shift and not a multiply.
+    ///
+    /// `bench/kernel-ram` pins the stride at 128 and `bench/kernel-flash` pins
+    /// `mul` at 0; without this the stride is 92 and every TCB resolve pays a
+    /// `mul`. It is a deliberate flash-for-RAM trade: 254 bytes of flash
+    /// against 36 bytes of RAM per task, so it pays below roughly eight tasks
+    /// and is the owner's call above that.
+    _stride_pad: [u32; 9],
 }
 
 /// How many notification slots a task has room for.
@@ -266,11 +286,18 @@ struct WaitFrame {
     /// `TaskHandle::NULL`-equivalent when there is none.
     queue: QueueHandle,
     /// `xTicksToWait`, decremented by each `xTaskCheckForTimeOut`.
-    ticks: u64,
+    ///
+    /// All three are SPLIT (`timer::Split64`), so a `WaitFrame` does not align
+    /// a `Tcb` to eight. An arena slot pays its value's alignment as padding,
+    /// and `Tcb` is one per task.
+    ticks: crate::timer::Split64,
     /// `xTimeOut.xTimeOnEntering`.
-    entering: u64,
+    entering: crate::timer::Split64,
     /// `xTimeOut.xOverflowCount`.
-    overflows: u64,
+    /// Counted in a `u32`: it advances once per delayed-list swap, so four
+    /// billion of them is not a bound anything reaches, and a `u64` here was
+    /// two instructions an operation on rv32.
+    overflows: u32,
     /// `xEntryTimeSet`.
     entry_set: bool,
     /// `xInheritanceOccurred`.
@@ -295,6 +322,7 @@ pub struct StartHandles {
 /// slots, stream buffers, and stream-buffer bytes this kernel has room
 /// for. See the crate docs and [`items_for`] / [`lists_for`].
 /// [`Kernel::new`] refuses a geometry that does not add up.
+#[repr(C)]
 pub struct Kernel<
     C: Config,
     P: Port,
@@ -309,29 +337,151 @@ pub struct Kernel<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
+    const TIMER_CMDS: usize,
 > {
-    pub(crate) port: P,
-    pub(crate) trace: T,
-    pub(crate) tcbs: Arena<TaskKind, Tcb, TASKS>,
-    pub(crate) queues: Arena<QueueKind, Queue, QUEUES>,
-    pub(crate) lists: Lists<ITEMS, LISTS>,
-    pub(crate) slots: [u64; SLOTS],
-    pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
-    pub(crate) timers: Arena<TimerKind, Timer, TIMERS>,
-    pub(crate) groups: Arena<EventGroupKind, EventGroup, GROUPS>,
-    /// The ring of `DaemonTaskMessage_t`s the timer queue carries indices
-    /// into. It is exactly as long as the queue, so a message can only be
-    /// overwritten once the queue has already refused to hold its index.
-    pub(crate) timer_messages: [Message; MAX_TIMER_COMMANDS],
-    pub(crate) timer_message_next: usize,
-    /// Which of the two timer lists is `pxCurrentTimerList` right now.
-    pub(crate) timers_swapped: bool,
+    /// `xTickCount`, masked to the configuration's tick width.
+    pub(crate) tick: u64,
+    /// `xPendedTicks`.
+    /// Counted in a `u32`, for the reason `overflows` is: it counts ticks
+    /// that arrived while the scheduler was suspended, which a suspension
+    /// long enough to overflow four billion would have to outlive.
+    pended_ticks: u32,
+    /// `xNextTaskUnblockTime`.
+    next_unblock_time: u64,
+    /// `xNumOfOverflows`.
+    overflows: u32,
     /// `xLastTime` in `prvSampleTimeNow`.
     pub(crate) timer_last_time: u64,
+    /// `pxCurrentTCB`.
+    pub(crate) current: TaskHandle,
+    /// `uxSchedulerSuspended`.
+    suspended_depth: u32,
+    /// `uxCurrentNumberOfTasks`.
+    task_count: usize,
+    /// How many times the scheduler could not choose a task, and why the
+    /// FIRST time. See [`Stall`].
+    stalls: u32,
+    pub(crate) timer_message_next: usize,
+    pub(crate) bytes_used: usize,
+    pub(crate) free_count: usize,
+    pub(crate) free_slot_count: usize,
+    pub(crate) slots_used: usize,
+    /// The task whose abandoned frame is running right now, if any.
+    /// `TaskHandle::NULL` for "nobody", not `Option<TaskHandle>`.
+    ///
+    /// A `Handle` is two `u16`s with no niche, so the `Option` was eight bytes
+    /// and a real discriminant — and `resume_pending` tests this field on
+    /// every step the runner takes, which is the most-called entry in the
+    /// kernel. `NULL` is already the sentinel (`generation == 0`), so the
+    /// representation carries the fact the discriminant was carrying.
+    unwinding: TaskHandle,
+    /// A task that deleted ITSELF and whose slot the idle task has not
+    /// reclaimed yet — the C's `xTasksWaitingTermination`, which only ever
+    /// holds the running task, because any other task is freed on the spot.
+    ///
+    /// One slot is enough, and that is a property rather than a guess: a
+    /// self-deleting task is off every ready list and yields immediately, so
+    /// a second self-delete cannot happen until a switch has occurred, and
+    /// the switch is where this is reaped.
+    awaiting_reap: TaskHandle,
     /// `xTimerQueue`.
     pub(crate) timer_queue: QueueHandle,
-    pub(crate) bytes: [u8; BYTES],
-    pub(crate) bytes_used: usize,
+    /// How many tasks are parked at a queue call's sampling exit.
+    ///
+    /// A summary, so that [`Kernel::take_queue_resume`] — which runs at the
+    /// top of every queue send and every queue receive — can answer "nothing
+    /// to resume" from one field instead of resolving the caller's TCB out of
+    /// the arena. Only the three sites that park a task raise it, and only a
+    /// take that finds a slot set lowers it, so it counts exactly the slots
+    /// that are not `QueueResume::No`.
+    queue_resumes: u16,
+    /// How many tasks are parked inside an event-group wait, for the same
+    /// reason [`Kernel::queue_resumes`] exists: `take_event_resume` runs at
+    /// the top of every `event_group_wait_bits` and every `event_group_sync`,
+    /// and on all but the parked few the answer is no.
+    event_resumes: u16,
+    /// `uxTopReadyPriority`.
+    top_ready_priority: u8,
+    /// The running task's scheduling priority, kept beside `current`.
+    ///
+    /// The C reads `pxCurrentTCB->uxPriority`: one pointer dereference,
+    /// because the pointer IS the task. A handle is not a pointer, so the
+    /// same read went through `Arena::resolve` — a bounds check, a generation
+    /// compare and an `Option` — **every tick**, on the one handle the kernel
+    /// itself maintains and cannot have wrong.
+    ///
+    /// Measured: that resolve was **43 of the tick's 56 instructions, 77 %**.
+    /// Stubbing it to a constant took `increment_tick` from 56 to 13 against
+    /// the C's 15 — from 3.73x against us to 0.87x. This field is that
+    /// finding, done correctly.
+    ///
+    /// **It is written in exactly two places** — [`Self::set_current`] and
+    /// [`Self::set_task_priority`] — so that a call site cannot forget it.
+    /// `current_priority` debug-asserts it against the resolved value, so the
+    /// kernel's own tests and the conformance corpus fail loudly if it ever
+    /// drifts.
+    current_priority: u8,
+    /// `xSchedulerRunning`.
+    running: bool,
+    /// `xYieldPendings[0]`.
+    yield_pending: bool,
+    /// Which of the two delayed lists is `pxDelayedTaskList` right now.
+    delayed_swapped: bool,
+    /// Which of the two timer lists is `pxCurrentTimerList` right now.
+    pub(crate) timers_swapped: bool,
+    first_stall: Stall,
+
+    pub(crate) port: P,
+    pub(crate) trace: T,
+    /// `vApplicationTickHook`, held by value so it can borrow the kernel.
+    pub(crate) tick_hook: H,
+    /// How many outermost critical-section exits a task owes the clock.
+    ///
+    /// This is `uxSavedCriticalNesting` in the Posix port's
+    /// `prvSwitchThread` and then some. A thread stops at the switch; a
+    /// stackless call does not, so the abandoned frame runs on — closing
+    /// the sections it had open and, on some paths, opening one more. The
+    /// port tallies every exit that frame makes instead of counting it as
+    /// sim time, and the tally is paid here when the task runs again. That
+    /// is what puts a sim tick where the C one lands.
+    /// Five per-task booleans, one bit each, in ONE array.
+    ///
+    /// They were five `[bool; TASKS]`. Each one is a separate base address, so
+    /// a function touching two of them — and the owed body touches three —
+    /// computed two bases and did two loads to read two bits that now share a
+    /// byte. Packed they cost one byte a task instead of five, and one base
+    /// instead of five across the whole kernel.
+    flags: [u8; TASKS],
+    /// `started`, kept OUT of `flags` on purpose.
+    ///
+    /// It is the only one of the five that `switch_context` reads — through
+    /// `hand_over`, on every switch — and packing it cost the selection row
+    /// one instruction for the mask. The other four are never on that path,
+    /// so they stay packed. Per-call-site, not per-idea.
+    started: [bool; TASKS],
+    /// `owes_anything`, kept OUT of `flags` for the reason `started` is: it is
+    /// the single most-read byte in the kernel — `resume_pending` tests it
+    /// before every step the runner takes — and packing it cost that row three
+    /// instructions for the mask. Per call site, not per idea.
+    owes_anything: [bool; TASKS],
+    /// `delay_aborted`, kept OUT of `flags`: `check_for_timeout` reads it on
+    /// every pass of every blocking call.
+    delay_aborted: [bool; TASKS],
+    pub(crate) lists: Lists<ITEMS, LISTS>,
+    pub(crate) tcbs: Arena<TaskKind, Tcb, TASKS>,
+    owed_exits: [u32; TASKS],
+    /// A trace line a task owes from a call it was switched out of.
+    ///
+    /// `xQueueReceive`'s failure path is `taskEXIT_CRITICAL();
+    /// traceQUEUE_RECEIVE_FAILED( pxQueue ); return errQUEUE_EMPTY;` — and
+    /// if the tick that the exit released switches the task away, those two
+    /// lines sit on a stack that is not running. The C emits the trace when
+    /// the task resumes, so this kernel does too.
+    owed_trace: [OwedTrace; TASKS],
+    pub(crate) queues: Arena<QueueKind, Queue, QUEUES>,
+    pub(crate) timers: Arena<TimerKind, Timer, TIMERS>,
+    pub(crate) groups: Arena<EventGroupKind, EventGroup, GROUPS>,
+    pub(crate) buffers: Arena<StreamKind, StreamBuffer, BUFFERS>,
     /// Blocks of the byte arena that a deleted stream buffer gave back,
     /// as `(base, length)`, kept sorted and coalesced.
     ///
@@ -342,7 +492,6 @@ pub struct Kernel<
     /// buffers can be alive, so at most `BUFFERS` holes can exist between
     /// them, which is why the list is that long and cannot overflow.
     pub(crate) free_blocks: [(usize, usize); BUFFERS],
-    pub(crate) free_count: usize,
     /// Extents of the SLOT arena that a deleted queue gave back, as
     /// `(base, length)`, coalesced the same way `free_blocks` is.
     ///
@@ -356,94 +505,22 @@ pub struct Kernel<
     /// At most `QUEUES` queues are alive, so at most `QUEUES` holes can sit
     /// between them and the list cannot overflow.
     pub(crate) free_slots: [(usize, usize); QUEUES],
-    pub(crate) free_slot_count: usize,
-    pub(crate) slots_used: usize,
-    /// `pxCurrentTCB`.
-    pub(crate) current: TaskHandle,
-    /// `uxTopReadyPriority`.
-    top_ready_priority: u8,
-    /// `xTickCount`, masked to the configuration's tick width.
-    pub(crate) tick: u64,
-    /// `xPendedTicks`.
-    pended_ticks: u64,
-    /// `uxSchedulerSuspended`.
-    suspended_depth: u32,
-    /// `xSchedulerRunning`.
-    running: bool,
-    /// `xNextTaskUnblockTime`.
-    next_unblock_time: u64,
-    /// `xYieldPendings[0]`.
-    yield_pending: bool,
-    /// `uxCurrentNumberOfTasks`.
-    task_count: usize,
-    /// How many times the scheduler could not choose a task, and why the
-    /// FIRST time. See [`Stall`].
-    stalls: u32,
-    first_stall: Stall,
-    /// A task that deleted ITSELF and whose slot the idle task has not
-    /// reclaimed yet — the C's `xTasksWaitingTermination`, which only ever
-    /// holds the running task, because any other task is freed on the spot.
+    /// The ring of `DaemonTaskMessage_t`s the timer queue carries indices
+    /// into. It is exactly as long as the queue, so a message can only be
+    /// overwritten once the queue has already refused to hold its index.
+    /// The timer daemon's command mailbox, sized by the configuration.
     ///
-    /// One slot is enough, and that is a property rather than a guess: a
-    /// self-deleting task is off every ready list and yields immediately, so
-    /// a second self-delete cannot happen until a switch has occurred, and
-    /// the switch is where this is reaped.
-    awaiting_reap: Option<TaskHandle>,
-    /// Which of the two delayed lists is `pxDelayedTaskList` right now.
-    delayed_swapped: bool,
-    /// `xNumOfOverflows`.
-    overflows: u64,
-    /// Which tasks have been switched in at least once. A task's first
-    /// switch-in is where a real port hands it a fresh stack, so the
-    /// outgoing task's open critical sections are abandoned there
-    /// (`Port::reset_nesting_for_first_start`).
-    started: [bool; TASKS],
-    /// A task that was switched out *in the middle of a kernel call* still
-    /// owes the tail of that call — in practice always the `portYIELD()`
-    /// that `vTaskDelay` and `vTaskSuspend` make after their critical
-    /// sections. On a real port the tail simply sits on the task's frozen
-    /// stack; here the stack is a program counter, so the debt is recorded
-    /// and paid by [`Kernel::resume_pending`] when the task runs again.
-    owes_yield: [bool; TASKS],
-    /// A trace line a task owes from a call it was switched out of.
+    /// It used to be `[Message; MAX_TIMER_COMMANDS]` — a hardcoded 32 — while
+    /// `Config::TIMER_QUEUE_LENGTH` already said how many the configuration
+    /// wanted and defaulted to ten. Because it scaled with **nothing**, it was
+    /// a fixed 768 bytes at every geometry, which is **39 % of a two-task
+    /// kernel's entire static footprint** and 31 % of a four-task one.
     ///
-    /// `xQueueReceive`'s failure path is `taskEXIT_CRITICAL();
-    /// traceQUEUE_RECEIVE_FAILED( pxQueue ); return errQUEUE_EMPTY;` — and
-    /// if the tick that the exit released switches the task away, those two
-    /// lines sit on a stack that is not running. The C emits the trace when
-    /// the task resumes, so this kernel does too.
-    owed_trace: [OwedTrace; TASKS],
-    /// How many outermost critical-section exits a task owes the clock.
-    ///
-    /// This is `uxSavedCriticalNesting` in the Posix port's
-    /// `prvSwitchThread` and then some. A thread stops at the switch; a
-    /// stackless call does not, so the abandoned frame runs on — closing
-    /// the sections it had open and, on some paths, opening one more. The
-    /// port tallies every exit that frame makes instead of counting it as
-    /// sim time, and the tally is paid here when the task runs again. That
-    /// is what puts a sim tick where the C one lands.
-    owed_exits: [u32; TASKS],
-    /// Does this task owe anything at all? A conservative hint: set by
-    /// every writer of the three fields above, cleared only by
-    /// [`Kernel::resume_pending`] once it has checked all three. Wrong in
-    /// the `true` direction costs one slow path; it is never wrong the
-    /// other way, because every writer raises it.
-    owes_anything: [bool; TASKS],
-    /// Does this task have a wait frame set?
-    ///
-    /// A mirror of its `wait.entry_set`, so [`Kernel::end_wait`] can
-    /// answer "nothing to clear" -- which is almost every call -- without
-    /// resolving the TCB to find out. Two writers, the same two that move
-    /// the flag itself.
-    wait_set: [bool; TASKS],
-    /// The task whose abandoned frame is running right now, if any.
-    unwinding: Option<TaskHandle>,
-    /// `vApplicationTickHook`, held by value so it can borrow the kernel.
-    pub(crate) tick_hook: H,
-    /// `ucDelayAborted`: the task was pulled out of the Blocked state by
-    /// [`Kernel::abort_delay`] rather than by its own block time running
-    /// out, so it must not re-evaluate that block time and block again.
-    delay_aborted: [bool; TASKS],
+    /// `TIMER_CMDS` is that number, checked against the config in
+    /// [`Self::with_tick_hook`] exactly as `ITEMS` and `LISTS` are.
+    pub(crate) timer_messages: [Message; TIMER_CMDS],
+    pub(crate) slots: [u64; SLOTS],
+    pub(crate) bytes: [u8; BYTES],
     _config: PhantomData<C>,
 }
 
@@ -461,12 +538,94 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    const TIMER_CMDS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS, TIMER_CMDS>
 where
     H: TickHook<Self>,
 {
     /// `portMAX_DELAY` at this configuration's tick width.
     pub const MAX_DELAY: u64 = <C::Tick as TickWidth>::MAX;
+
+    // ------------------------------------------------------- footprint --
+
+    /// The kernel's own static size, and the same number `size_of` gives.
+    ///
+    /// The consts below decompose it. They exist because a footprint you
+    /// cannot decompose to the byte is a footprint you cannot optimise: the
+    /// arena fields are `pub(crate)` and their types are private, so nothing
+    /// outside this crate can measure them, and a decomposition assembled
+    /// from per-dimension SLOPES is not one — `ITEMS` and `LISTS` are derived
+    /// from `TASKS`, `QUEUES` and `GROUPS`, so the function is not linear and
+    /// slopes do not sum to the total. That was tried; it produced 696 bytes
+    /// of nonsense.
+    ///
+    /// Every one is `size_of` on whatever target this is compiled for, which
+    /// is the only place the number means anything: a host `usize` is eight
+    /// bytes and rv32's is four.
+    ///
+    /// [`FOOTPRINT_ACCOUNTED`](Self::FOOTPRINT_ACCOUNTED) sums them, and the
+    /// difference from [`FOOTPRINT`](Self::FOOTPRINT) is padding plus the
+    /// scalar tail — print both, never one. `bench/kernel-ram` does.
+    pub const FOOTPRINT: usize = core::mem::size_of::<Self>();
+
+    /// The task control blocks.
+    pub const FOOTPRINT_TCBS: usize = core::mem::size_of::<Arena<TaskKind, Tcb, TASKS>>();
+    /// The queue descriptors, and NOT their item storage.
+    pub const FOOTPRINT_QUEUES: usize = core::mem::size_of::<Arena<QueueKind, Queue, QUEUES>>();
+    /// Every intrusive list: ready, delayed, and the per-object waiters.
+    pub const FOOTPRINT_LISTS: usize = core::mem::size_of::<Lists<ITEMS, LISTS>>();
+    /// Queue item storage, as `u64` slots.
+    pub const FOOTPRINT_SLOTS: usize = core::mem::size_of::<[u64; SLOTS]>();
+    /// The stream-buffer descriptors, and NOT their bytes.
+    pub const FOOTPRINT_BUFFERS: usize =
+        core::mem::size_of::<Arena<StreamKind, StreamBuffer, BUFFERS>>();
+    /// The software timers.
+    pub const FOOTPRINT_TIMERS: usize = core::mem::size_of::<Arena<TimerKind, Timer, TIMERS>>();
+    /// The event groups.
+    pub const FOOTPRINT_GROUPS: usize =
+        core::mem::size_of::<Arena<EventGroupKind, EventGroup, GROUPS>>();
+    /// The timer daemon's command mailbox.
+    ///
+    /// It scales with `TIMER_CMDS` now, which the geometry check pins to
+    /// `Config::TIMER_QUEUE_LENGTH`. It used to be a hardcoded 32 and so
+    /// scaled with nothing — a fixed 768 bytes, 39 % of a two-task kernel.
+    /// The line stays separate because that history is worth being able to
+    /// read off a decomposition.
+    pub const FOOTPRINT_TIMER_MESSAGES: usize = core::mem::size_of::<[Message; TIMER_CMDS]>();
+    /// The byte arena, for stream-buffer contents.
+    pub const FOOTPRINT_BYTES: usize = core::mem::size_of::<[u8; BYTES]>();
+    /// The two free lists, over the byte arena and the slot arena.
+    pub const FOOTPRINT_FREE_LISTS: usize = core::mem::size_of::<[(usize, usize); BUFFERS]>()
+        + core::mem::size_of::<[(usize, usize); QUEUES]>();
+
+    /// The seven per-task side arrays, together.
+    ///
+    /// Seven arrays indexed by the same task, five of them `[bool; TASKS]`.
+    /// Whether that wants to be one array of a flags byte is a question this
+    /// number is here to make askable.
+    pub const FOOTPRINT_PER_TASK_SIDE: usize = core::mem::size_of::<[u8; TASKS]>()
+        + core::mem::size_of::<[bool; TASKS]>() * 3
+        + core::mem::size_of::<[OwedTrace; TASKS]>()
+        + core::mem::size_of::<[u32; TASKS]>();
+
+    /// What the lines above account for.
+    ///
+    /// `FOOTPRINT - FOOTPRINT_ACCOUNTED` is the unattributed remainder: the
+    /// scalar tail (`tick`, `current`, the counters) plus whatever padding
+    /// the layout inserts. It was 140 bytes of 6,784 when this was written. A
+    /// remainder that grows is a field somebody added without adding a line
+    /// here.
+    pub const FOOTPRINT_ACCOUNTED: usize = Self::FOOTPRINT_TCBS
+        + Self::FOOTPRINT_QUEUES
+        + Self::FOOTPRINT_LISTS
+        + Self::FOOTPRINT_SLOTS
+        + Self::FOOTPRINT_BUFFERS
+        + Self::FOOTPRINT_TIMERS
+        + Self::FOOTPRINT_GROUPS
+        + Self::FOOTPRINT_TIMER_MESSAGES
+        + Self::FOOTPRINT_BYTES
+        + Self::FOOTPRINT_FREE_LISTS
+        + Self::FOOTPRINT_PER_TASK_SIDE;
 
     // ------------------------------------------------------------ setup --
 
@@ -495,6 +654,10 @@ where
             || LISTS != lists_for(C::MAX_PRIORITIES, QUEUES, GROUPS)
             || TASKS == 0
             || C::MAX_TASK_NAME_LEN > crate::NAME_CAPACITY
+            // The mailbox is a declared dimension now, so a declaration that
+            // disagrees with its own config is refused rather than silently
+            // sized to whichever one the type happened to carry.
+            || TIMER_CMDS != C::TIMER_QUEUE_LENGTH
         {
             return Err(Error::InvalidArgument);
         }
@@ -509,7 +672,7 @@ where
             buffers: Arena::new(),
             timers: Arena::new(),
             groups: Arena::new(),
-            timer_messages: [Message::default(); MAX_TIMER_COMMANDS],
+            timer_messages: [Message::default(); TIMER_CMDS],
             timer_message_next: 0,
             timers_swapped: false,
             timer_last_time: 0,
@@ -522,6 +685,7 @@ where
             free_slot_count: 0,
             current: TaskHandle::NULL,
             top_ready_priority: 0,
+            current_priority: 0,
             tick: C::INITIAL_TICK_COUNT,
             pended_ticks: 0,
             suspended_depth: 0,
@@ -531,17 +695,18 @@ where
             task_count: 0,
             stalls: 0,
             first_stall: Stall::None,
-            awaiting_reap: None,
+            awaiting_reap: TaskHandle::NULL,
             delayed_swapped: false,
             overflows: 0,
+            flags: [0; TASKS],
             started: [false; TASKS],
-            owes_yield: [false; TASKS],
-            owed_exits: [0; TASKS],
             owes_anything: [false; TASKS],
-            wait_set: [false; TASKS],
-            unwinding: None,
-            tick_hook,
             delay_aborted: [false; TASKS],
+            owed_exits: [0; TASKS],
+            unwinding: TaskHandle::NULL,
+            queue_resumes: 0,
+            event_resumes: 0,
+            tick_hook,
             owed_trace: [OwedTrace::None; TASKS],
             _config: PhantomData,
         })
@@ -571,7 +736,7 @@ where
     /// `xNumOfOverflows`, for a scenario that reports counters.
     #[must_use]
     pub const fn overflows(&self) -> u64 {
-        self.overflows
+        self.overflows as u64
     }
 
     // ------------------------------------------------------ list indices --
@@ -623,13 +788,13 @@ where
 
     /// A task's `xStateListItem`: the task's own arena index.
     pub(crate) const fn state_item(task: TaskHandle) -> ItemId {
-        task.index()
+        task.index() as u16
     }
 
     /// A task's `xEventListItem`: `TASKS` above its state item, so the two
     /// never collide and either maps back to its task by arithmetic alone.
     pub(crate) fn event_item(task: TaskHandle) -> ItemId {
-        Self::task_item_base().saturating_add(task.index())
+        Self::task_item_base().saturating_add(task.index() as u16)
     }
 
     fn task_item_base() -> ItemId {
@@ -682,7 +847,7 @@ where
     /// `xPendedTicks`, likewise.
     #[must_use]
     pub const fn pended_ticks(&self) -> u64 {
-        self.pended_ticks
+        self.pended_ticks as u64
     }
 
     /// The item ids in `priority`'s ready list, in order, into `out`.
@@ -749,7 +914,53 @@ where
     }
 
     pub(crate) fn current_priority(&self) -> u8 {
-        self.priority_of(None).unwrap_or(0)
+        // The cache is the whole point; this is the proof it is honest. It
+        // costs nothing in release and fails the kernel's own tests, the
+        // Kani proofs and the conformance corpus the moment a new write to
+        // `current` or to a priority forgets its helper.
+        debug_assert_eq!(
+            self.current_priority,
+            self.priority_of(None).unwrap_or(0),
+            "the cached current priority went stale -- a write to `current` or              to a task's priority bypassed set_current/set_task_priority"
+        );
+        self.current_priority
+    }
+
+    /// Make `task` the running task, keeping [`Self::current_priority`] with
+    /// it, where the caller already knows the priority.
+    ///
+    /// One of the two places that field is written; assigning `self.current`
+    /// directly is what this exists to prevent.
+    ///
+    /// **The priority is a parameter and not resolved here**, because every
+    /// caller already has it. `switch_context`'s search loop finds the highest
+    /// non-empty ready list and takes `next` out of it, so `next`'s priority
+    /// IS that list's index; task creation has it as an argument. Resolving
+    /// the TCB again to learn what the caller just proved cost **9
+    /// instructions on the switch row** — measured, by landing this without
+    /// the parameter and watching `switch_select` go 79 → 88, then 88 → 82
+    /// when it was threaded through.
+    fn set_current_at(&mut self, task: TaskHandle, priority: u8) {
+        self.current = task;
+        self.current_priority = priority;
+    }
+
+    /// Write a task's scheduling priority, keeping [`Self::current_priority`]
+    /// with it when that task is the running one.
+    ///
+    /// The other of the two. Note it is the SCHEDULING priority only:
+    /// `base_priority` does not decide which ready list a task sits on, so it
+    /// is written directly at its call sites.
+    ///
+    /// # Errors
+    /// [`Error::InvalidHandle`] or [`Error::Gone`] for a handle the arena
+    /// refuses, exactly as `resolve_mut` does.
+    fn set_task_priority(&mut self, task: TaskHandle, priority: u8) -> Result<()> {
+        self.tcbs.resolve_mut(task)?.priority = priority;
+        if task == self.current {
+            self.current_priority = priority;
+        }
+        Ok(())
     }
 
     /// `uxTaskPriorityGet`: the C API, which takes a critical section.
@@ -845,6 +1056,8 @@ where
     ///
     /// Counts every occurrence and keeps the FIRST reason: the first is the
     /// diagnosis and the rest are consequences.
+    #[cold]
+    #[inline(never)]
     fn note_stall(&mut self, why: Stall) {
         self.stalls = self.stalls.saturating_add(1);
         if self.first_stall == Stall::None {
@@ -911,6 +1124,10 @@ where
     /// This kernel allocates nothing, so the call is the whole of it. On a
     /// configuration with [`Config::DYNAMIC_ALLOCATION`] off it compiles
     /// away to nothing at all.
+    // Out of line: 12 cold create/delete sites, each otherwise inlining
+    // suspend_all + resume_all. Worth -46 B, and the Ir cost is nil because
+    // every caller is a create or a delete.
+    #[inline(never)]
     pub(crate) fn account_for_allocation(&mut self) {
         if C::DYNAMIC_ALLOCATION {
             self.suspend_all();
@@ -960,6 +1177,7 @@ where
     /// outlining it still costs `khot-ir` 12,001, `ksched-ir` 7,555 and
     /// `kipc-ir` 2,000 for nothing `kernel-ir` did not already have. So the
     /// body keeps LLVM's own choice and only this call site is pinned.
+    #[cold]
     #[inline(never)]
     fn tick_on_exit(&mut self) {
         self.tick_from_isr();
@@ -1049,7 +1267,7 @@ where
 
         if self.tick.saturating_add(jump) == self.next_unblock_time && jump > 0 {
             self.pended_ticks = self.pended_ticks.saturating_add(1);
-            jump = jump.saturating_sub(1);
+            jump = jump.wrapping_sub(1);
         }
 
         self.tick = self.tick.wrapping_add(jump) & Self::MAX_DELAY;
@@ -1080,14 +1298,14 @@ where
         let expected = self.expected_idle_time();
         if expected >= C::EXPECTED_IDLE_TIME_BEFORE_SLEEP {
             let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             self.trace.event(tick, Event::LowPowerIdleBegin);
 
             let slept = self.port.suppress_ticks_and_sleep(expected);
             self.step_tick(slept);
 
             let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             self.trace.event(tick, Event::LowPowerIdleEnd);
         }
         let _ = self.resume_all();
@@ -1095,6 +1313,12 @@ where
 
     /// `portYIELD()` as the Posix port spells it: a critical section around
     /// the context switch, so a tick raised during it lands on the way out.
+    /// `#[cold]` because the call is GUARDED and reached from many sites on
+    /// one hot path, which is the shape that pays: it lets LLVM keep the
+    /// caller's frame setup out of the likely route. Measured on
+    /// `riscv32-qemu-tick-work`, one attribute at a time.
+    /// Worth queue -7, group -3 on its own.
+    #[cold]
     pub(crate) fn port_yield(&mut self) {
         self.enter_critical();
         self.port.count_yield();
@@ -1171,12 +1395,13 @@ where
             stream_timed: false,
             stream_waited: false,
             stream_local: 0,
+            _stride_pad: [0; 9],
         };
         let handle = match self.tcbs.try_insert(tcb) {
             Ok(h) => h,
             Err(_) => {
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace.event(tick, Event::TaskCreateFailed);
                 return Err(Error::Full);
             }
@@ -1201,7 +1426,7 @@ where
         // now would put both events on the wrong side of the switch — which
         // is precisely how `death` first diverged.
         if self.current != caller {
-            if let Some(slot) = self.owed_trace.get_mut(usize::from(caller.index())) {
+            if let Some(slot) = self.owed_trace.get_mut(caller.index() as usize) {
                 *slot = OwedTrace::AddNewTaskToReadyList {
                     task: handle,
                     priority,
@@ -1220,12 +1445,12 @@ where
         {
             self.task_count = self.task_count.wrapping_add(1);
             if self.current.is_null() {
-                self.current = task;
+                self.set_current_at(task, priority);
             } else if !self.running {
                 // `<=`, so the last-created task of the highest priority is
                 // the one that runs first.
                 if self.current_priority() <= priority {
-                    self.current = task;
+                    self.set_current_at(task, priority);
                 }
             }
             self.trace_task(task, |task, name| Event::TaskCreate {
@@ -1330,7 +1555,7 @@ where
         self.note_first_start(current);
         self.trace_task(current, |task, name| Event::TaskSwitchedIn { task, name });
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(tick, Event::StartingScheduler);
         Ok(StartHandles {
             idle,
@@ -1351,11 +1576,19 @@ where
         let current = self.current;
         self.trace_task(current, |task, name| Event::TaskSwitchedOut { task, name });
         // taskSELECT_HIGHEST_PRIORITY_TASK
+        //
+        // ONE call per priority level, not two. The search used to ask
+        // `is_empty` — a bounded read of the list's metadata — and then hand
+        // the winning level to `next_round_robin`, which reads that same
+        // metadata again to find the cursor. `next_round_robin` already
+        // answers `None` for an empty list, and does so BEFORE it touches the
+        // cursor, so it is its own emptiness probe and the level that loses
+        // is left exactly as it was found.
         let mut top = self.top_ready_priority;
-        loop {
-            match self.lists.is_empty(Self::ready_list(top)) {
-                Ok(false) => break,
-                Ok(true) => {
+        let item = loop {
+            match self.lists.next_round_robin(Self::ready_list(top)) {
+                Ok(Some(item)) => break item,
+                Ok(None) => {
                     if top == 0 {
                         // The C `configASSERT( uxTopPriority )`. The idle
                         // task keeps priority 0 non-empty, so reaching here
@@ -1374,10 +1607,6 @@ where
                     return;
                 }
             }
-        }
-        let Ok(Some(item)) = self.lists.next_round_robin(Self::ready_list(top)) else {
-            self.note_stall(Stall::EmptyRotation);
-            return;
         };
         let Ok(next) = self.task_of_state_item(item) else {
             self.note_stall(Stall::UnknownTask);
@@ -1387,7 +1616,9 @@ where
         if next != current {
             self.hand_over(current, next);
         }
-        self.current = next;
+        // `top` is `next`'s priority by construction: the loop above found
+        // the highest non-empty ready list and `next` came out of it.
+        self.set_current_at(next, top);
         self.trace_task(next, |task, name| Event::TaskSwitchedIn { task, name });
     }
 
@@ -1411,14 +1642,17 @@ where
         // set, and the rest returns at once unless this task owes
         // something. Neither is duplicated -- the cold half still runs
         // both in full.
-        if self.unwinding.is_none()
-            && !self
-                .owes_anything
-                .get(usize::from(self.current.index()))
-                .copied()
-                .unwrap_or(true)
-        {
-            return false;
+        if self.unwinding.is_null() {
+            // Nothing to settle, which is the shape of almost every call.
+            // `settle_unwind` would test `unwinding` and return at once, and
+            // the cold half would then re-read the very byte this line reads
+            // — so on this shape both are skipped and the owed body is
+            // entered directly.
+            let index = self.current.index() as usize;
+            if !self.owes_anything.get(index).copied().unwrap_or(true) {
+                return false;
+            }
+            return self.resume_pending_owed(index);
         }
         self.resume_pending_cold()
     }
@@ -1431,28 +1665,56 @@ where
     #[inline(never)]
     fn resume_pending_cold(&mut self) -> bool {
         self.settle_unwind();
-        let index = usize::from(self.current.index());
+        let index = self.current.index() as usize;
 
         // One load and one test for the overwhelmingly common case. The
         // combined check below is the fallback, and it is what clears the hint
         // -- so a hint left standing costs one slow path and then goes away.
+        //
+        // This read cannot be threaded in from `resume_pending`: settling an
+        // unwind calls `owe` itself, so the answer here is not always the
+        // answer there. That is exactly why the no-unwind shape gets its own
+        // entry rather than this one being made cheaper.
         if !self.owes_anything.get(index).copied().unwrap_or(true) {
             return false;
         }
+        self.resume_pending_owed(index)
+    }
 
+    /// Everything owed to the current task, once it is known that something
+    /// is.
+    ///
+    /// Its own symbol so that both shapes above can reach it without either
+    /// paying for the other's entry conditions.
+    #[inline(never)]
+    fn resume_pending_owed(&mut self, index: usize) -> bool {
+        let did = self.resume_pending_owed_inner(index);
+        if did {
+            // Every branch below that did work returned with the hint still
+            // standing, so the runner came straight back and spent a second
+            // entry re-deriving "nothing owed". Clearing it here covers all
+            // of them at one site.
+            self.clear_owe_if_settled(index);
+        }
+        did
+    }
+
+    /// The body of [`Kernel::resume_pending_owed`].
+    fn resume_pending_owed_inner(&mut self, index: usize) -> bool {
         // Almost every call answers "nothing owed", and the sequence below
         // reaches that answer in three stages -- a compare, a match over
         // `OwedTrace`, then another compare -- each reachable only after the
         // one before. The same three loads, but one branch instead of three.
+        // No `.copied()` on `owed_trace`: that materialises an
+        // `Option<OwedTrace>`, and `OwedTrace` is forty bytes wide because of
+        // `TimerCommandSend`'s `Name`. Matching through the reference tests
+        // the discriminant where the copy moved the whole variant to test it.
         if self.owed_exits.get(index).copied().unwrap_or(0) == 0
-            && matches!(
-                self.owed_trace.get(index).copied(),
-                Some(OwedTrace::None) | None
-            )
-            && self.owes_yield.get(index).copied() != Some(true)
+            && matches!(self.owed_trace.get(index), Some(OwedTrace::None) | None)
+            && !self.flag(index, Self::F_YIELD, false)
         {
-            if let Some(flag) = self.owes_anything.get_mut(index) {
-                *flag = false;
+            if let Some(f) = self.owes_anything.get_mut(index) {
+                *f = false;
             }
             return false;
         }
@@ -1482,20 +1744,20 @@ where
         match self.owed_trace.get(index).copied() {
             Some(OwedTrace::SendFailed(queue)) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace
                     .event(tick, Event::QueueSendFailed { queue, name: "" });
                 return true;
             }
             Some(OwedTrace::ReceiveFailed(queue)) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace
                     .event(tick, Event::QueueReceiveFailed { queue, name: "" });
                 return true;
@@ -1506,10 +1768,10 @@ where
                 timed_out,
             }) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace.event(
                     tick,
                     Event::EventGroupWaitBitsEnd {
@@ -1525,10 +1787,10 @@ where
                 is_message_buffer,
             }) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace.event(
                     tick,
                     Event::StreamBufferCreate {
@@ -1545,10 +1807,10 @@ where
                 value,
             }) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace.event(
                     tick,
                     Event::TimerCommandSend {
@@ -1562,19 +1824,17 @@ where
             }
             Some(OwedTrace::AddNewTaskToReadyList { task, priority }) => {
                 if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
+                    *slot = crate::kernel::OwedTrace::None;
                 }
                 let _ = self.add_new_task_to_ready_list(task, priority);
                 return true;
             }
             Some(OwedTrace::None) | None => {}
         }
-        if self.owes_yield.get(index).copied() != Some(true) {
+        if !self.flag(index, Self::F_YIELD, false) {
             return false;
         }
-        if let Some(flag) = self.owes_yield.get_mut(index) {
-            *flag = false;
-        }
+        self.set_flag(index, Self::F_YIELD, false);
         self.port_yield();
         true
     }
@@ -1589,14 +1849,15 @@ where
         // writes `None` back even then -- a store, on every call, to clear a
         // slot that was already clear. Peeking first leaves the store for the
         // calls that actually have something to clear.
-        if self.unwinding.is_none() {
+        if self.unwinding.is_null() {
             return;
         }
-        let Some(task) = self.unwinding.take() else {
+        let task = core::mem::replace(&mut self.unwinding, TaskHandle::NULL);
+        if task.is_null() {
             return;
         };
         let owed = self.port.end_unwind();
-        if let Some(slot) = self.owed_exits.get_mut(usize::from(task.index())) {
+        if let Some(slot) = self.owed_exits.get_mut(task.index() as usize) {
             // Accumulate: a replay that is itself interrupted leaves the
             // rest of its own loop as a tail, and that tail is more of the
             // same debt.
@@ -1614,9 +1875,18 @@ where
     /// choose between two events the caller had already decided between.
     #[inline(always)]
     pub(crate) fn trace_failure_or_owe(&mut self, caller: TaskHandle, owed: OwedTrace) {
+        #[cfg(feature = "census")]
+        CENSUS_OWE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Unlike every other trace site, this one has a side effect a no-op
+        // sink cannot delete: the miss path STORES an `OwedTrace` and raises
+        // `owes_anything`, which sends the task down the owed body on its next
+        // run to reproduce a line the sink will drop.
+        if !T::EMITS {
+            return;
+        }
         if self.current == caller {
             let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             match owed {
                 OwedTrace::SendFailed(queue) => self
                     .trace
@@ -1668,7 +1938,7 @@ where
             }
             return;
         }
-        if let Some(slot) = self.owed_trace.get_mut(usize::from(caller.index())) {
+        if let Some(slot) = self.owed_trace.get_mut(caller.index() as usize) {
             *slot = owed;
         }
         self.owe(caller);
@@ -1679,18 +1949,72 @@ where
     /// Called by every writer of `owed_trace`, `owes_yield` and `owed_exits`.
     /// Missing one would let `resume_pending` skip work that was really owed,
     /// which the conformance differential would show as a missing trace line.
+    /// `owes_yield`: a `portYIELD()` the task was preempted before reaching.
+    const F_YIELD: u8 = 1 << 1;
+    /// `wait_set`: a blocking call's `WaitFrame` is live in the TCB.
+    const F_WAIT: u8 = 1 << 2;
+
+    /// Read one per-task flag.
+    ///
+    /// `missing` is what an index past the end answers. Each caller chooses it
+    /// so an impossible index takes the SLOW path rather than the fast one,
+    /// which is what the five separate arrays did with `unwrap_or`.
+    #[inline(always)]
+    fn flag(&self, index: usize, bit: u8, missing: bool) -> bool {
+        match self.flags.get(index) {
+            Some(f) => f & bit != 0,
+            None => missing,
+        }
+    }
+
+    /// Write one per-task flag. An index past the end writes nothing, as
+    /// `get_mut` did.
+    #[inline(always)]
+    fn set_flag(&mut self, index: usize, bit: u8, on: bool) {
+        if let Some(f) = self.flags.get_mut(index) {
+            if on {
+                *f |= bit;
+            } else {
+                *f &= !bit;
+            }
+        }
+    }
+
+    /// Drop the hint if nothing is owed any more.
+    ///
+    /// Worth one whole entry to [`Kernel::resume_pending_owed`] per owed item.
+    /// A census over three scenarios found every raise producing exactly TWO
+    /// entries — one that did the work and returned `true`, and a second that
+    /// re-derived "nothing owed" and cleared the hint on its way out (BlockQ:
+    /// 43,110 raises, 86,207 entries, 43,103 of them finding nothing). Doing
+    /// it at the end of the branch that did the work turns that second entry
+    /// into a `resume_pending` fast path, which is a few instructions instead
+    /// of forty-odd.
+    ///
+    /// This cannot clear a live hint. Everything that opens new debt raises
+    /// the hint itself — a replay that gets switched out leaves its tail to
+    /// `settle_unwind`, which raises it again when it collects the tally.
+    fn clear_owe_if_settled(&mut self, index: usize) {
+        if self.owed_exits.get(index).copied().unwrap_or(0) == 0
+            && matches!(self.owed_trace.get(index), Some(OwedTrace::None) | None)
+            && !self.flag(index, Self::F_YIELD, false)
+        {
+            if let Some(f) = self.owes_anything.get_mut(index) {
+                *f = false;
+            }
+        }
+    }
+
     fn owe(&mut self, task: TaskHandle) {
-        if let Some(flag) = self.owes_anything.get_mut(usize::from(task.index())) {
-            *flag = true;
+        if let Some(f) = self.owes_anything.get_mut(task.index() as usize) {
+            *f = true;
         }
     }
 
     /// Record that `task` was preempted before the `portYIELD()` at the end
     /// of the call it is inside.
     pub(crate) fn owe_yield(&mut self, task: TaskHandle) {
-        if let Some(flag) = self.owes_yield.get_mut(usize::from(task.index())) {
-            *flag = true;
-        }
+        self.set_flag(task.index() as usize, Self::F_YIELD, true);
         self.owe(task);
     }
 
@@ -1706,23 +2030,28 @@ where
     fn hand_over(&mut self, outgoing: TaskHandle, incoming: TaskHandle) {
         // A tail that switches again is still the first frame's tail: the
         // code after the second switch is on the same abandoned stack.
-        if self.unwinding.is_none() {
-            self.unwinding = Some(outgoing);
+        if self.unwinding.is_null() {
+            self.unwinding = outgoing;
             self.port.begin_unwind();
         }
-        let index = usize::from(incoming.index());
-        if let Some(flag) = self.started.get_mut(index) {
-            if !*flag {
-                *flag = true;
-                if let Some(slot) = self.owed_exits.get_mut(index) {
-                    *slot = 0;
-                }
-                if let Some(flag) = self.owes_yield.get_mut(index) {
-                    *flag = false;
-                }
-                if let Some(slot) = self.owed_trace.get_mut(index) {
-                    *slot = OwedTrace::None;
-                }
+        let index = incoming.index() as usize;
+        // ONE access to the byte, not two: the test and the two bit writes all
+        // work on the same `&mut`. STARTED goes on and YIELD goes off together,
+        // which is the whole point of their sharing a byte.
+        let first = match self.started.get_mut(index) {
+            Some(f) if !*f => {
+                *f = true;
+                true
+            }
+            _ => false,
+        };
+        if first {
+            self.set_flag(index, Self::F_YIELD, false);
+            if let Some(slot) = self.owed_exits.get_mut(index) {
+                *slot = 0;
+            }
+            if let Some(slot) = self.owed_trace.get_mut(index) {
+                *slot = crate::kernel::OwedTrace::None;
             }
         }
     }
@@ -1730,15 +2059,15 @@ where
     /// Mark a task as having run, without a hand-over: the first task the
     /// scheduler starts has no predecessor.
     fn note_first_start(&mut self, task: TaskHandle) {
-        if let Some(flag) = self.started.get_mut(usize::from(task.index())) {
-            *flag = true;
+        if let Some(f) = self.started.get_mut(task.index() as usize) {
+            *f = true;
         }
     }
 
     /// `xTaskIncrementTick`; `true` when a context switch is required.
     pub fn increment_tick(&mut self) -> bool {
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(tick, Event::TaskIncrementTick { tick });
         let mut switch_required = false;
         if self.suspended_depth == 0 {
@@ -1831,7 +2160,7 @@ where
             self.exit_critical();
             if should_block {
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace_task(caller, |task, name| Event::TaskNotifyWaitBlock {
                     task,
                     name,
@@ -1854,7 +2183,7 @@ where
         }
         self.set_notify_blocked(caller, false);
         self.enter_critical();
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace_task(caller, |task, name| Event::TaskNotifyWait {
             task,
             name,
@@ -1931,7 +2260,7 @@ where
             self.exit_critical();
             if should_block {
                 // The C traces BEFORE it adds itself to the delayed list.
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace_task(caller, |task, name| Event::TaskNotifyTakeBlock {
                     task,
                     name,
@@ -1952,14 +2281,20 @@ where
         }
         self.set_notify_blocked(caller, false);
         self.enter_critical();
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace_task(caller, |task, name| Event::TaskNotifyTake {
             task,
             name,
             index,
         });
-        let value = self.notified_value_of(caller, index);
+        // One resolve for the read and both writes. `notified_value_of`
+        // resolved the TCB to read the value and this line resolved it again
+        // to write it back -- the same trade `unlock_queue` makes, and a
+        // `&mut self` call sits between this and the read at the top of the
+        // function, so the two cannot be folded by the compiler.
+        let mut value = 0;
         if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+            value = tcb.notified.get(index).copied().unwrap_or(0);
             if value != 0 {
                 if let Some(slot) = tcb.notified.get_mut(index) {
                     // Guarded by `value != 0` above, so the saturation
@@ -2014,7 +2349,7 @@ where
             if self
                 .tcbs
                 .resolve(handle)
-                .is_ok_and(|tcb| tcb.name.as_str() == name)
+                .is_ok_and(|tcb| tcb.name.matches(name))
             {
                 found = Some(handle);
                 break;
@@ -2159,7 +2494,7 @@ where
         // `traceTASK_NOTIFY` is hooked; `traceTASK_NOTIFY_FROM_ISR` is not,
         // so an interrupt's notification says nothing on either side.
         if !from_isr {
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             self.trace_task(task, |t, name| Event::TaskNotify {
                 task: t,
                 name,
@@ -2317,11 +2652,25 @@ where
     /// Whether `task` has a queue call to resume below its sampling exit.
     /// Taking it clears the marker.
     pub(crate) fn take_queue_resume(&mut self, task: TaskHandle) -> QueueResume {
+        // Nobody is parked at a sampling exit, so there is nothing to read.
+        // This is the answer on all but a handful of queue calls, and it costs
+        // one field load where resolving the TCB costs an arena lookup.
+        if self.queue_resumes == 0 {
+            return QueueResume::No;
+        }
         let Ok(tcb) = self.tcbs.resolve_mut(task) else {
             return QueueResume::No;
         };
         let resume = tcb.queue_resume;
-        tcb.queue_resume = QueueResume::No;
+        // Peek before clearing, the same trade `settle_unwind` makes: every
+        // queue send and every queue receive passes through here, and on all
+        // but the handful that were preempted at a sampling exit the slot is
+        // already `No` — so the unconditional write was a store, on every
+        // queue call, to clear something already clear.
+        if resume != QueueResume::No {
+            tcb.queue_resume = QueueResume::No;
+            self.queue_resumes = self.queue_resumes.saturating_sub(1);
+        }
         resume
     }
 
@@ -2331,7 +2680,17 @@ where
     /// re-reads the queue under `prvLockQueue` on the other side of the
     /// exit, so there is nothing sampled to carry.
     pub(crate) fn set_queue_resume(&mut self, task: TaskHandle, at: QueueResume) {
+        debug_assert_ne!(
+            at,
+            QueueResume::No,
+            "set_queue_resume only ever parks a task; clearing is take's job, and the summary count depends on that"
+        );
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            // Count the slot, not the call: re-parking a task already parked
+            // replaces its slot and must not be counted twice.
+            if tcb.queue_resume == QueueResume::No {
+                self.queue_resumes = self.queue_resumes.wrapping_add(1);
+            }
             tcb.queue_resume = at;
         }
     }
@@ -2472,7 +2831,7 @@ where
         };
         loop {
             let delayed = self.delayed_list();
-            if self.lists.is_empty(delayed) != Ok(false) {
+            if self.lists.is_empty_of(delayed) {
                 self.next_unblock_time = Self::MAX_DELAY;
                 return switch_required;
             }
@@ -2526,7 +2885,10 @@ where
     /// `taskSWITCH_DELAYED_LISTS()`.
     // Out of line for the same reason: the overflow swap happens when the
     // tick count wraps, which is once in a very long while.
-    #[inline(never)]
+    // In line at its ONE caller (A3): win 26. It carried #[inline(never)] AND a
+    // later #[inline] together, so the A3 change was dead from the day it was
+    // written -- and rustc said so on every build.
+    #[inline(always)]
     fn switch_delayed_lists(&mut self) {
         self.delayed_swapped = !self.delayed_swapped;
         self.overflows = self.overflows.wrapping_add(1);
@@ -2606,8 +2968,8 @@ where
             // it is its own guard -- and `is_ok` is exactly "something was
             // removed", which is what the flag below depends on.
             if self.lists.remove(event).is_ok() {
-                if let Some(flag) = self.delay_aborted.get_mut(usize::from(task.index())) {
-                    *flag = true;
+                if let Some(f) = self.delay_aborted.get_mut(task.index() as usize) {
+                    *f = true;
                 }
             }
         }
@@ -2633,8 +2995,8 @@ where
         let current = self.current;
         // About to enter a delayed list, so the abort flag is cleared here
         // and can only be seen set by a task that really was aborted.
-        if let Some(flag) = self.delay_aborted.get_mut(usize::from(current.index())) {
-            *flag = false;
+        if let Some(f) = self.delay_aborted.get_mut(current.index() as usize) {
+            *f = false;
         }
         let item = Self::state_item(current);
         // `uxListRemove` already answers `NotActive` for an item that is
@@ -2871,7 +3233,7 @@ where
             // `vListInsertEnd( &xTasksWaitingTermination, ... )` and
             // `++uxDeletedTasksWaitingCleanUp`. The count is NOT decremented
             // here — the idle task does that when it reaps.
-            self.awaiting_reap = Some(target);
+            self.awaiting_reap = target;
             self.trace_task(target, |task, name| Event::TaskDelete { task, name });
         } else {
             self.task_count = self.task_count.saturating_sub(1);
@@ -2922,8 +3284,8 @@ where
         // them here as well would work and would be worse: two places that
         // must agree about what a fresh task owes, and a gate that cannot
         // catch either one being dropped because the other still covers it.
-        if let Some(slot) = self.started.get_mut(usize::from(task.index())) {
-            *slot = false;
+        if let Some(f) = self.started.get_mut(task.index() as usize) {
+            *f = false;
         }
     }
 
@@ -2941,13 +3303,14 @@ where
     /// it yields before it can return, so a second deferred delete cannot
     /// happen until this has run.
     pub fn check_tasks_waiting_termination(&mut self) {
-        let Some(task) = self.awaiting_reap else {
+        let task = self.awaiting_reap;
+        if task.is_null() {
             return;
         };
         // The C takes the section per reaped task, decrements both counts
         // inside it, and calls `prvDeleteTCB` outside.
         self.enter_critical();
-        self.awaiting_reap = None;
+        self.awaiting_reap = TaskHandle::NULL;
         self.task_count = self.task_count.saturating_sub(1);
         self.exit_critical();
         self.delete_tcb(task);
@@ -2983,11 +3346,12 @@ where
                 }
                 let used_on_entry = self.tcbs.resolve(target)?.priority;
                 {
-                    let tcb = self.tcbs.resolve_mut(target)?;
-                    if tcb.base_priority == tcb.priority || new_priority > tcb.priority {
-                        tcb.priority = new_priority;
+                    let tcb = self.tcbs.resolve(target)?;
+                    let raise = tcb.base_priority == tcb.priority || new_priority > tcb.priority;
+                    if raise {
+                        self.set_task_priority(target, new_priority)?;
                     }
-                    tcb.base_priority = new_priority;
+                    self.tcbs.resolve_mut(target)?.base_priority = new_priority;
                 }
                 let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(new_priority));
                 self.lists
@@ -3020,10 +3384,29 @@ where
     /// Out of line because it is the rare half of [`Kernel::resume_all`]: the
     /// pending list is empty on essentially every call, and inlining this made
     /// every one of those calls carry a frame sized for the walk.
-    #[inline(never)]
+    ///
+    /// **The GUARD is inlined and only the WALK is out of line.** Outlining
+    /// the whole thing — which is what this used to do — meant every call paid
+    /// a call and a frame to discover there was nothing to do, on a path taken
+    /// three times inside `queue_send_blocking` and three more inside
+    /// `queue_take_blocking`. Asking "is the list empty" is one list read; the
+    /// walk behind it is what wanted outlining.
+    #[inline(always)]
     fn drain_pending_ready(&mut self) {
+        if self.lists.is_empty_of(Self::pending_ready_list()) {
+            // Empty, or a list error: either way the walk below moves nothing,
+            // so `moved_any` would stay false and the reset would not happen.
+            return;
+        }
+        self.drain_pending_ready_walk();
+    }
+
+    /// The walk itself. See [`Kernel::drain_pending_ready`].
+    #[cold]
+    #[inline(never)]
+    fn drain_pending_ready_walk(&mut self) {
         let mut moved_any = false;
-        while self.lists.is_empty(Self::pending_ready_list()) == Ok(false) {
+        while !self.lists.is_empty_of(Self::pending_ready_list()) {
             let Ok(Some(item)) = self.lists.head(Self::pending_ready_list()) else {
                 break;
             };
@@ -3049,9 +3432,21 @@ where
     /// Run the ticks that landed while the scheduler was suspended.
     ///
     /// Out of line for the same reason as its sibling: `pended_ticks` is zero
-    /// on essentially every call.
-    #[inline(never)]
+    /// on essentially every call — and, as there, **only the loop is out of
+    /// line now**. The guard is a field read, and it also skips the
+    /// `pended_ticks = 0` store that the zero case was writing over a zero.
+    #[inline(always)]
     fn unwind_pended_ticks(&mut self) {
+        if self.pended_ticks == 0 {
+            return;
+        }
+        self.unwind_pended_ticks_loop();
+    }
+
+    /// The loop itself. See [`Kernel::unwind_pended_ticks`].
+    #[cold]
+    #[inline(never)]
+    fn unwind_pended_ticks_loop(&mut self) {
         let mut pended = self.pended_ticks;
         while pended > 0 {
             if self.increment_tick() {
@@ -3062,15 +3457,38 @@ where
         self.pended_ticks = 0;
     }
 
-    /// `xTaskResumeAll`; `true` when it yielded on the caller's behalf.
+    /// Hand the port's critical-section exit tally to the trace sink.
+    ///
+    /// Gated on `T::EMITS` because `Port::exits` reads an ATOMIC counter, and
+    /// LLVM may not delete an atomic load even when the value it produces is
+    /// unused. With `NoTrace` the body folds to nothing while the `lw` behind it
+    /// would stay, so every site was paying a load of a counter no sink was
+    /// going to read. The gate is a compile-time constant, so an emitting sink
+    /// is unchanged and a silent one loses the load entirely.
     #[inline(always)]
+    pub(crate) fn note_exits(&mut self) {
+        if T::EMITS {
+            self.trace.note_exits(self.port.exits());
+        }
+    }
+
+    /// `xTaskResumeAll`; `true` when it yielded on the caller's behalf.
+    ///
+    /// Out of line for the cold callers; the body is [`Kernel::resume_all_inline`].
+    #[inline(never)]
     pub fn resume_all(&mut self) -> bool {
+        self.resume_all_inline()
+    }
+
+    /// The body of [`Kernel::resume_all`], in line for the hot callers.
+    #[inline(always)]
+    pub(crate) fn resume_all_inline(&mut self) -> bool {
         let mut already_yielded = false;
         self.enter_critical();
         {
             self.suspended_depth = self.suspended_depth.saturating_sub(1);
             if self.suspended_depth == 0 && self.task_count > 0 {
-                if self.lists.is_empty(Self::pending_ready_list()) == Ok(false) {
+                if !self.lists.is_empty_of(Self::pending_ready_list()) {
                     self.drain_pending_ready();
                 }
                 if self.pended_ticks > 0 {
@@ -3099,37 +3517,60 @@ where
     /// passes leave the running total alone, because the `ticks` the caller
     /// passes is the original block time and the kernel is holding what is
     /// left of it.
+    ///
+    /// Answers the block time that is LEFT. Both call sites wanted it right
+    /// afterwards and used to resolve the same TCB a second time to read a
+    /// field this function is already holding a `&mut` to. The answer is exact
+    /// rather than merely equal to `ticks`, because the frame may be an earlier
+    /// pass's — in which case the remaining time is what the kernel has been
+    /// counting down, not what the caller passed.
+    ///
+    /// `None` means no frame was written at all, so the caller can skip the
+    /// `end_wait` that would tear one down.
     pub(crate) fn begin_wait(
         &mut self,
         task: TaskHandle,
         queue: QueueHandle,
         ticks: u64,
-    ) -> Result<()> {
+    ) -> Option<u64> {
+        // The zero-block-time exit, taken before anything is read. `wait_set`
+        // mirrors the TCB's `entry_set` in one byte, which is the same trade
+        // `end_wait` documents and makes — so the frame can be ruled out
+        // without an arena lookup, and without reading the clock either.
+        // Out of range reads as SET, so an impossible index still goes the
+        // long way round.
+        if ticks == 0 && !self.flag(task.index() as usize, Self::F_WAIT, true) {
+            // `None`, not `Some(0)`: no frame was written, so the caller can
+            // skip the `end_wait` that would tear one down. It reads the same
+            // `wait_set` byte to find nothing to do.
+            return None;
+        }
         let tick = self.tick;
         let overflows = self.overflows;
         let Ok(tcb) = self.tcbs.resolve_mut(task) else {
             // A queue call made before the scheduler started, from what the
             // C would call `main()`: there is no task to keep a frame for,
             // and such a call never blocks — `xSemaphoreGive` on a fresh
-            // semaphore is the usual one.
-            return Ok(());
+            // semaphore is the usual one. The old read answered 0 here
+            // (`unwrap_or(0)` on the same failed resolve), so 0 is what this
+            // must answer to keep the call sites reading the same.
+            return Some(0);
         };
         if tcb.wait.queue != queue || !tcb.wait.entry_set {
             tcb.wait = WaitFrame {
                 queue,
-                ticks,
-                entering: tick,
+                ticks: crate::timer::Split64::new(ticks),
+                entering: crate::timer::Split64::new(tick),
                 overflows,
                 entry_set: true,
                 inherited: false,
             };
         }
+        let remaining = tcb.wait.ticks.get();
         // The frame is set either way on this path -- either it was written
         // just now, or it was already this queue's.
-        if let Some(flag) = self.wait_set.get_mut(usize::from(task.index())) {
-            *flag = true;
-        }
-        Ok(())
+        self.set_flag(task.index() as usize, Self::F_WAIT, true);
+        Some(remaining)
     }
 
     /// The call finished, one way or the other.
@@ -3138,13 +3579,11 @@ where
         // says so in one byte where resolving the TCB to read `entry_set`
         // cost an arena lookup. Out of range reads as SET, so an impossible
         // index still takes the slow path below.
-        let at = usize::from(task.index());
-        if !self.wait_set.get(at).copied().unwrap_or(true) {
+        let at = task.index() as usize;
+        if !self.flag(at, Self::F_WAIT, true) {
             return;
         }
-        if let Some(flag) = self.wait_set.get_mut(at) {
-            *flag = false;
-        }
+        self.set_flag(at, Self::F_WAIT, false);
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
             // Now that the frame is only set on the path that blocks, most
             // calls reach here with nothing to clear, and this was writing
@@ -3156,11 +3595,6 @@ where
                 tcb.wait = WaitFrame::default();
             }
         }
-    }
-
-    /// `xTicksToWait` as it now stands.
-    pub(crate) fn remaining_ticks(&self, task: TaskHandle) -> u64 {
-        self.tcbs.resolve(task).map(|t| t.wait.ticks).unwrap_or(0)
     }
 
     /// `xInheritanceOccurred`.
@@ -3180,39 +3614,54 @@ where
     /// `xTaskCheckForTimeOut`: `true` when the block time has run out.
     /// Takes a critical section, as the C does, and charges the elapsed
     /// time against what is left.
-    pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> bool {
+    /// `None` is `pdTRUE` — the block time has run out. `Some(left)` is
+    /// `pdFALSE`, and carries what is left of it.
+    ///
+    /// The block time is threaded out because both call sites asked for it
+    /// immediately afterwards by resolving the TCB again, which
+    /// the same TCB out of the arena again to read the very field the match
+    /// below has just written.
+    pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> Option<u64> {
         self.enter_critical();
         // An aborted delay is not the same as a time out, but it has the
         // same result: stop waiting.
-        if self.delay_aborted.get(usize::from(task.index())).copied() == Some(true) {
-            if let Some(flag) = self.delay_aborted.get_mut(usize::from(task.index())) {
-                *flag = false;
+        if self
+            .delay_aborted
+            .get(task.index() as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            if let Some(f) = self.delay_aborted.get_mut(task.index() as usize) {
+                *f = false;
             }
             self.exit_critical();
-            return true;
+            return None;
         }
         let now = self.tick;
         let overflows = self.overflows;
         let result = match self.tcbs.resolve_mut(task) {
             Ok(tcb) => {
-                let elapsed = now.wrapping_sub(tcb.wait.entering) & Self::MAX_DELAY;
-                if tcb.wait.ticks == Self::MAX_DELAY {
+                let entering = tcb.wait.entering.get();
+                let held = tcb.wait.ticks.get();
+                let elapsed = now.wrapping_sub(entering) & Self::MAX_DELAY;
+                if held == Self::MAX_DELAY {
                     // An indefinite block never times out.
-                    false
-                } else if overflows != tcb.wait.overflows && now >= tcb.wait.entering {
-                    tcb.wait.ticks = 0;
-                    true
-                } else if elapsed < tcb.wait.ticks {
-                    tcb.wait.ticks = tcb.wait.ticks.saturating_sub(elapsed);
-                    tcb.wait.entering = now;
+                    Some(Self::MAX_DELAY)
+                } else if overflows != tcb.wait.overflows && now >= entering {
+                    tcb.wait.ticks = crate::timer::Split64::new(0);
+                    None
+                } else if elapsed < held {
+                    let left = held.wrapping_sub(elapsed);
+                    tcb.wait.ticks = crate::timer::Split64::new(left);
+                    tcb.wait.entering = crate::timer::Split64::new(now);
                     tcb.wait.overflows = overflows;
-                    false
+                    Some(left)
                 } else {
-                    tcb.wait.ticks = 0;
-                    true
+                    tcb.wait.ticks = crate::timer::Split64::new(0);
+                    None
                 }
             }
-            Err(_) => true,
+            Err(_) => None,
         };
         self.exit_critical();
         result
@@ -3279,9 +3728,15 @@ where
     /// Whether `task` is resuming an event-group wait rather than starting
     /// one. Taking it clears the marker.
     pub(crate) fn take_event_resume(&mut self, task: TaskHandle) -> bool {
+        // Nobody is parked in a wait, so there is nothing to read — one field
+        // load in place of an arena lookup.
+        if self.event_resumes == 0 {
+            return false;
+        }
         match self.tcbs.resolve_mut(task) {
             Ok(tcb) if tcb.event_blocked => {
                 tcb.event_blocked = false;
+                self.event_resumes = self.event_resumes.wrapping_sub(1);
                 true
             }
             _ => false,
@@ -3292,6 +3747,10 @@ where
     /// is inside resumes rather than restarts.
     pub(crate) fn set_event_resume(&mut self, task: TaskHandle) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            // Count the slot, not the call.
+            if !tcb.event_blocked {
+                self.event_resumes = self.event_resumes.wrapping_add(1);
+            }
             tcb.event_blocked = true;
         }
     }
@@ -3329,6 +3788,7 @@ where
     /// `xTaskPriorityInherit`: lift the mutex holder to the waiter's
     /// priority. `true` when the holder is (or already was) lifted, which
     /// is what the waiter remembers so it can undo it on a timeout.
+    #[cold]
     pub(crate) fn priority_inherit(&mut self, holder: TaskHandle) -> Result<bool> {
         if holder.is_null() || !self.tcbs.contains(holder) {
             return Ok(false);
@@ -3349,10 +3809,10 @@ where
         let item = Self::state_item(holder);
         if self.lists.container(item)? == Some(Self::ready_list(holder_priority)) {
             let _ = self.lists.remove(item);
-            self.tcbs.resolve_mut(holder)?.priority = waiter_priority;
+            self.set_task_priority(holder, waiter_priority)?;
             self.add_task_to_ready_list(holder)?;
         } else {
-            self.tcbs.resolve_mut(holder)?.priority = waiter_priority;
+            self.set_task_priority(holder, waiter_priority)?;
         }
         self.trace_task(holder, |task, name| Event::TaskPriorityInherit {
             task,
@@ -3364,6 +3824,7 @@ where
 
     /// `xTaskPriorityDisinherit`: giving the mutex back drops the
     /// inherited priority. `true` when a yield is wanted.
+    #[cold]
     pub(crate) fn priority_disinherit(&mut self, holder: TaskHandle) -> Result<bool> {
         if holder.is_null() {
             return Ok(false);
@@ -3394,10 +3855,7 @@ where
             name,
             priority: Self::priority_value(base),
         });
-        {
-            let tcb = self.tcbs.resolve_mut(holder)?;
-            tcb.priority = base;
-        }
+        self.set_task_priority(holder, base)?;
         let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(base));
         self.lists
             .set_value(Self::event_item(holder), event_value)?;
@@ -3407,6 +3865,7 @@ where
 
     /// `vTaskPriorityDisinheritAfterTimeout`: a waiter gave up, so the
     /// holder keeps only what the tasks still waiting justify.
+    #[cold]
     pub(crate) fn priority_disinherit_after_timeout(
         &mut self,
         holder: TaskHandle,
@@ -3435,7 +3894,7 @@ where
             name,
             priority: Self::priority_value(target),
         });
-        self.tcbs.resolve_mut(holder)?.priority = target;
+        self.set_task_priority(holder, target)?;
         let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(target));
         self.lists
             .set_value(Self::event_item(holder), event_value)?;
@@ -3489,6 +3948,12 @@ where
 
     /// `xTaskRemoveFromEventList`; `true` when the woken task outranks the
     /// running one and a yield is therefore required.
+    /// `#[cold]` because the call is GUARDED and reached from many sites on
+    /// one hot path, which is the shape that pays: it lets LLVM keep the
+    /// caller's frame setup out of the likely route. Measured on
+    /// `riscv32-qemu-tick-work`, one attribute at a time.
+    /// Worth queue -7 on its own.
+    #[cold]
     pub(crate) fn remove_from_event_list(&mut self, list: ListId) -> Result<bool> {
         let Some(item) = self.lists.head(list)? else {
             return Ok(false);
@@ -3547,6 +4012,7 @@ mod tests {
         0,
         0,
         0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     fn kernel() -> K {
@@ -3742,6 +4208,7 @@ mod tests {
             0,
             0,
             0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
         >;
         assert!(
             WrongItems::new(TestPort::default(), NoTrace).is_err(),
@@ -3765,6 +4232,7 @@ mod tests {
             0,
             0,
             0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
         >;
         assert!(
             WrongLists::new(TestPort::default(), NoTrace).is_err(),
@@ -3786,6 +4254,7 @@ mod tests {
             0,
             0,
             0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
         >;
         assert!(
             NoTasks::new(TestPort::default(), NoTrace).is_err(),
@@ -4046,6 +4515,59 @@ mod tests {
             u64::MAX,
             "the two are genuinely different values, or this test is vacuous"
         );
+    }
+
+    /// The owe hint must not outlive the debt it stands for.
+    ///
+    /// A census over three scenarios found every raise producing exactly TWO
+    /// entries to `resume_pending_owed` — one that did the work and returned
+    /// `true`, and a second that re-derived "nothing owed" and cleared the
+    /// hint on its way out. BlockQ: 43,110 raises, 86,207 entries. Clearing
+    /// the hint at the end of the work made entries equal raises.
+    ///
+    /// Both directions are asserted. A `clear_owe_if_settled` that cleared
+    /// unconditionally would pass the first half and lose a real owed item,
+    /// which is a missing trace line in the differential — so the second half
+    /// is the half that matters.
+    #[test]
+    fn the_owe_hint_does_not_outlive_the_debt() {
+        let mut k = running();
+        let me = k.current();
+        let i = me.index() as usize;
+        fn hint(k: &K, i: usize) -> bool {
+            k.owes_anything.get(i).copied().unwrap_or(false)
+        }
+
+        k.owe(me);
+        assert!(hint(&k, i), "the hint was raised");
+        k.clear_owe_if_settled(i);
+        assert!(
+            !hint(&k, i),
+            "nothing is owed, so the hint is dead and must go -- leaving it standing costs one whole entry to the owed body per owed item"
+        );
+
+        // The negative case, once per kind of debt. A `clear_owe_if_settled`
+        // that cleared unconditionally would pass the half above and lose a
+        // real owed item, which is a missing line in the differential.
+        for kind in 0..3 {
+            match kind {
+                0 => *k.owed_exits.get_mut(i).expect("in range") = 1,
+                1 => k.set_flag(i, K::F_YIELD, true),
+                _ => {
+                    *k.owed_trace.get_mut(i).expect("in range") =
+                        crate::kernel::OwedTrace::AddNewTaskToReadyList {
+                            task: me,
+                            priority: 1,
+                        }
+                }
+            }
+            k.owe(me);
+            k.clear_owe_if_settled(i);
+            assert!(hint(&k, i), "kind {kind} is live debt; the hint must stay");
+            *k.owed_exits.get_mut(i).expect("in range") = 0;
+            k.set_flag(i, K::F_YIELD, false);
+            *k.owed_trace.get_mut(i).expect("in range") = crate::kernel::OwedTrace::None;
+        }
     }
 
     /// The stream-buffer resume flag is a ONE-SHOT: the take clears it, so

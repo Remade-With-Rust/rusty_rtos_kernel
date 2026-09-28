@@ -68,6 +68,7 @@ impl StreamBuffer {
     /// at least `head + 1` and cannot underflow; and the fold only runs when
     /// `count >= length`, where `count` is at most `2 * length - 1`, so it
     /// lands back inside `0..length`.
+    #[inline]
     pub(crate) const fn bytes_in_buffer(&self) -> usize {
         let mut count = self.length.wrapping_add(self.head).wrapping_sub(self.tail);
         if count >= self.length {
@@ -82,6 +83,7 @@ impl StreamBuffer {
     /// Bounded as [`StreamBuffer::bytes_in_buffer`] is, with one more step:
     /// `length + tail - head` is at least 1, because `head` is at most
     /// `length - 1`, so taking the spare byte off it cannot underflow.
+    #[inline]
     pub(crate) const fn spaces_available(&self) -> usize {
         let mut space = self
             .length
@@ -115,7 +117,8 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    const TIMER_CMDS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS, TIMER_CMDS>
 where
     H: TickHook<Self>,
 {
@@ -208,7 +211,7 @@ where
             if free == length {
                 self.drop_free_block(i);
             } else if let Some(slot) = self.free_blocks.get_mut(i) {
-                *slot = (base.saturating_add(length), free.saturating_sub(length));
+                *slot = (base.saturating_add(length), free.wrapping_sub(length));
             }
             return Some(base);
         }
@@ -242,7 +245,7 @@ where
                 self.drop_free_block(i);
                 continue;
             }
-            i = i.saturating_add(1);
+            i = i.wrapping_add(1);
         }
         // A block at the very end goes back to the bump pointer instead of
         // the list, which is what keeps a create/delete loop free.
@@ -252,7 +255,7 @@ where
         }
         if let Some(slot) = self.free_blocks.get_mut(self.free_count) {
             *slot = (base, length);
-            self.free_count = self.free_count.saturating_add(1);
+            self.free_count = self.free_count.wrapping_add(1);
         }
     }
 
@@ -275,7 +278,7 @@ where
     /// [`Error::Gone`] for a stale handle.
     pub fn stream_buffer_delete(&mut self, buffer: StreamBufferHandle) -> Result<()> {
         let b = *self.buffers.resolve(buffer)?;
-        let _ = self.buffers.remove(buffer);
+        let _ = self.buffers.discard(buffer);
         self.give_bytes(b.base, b.length);
         // `vStreamBufferDelete` ends in `vPortFree` (stream_buffer.c:582),
         // and `heap_4` brackets that with `vTaskSuspendAll` /
@@ -381,8 +384,8 @@ where
         self.enter_critical();
         let done = match self.buffers.resolve_mut(buffer) {
             Ok(b)
-                if b.waiting_to_receive == TaskHandle::NULL
-                    && b.waiting_to_send == TaskHandle::NULL =>
+                if b.waiting_to_receive.is_null()
+                    && b.waiting_to_send.is_null() =>
             {
                 b.head = 0;
                 b.tail = 0;
@@ -407,7 +410,7 @@ where
         if available <= Self::MESSAGE_LENGTH_BYTES {
             return Ok(0);
         }
-        Ok(self.read_length_prefix(&b, b.tail).0)
+        Ok(Self::read_length_prefix_from(&self.bytes, b.base, b.length, b.tail).0)
     }
 
     // ---------------------------------------------------------- sending --
@@ -466,7 +469,26 @@ where
     /// A call that BLOCKED is not blind: the C's thread stops inside it,
     /// other tasks run, and the counter has moved by the time the return
     /// hook is reached. Comparing the count is what says so on both sides.
+    ///
+    /// Gated on `T::EMITS`, for the same reason [`Kernel::note_exits`] is, and
+    /// to MATCH the C rather than diverge from it. In the C this bracket is
+    /// `traceRETURN_xStreamBufferSend`, which `FreeRTOS.h` defines as **empty**
+    /// unless a config wires it. Only `oracle/harness/FreeRTOSConfig.h` does --
+    /// the sim. `bench/kernel-ram/c/FreeRTOSConfig.h`, which the rv32 flash arm
+    /// compiles against, defines no `traceRETURN_*` at all, so **C pays zero
+    /// bytes for it in the arm we measure** while we were paying for it
+    /// unconditionally. Same defect class as relaxation being off on our arm
+    /// only (scorecard 14).
+    ///
+    /// Nothing observes the bracket under a silent sink: the exits counter it
+    /// samples is read by no one, and the critical section it takes is a closed
+    /// window that restores the mask it found. Under an emitting sink -- which
+    /// is every `conform` scenario -- the gate is true and the behaviour is
+    /// exactly as before, which is why 26/26 is unchanged.
     fn blind_call(&mut self, exits_at_entry: u64) {
+        if !T::EMITS {
+            return;
+        }
         if self.port.exits() != exits_at_entry {
             return;
         }
@@ -484,7 +506,7 @@ where
         data: &[u8],
         ticks: u64,
     ) -> Result<Wait<usize>> {
-        let entry = self.port.exits();
+        let entry = if T::EMITS { self.port.exits() } else { 0 };
         let out = self.stream_buffer_send_inner(buffer, data, ticks);
         self.blind_call(entry);
         out
@@ -497,11 +519,21 @@ where
         ticks: u64,
     ) -> Result<Wait<usize>> {
         let caller = self.current;
-        let snapshot = *self.buffers.resolve(buffer)?;
-        let max_reported = snapshot.length.saturating_sub(1);
+        // ONLY the fields this body reads. It was `*self.buffers.resolve(..)`
+        // -- the whole nine-field descriptor, about thirty-two bytes on rv32 --
+        // to reach three of them. `notify_index` is read at four
+        // points spread across the body, each behind an `&mut self` call, so
+        // the descriptor had to stay LIVE across all of them and was spilled
+        // for it. Two scalars live in registers. Same finding as `queue_take`:
+        // the cost was the live range, not the copy.
+        let (is_message, length, notify_index) = {
+            let b = self.buffers.resolve(buffer)?;
+            (b.is_message, b.length, b.notify_index)
+        };
+        let max_reported = length.saturating_sub(1);
         let mut required = data.len();
         let mut ticks = ticks;
-        if snapshot.is_message {
+        if is_message {
             required = required.saturating_add(Self::MESSAGE_LENGTH_BYTES);
             if required > max_reported {
                 // It will never fit, so do not wait for it to.
@@ -518,7 +550,7 @@ where
             // xRequiredSpace` below the exit, against the sample taken
             // inside it, so a task preempted there still blocks.
             if space < required {
-                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                match self.notify_wait(notify_index, 0, 0, ticks)? {
                     Blocked => return Ok(Blocked),
                     Ready(_) => {
                         self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
@@ -530,10 +562,16 @@ where
                 }
             }
         } else if self.notify_wait_pending(caller) {
-            match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+            match self.notify_wait(notify_index, 0, 0, ticks)? {
                 Blocked => return Ok(Blocked),
                 Ready(_) => {}
             }
+            // Spelled out at all three resume arms rather than factored into a
+            // helper the way the receive side's `after_stream_wait` is. Factoring
+            // it measured **+28 B** on 2026-09-25, identical with and without
+            // `#[inline(never)]` -- so LLVM outlines it either way, and one shared
+            // body plus three calls costs more than three copies that each fold
+            // against their own arm.
             self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
             self.check_for_time_out();
         } else if ticks > 0 {
@@ -560,7 +598,7 @@ where
             let space = self.buffers.resolve(buffer)?.spaces_available();
             let must_block = space < required;
             if must_block {
-                let _ = self.notify_state_clear(None, snapshot.notify_index);
+                let _ = self.notify_state_clear(None, notify_index);
                 self.buffers.resolve_mut(buffer)?.waiting_to_send = caller;
             }
             self.exit_critical();
@@ -575,7 +613,7 @@ where
             if must_block {
                 // `traceBLOCKING_ON_STREAM_BUFFER_SEND` is not one of the
                 // harness's hooks, so blocking says nothing on either side.
-                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                match self.notify_wait(notify_index, 0, 0, ticks)? {
                     Blocked => return Ok(Blocked),
                     Ready(_) => {
                         self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
@@ -592,7 +630,7 @@ where
         let written = self.write_message(buffer, data, space, required)?;
         if written > 0 {
             let tick = self.tick;
-            self.trace.note_exits(self.port.exits());
+            self.note_exits();
             self.trace.event(
                 tick,
                 Event::StreamBufferSend {
@@ -667,6 +705,21 @@ where
     ///
     /// `None` means "stop here"; the caller returns `Blocked` and the body
     /// makes the same call again, which then takes the resume path.
+    // In line at all THREE callers, which are all inside
+    // `stream_buffer_receive_inner`.
+    //
+    // This said "A3: ONE caller in the linked kernel, so this pays a prologue
+    // and epilogue for a single call" until 2026-09-25. The caller count was
+    // simply wrong -- there are three -- so the A3 argument did not apply, and
+    // with three callers `#[inline]` DUPLICATES the body rather than moving it,
+    // which is the opposite of what the comment claimed.
+    //
+    // The decision survives the correction, measured: `#[inline(never)]` costs
+    // **+100 B** (receive 732 -> 686, but a 146 B symbol appears). Each inlined
+    // copy folds to roughly fifteen bytes against the surrounding control flow,
+    // while a standalone body pays a frame and two real handle resolves. Right
+    // answer, wrong reason, now with a number.
+    #[inline(always)]
     fn after_stream_wait(
         &mut self,
         caller: TaskHandle,
@@ -675,6 +728,12 @@ where
         self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
         let available = self.buffers.resolve(buffer)?.bytes_in_buffer();
         if self.current != caller {
+            // Merging these two into one accessor that resolves the TCB once
+            // measured **0 B** on 2026-09-25: `&mut self` is `noalias`, so LLVM
+            // had already shared the resolve across both setters. `list.rs`'s
+            // fourth pass says exactly this, and it applies to the TCB flag
+            // accessors too. Merging adjacent accessors only pays when an
+            // `&mut self` call stands BETWEEN them.
             self.set_stream_waited(caller);
             self.set_stream_resume(caller, available);
             return Ok(None);
@@ -697,7 +756,7 @@ where
         out: &mut [u8],
         ticks: u64,
     ) -> Result<Wait<usize>> {
-        let entry = self.port.exits();
+        let entry = if T::EMITS { self.port.exits() } else { 0 };
         let received = self.stream_buffer_receive_inner(buffer, out, ticks);
         self.blind_call(entry);
         received
@@ -710,8 +769,18 @@ where
         ticks: u64,
     ) -> Result<Wait<usize>> {
         let caller = self.current;
-        let snapshot = *self.buffers.resolve(buffer)?;
-        let prefix = if snapshot.is_message {
+        // ONLY the fields this body reads. It was `*self.buffers.resolve(..)`
+        // -- the whole nine-field descriptor, about thirty-two bytes on rv32 --
+        // to reach two of them. `notify_index` is read at four
+        // points spread across the body, each behind an `&mut self` call, so
+        // the descriptor had to stay LIVE across all of them and was spilled
+        // for it. Two scalars live in registers. Same finding as `queue_take`:
+        // the cost was the live range, not the copy.
+        let (is_message, notify_index) = {
+            let b = self.buffers.resolve(buffer)?;
+            (b.is_message, b.notify_index)
+        };
+        let prefix = if is_message {
             Self::MESSAGE_LENGTH_BYTES
         } else {
             0
@@ -732,7 +801,7 @@ where
             // blocked at tick 1 and the sim created its client instead.
             available = local;
             if !self.take_stream_waited(caller) && available <= prefix {
-                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                match self.notify_wait(notify_index, 0, 0, ticks)? {
                     Blocked => return Ok(Blocked),
                     Ready(_) => match self.after_stream_wait(caller, buffer)? {
                         Some(now) => available = now,
@@ -743,7 +812,7 @@ where
         } else if self.notify_wait_pending(caller) {
             // Resuming: the C's wait returns here, so its second half runs
             // whatever the buffer now holds.
-            match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+            match self.notify_wait(notify_index, 0, 0, ticks)? {
                 Blocked => return Ok(Blocked),
                 Ready(_) => {}
             }
@@ -756,7 +825,7 @@ where
             available = self.buffers.resolve(buffer)?.bytes_in_buffer();
             let must_block = available <= prefix;
             if must_block {
-                let _ = self.notify_state_clear(None, snapshot.notify_index);
+                let _ = self.notify_state_clear(None, notify_index);
                 self.buffers.resolve_mut(buffer)?.waiting_to_receive = caller;
             }
             self.exit_critical();
@@ -769,7 +838,7 @@ where
                 return Ok(Blocked);
             }
             if must_block {
-                match self.notify_wait(snapshot.notify_index, 0, 0, ticks)? {
+                match self.notify_wait(notify_index, 0, 0, ticks)? {
                     Blocked => return Ok(Blocked),
                     Ready(_) => match self.after_stream_wait(caller, buffer)? {
                         Some(now) => available = now,
@@ -786,7 +855,7 @@ where
             received = self.read_message(buffer, out, available)?;
             if received != 0 {
                 let tick = self.tick;
-                self.trace.note_exits(self.port.exits());
+                self.note_exits();
                 self.trace.event(
                     tick,
                     Event::StreamBufferReceive {
@@ -839,13 +908,16 @@ where
     // No `inline`: one was tried and cost 323,801 instructions on
     // `StreamBufferDemo`. The body is small but it is reached from inside
     // `stream_buffer_send`, which is already large.
+    // A3: ONE caller in the linked kernel, so this pays a prologue and epilogue
+    // for a single call. Inlining moves the body rather than duplicating it.
+    #[inline(always)]
     fn send_completed(&mut self, buffer: StreamBufferHandle) -> Result<()> {
         if H::send_completed(self, buffer) {
             return Ok(());
         }
         self.suspend_all();
         let waiting = self.buffers.resolve(buffer)?.waiting_to_receive;
-        if waiting != TaskHandle::NULL {
+        if !waiting.is_null() {
             let index = self.buffers.resolve(buffer)?.notify_index;
             let _ = self.notify(waiting, index, 0, NotifyAction::None)?;
             self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
@@ -865,7 +937,7 @@ where
     /// [`Error::Gone`] for a stale handle.
     pub fn send_completed_from_isr(&mut self, buffer: StreamBufferHandle) -> Result<Woken> {
         let waiting = self.buffers.resolve(buffer)?.waiting_to_receive;
-        if waiting == TaskHandle::NULL {
+        if waiting.is_null() {
             return Ok(Woken::NO);
         }
         let index = self.buffers.resolve(buffer)?.notify_index;
@@ -878,7 +950,7 @@ where
     fn receive_completed(&mut self, buffer: StreamBufferHandle) -> Result<()> {
         self.suspend_all();
         let waiting = self.buffers.resolve(buffer)?.waiting_to_send;
-        if waiting != TaskHandle::NULL {
+        if !waiting.is_null() {
             let index = self.buffers.resolve(buffer)?.notify_index;
             let _ = self.notify(waiting, index, 0, NotifyAction::None)?;
             self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
@@ -890,7 +962,7 @@ where
     /// `sbRECEIVE_COMPLETED_FROM_ISR`.
     fn receive_completed_from_isr(&mut self, buffer: StreamBufferHandle) -> Result<Woken> {
         let waiting = self.buffers.resolve(buffer)?.waiting_to_send;
-        if waiting == TaskHandle::NULL {
+        if waiting.is_null() {
             return Ok(Woken::NO);
         }
         let index = self.buffers.resolve(buffer)?.notify_index;
@@ -909,13 +981,31 @@ where
         space: usize,
         required: usize,
     ) -> Result<usize> {
-        let b = *self.buffers.resolve(buffer)?;
+        // ONE resolve, and the descriptor is written through in place.
+        //
+        // This used to copy the whole nine-field descriptor out
+        // (`*self.buffers.resolve(..)`) and then resolve a SECOND time to store
+        // the new head, because `write_bytes` wanted `&mut self` and so nothing
+        // borrowed from `self` could be alive across it. Destructuring `self`
+        // into disjoint field borrows removes both the copy and the second
+        // resolve: `buffers` and `bytes` are different fields, so the borrow
+        // checker allows what C does with one pointer.
+        let Self { buffers, bytes, .. } = self;
+        let b = buffers.resolve_mut(buffer)?;
+        let (base, ring, is_message) = (b.base, b.length, b.is_message);
         let mut next_head = b.head;
         let mut length = data.len();
         let mut space = space;
-        if b.is_message {
+        if is_message {
             if space >= required {
-                next_head = self.write_length_prefix(&b, length, next_head);
+                // `write_length_prefix`, folded in: it was a one-caller wrapper
+                // whose whole body was this.
+                // `length.to_le_bytes()`, not `(length as u64).to_le_bytes()`:
+                // the widening wrote eight bytes on a target whose `size_t` is
+                // four, and the top half was never sent.
+                let raw = length.to_le_bytes();
+                let prefix = raw.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&raw);
+                next_head = Self::write_bytes_into(bytes, base, ring, prefix, next_head);
             } else {
                 length = 0;
             }
@@ -924,8 +1014,7 @@ where
         let length = length.min(space);
         if length != 0 {
             let chunk = data.get(..length).unwrap_or(data);
-            let head = self.write_bytes(&b, chunk, next_head);
-            self.buffers.resolve_mut(buffer)?.head = head;
+            b.head = Self::write_bytes_into(bytes, base, ring, chunk, next_head);
         }
         Ok(length)
     }
@@ -937,12 +1026,18 @@ where
         out: &mut [u8],
         available: usize,
     ) -> Result<usize> {
-        let b = *self.buffers.resolve(buffer)?;
+        // ONE resolve, and the descriptor is written through in place -- the
+        // mirror of `write_message`. Two resolves and a nine-field copy were
+        // needed only while the helpers took `&self`/`&mut self`; giving them
+        // the arena as a SLICE lets `buffers` and `bytes` be borrowed disjointly.
+        let Self { buffers, bytes, .. } = self;
+        let b = buffers.resolve_mut(buffer)?;
+        let (base, ring, is_message) = (b.base, b.length, b.is_message);
         let mut next_tail = b.tail;
         let mut available = available;
         let next_length;
-        if b.is_message {
-            let (message_length, tail) = self.read_length_prefix(&b, next_tail);
+        if is_message {
+            let (message_length, tail) = Self::read_length_prefix_from(bytes, base, ring, next_tail);
             next_tail = tail;
             available = available.saturating_sub(Self::MESSAGE_LENGTH_BYTES);
             next_length = if message_length > out.len() {
@@ -956,12 +1051,10 @@ where
         }
         let count = next_length.min(available);
         if count != 0 {
-            let slot = out.get_mut(..count);
-            let tail = match slot {
-                Some(slot) => self.read_bytes(&b, slot, next_tail),
+            b.tail = match out.get_mut(..count) {
+                Some(slot) => Self::read_bytes_from(bytes, base, ring, slot, next_tail),
                 None => next_tail,
             };
-            self.buffers.resolve_mut(buffer)?.tail = tail;
         }
         Ok(count)
     }
@@ -975,45 +1068,36 @@ where
     /// the fold on the line after turns back into 0, exactly as `wrap_next`
     /// does. Each index then passes through a `get_mut` that refuses
     /// anything the ring does not own.
-    fn write_bytes(&mut self, b: &StreamBuffer, data: &[u8], head: usize) -> usize {
-        // The two copies the doc above describes, and the two the C makes.
-        // Taken only when the payload fits the ring once -- which is the only
-        // shape that reaches here, because a send larger than the buffer is
-        // refused before this -- so a payload that would wrap more than once
-        // still walks the original loop and behaves exactly as it did.
-        if data.len() <= b.length {
-            let upto = b.length.wrapping_sub(head);
+    /// Takes the byte arena as a SLICE rather than `&mut self`, so a caller can
+    /// hold `&mut` to a descriptor in `self.buffers` at the same time. It asked
+    /// for `&mut self` until 2026-09-25, and that is why `write_message` had to
+    /// copy the whole descriptor out before calling it: under `forbid(unsafe)`
+    /// a `&StreamBuffer` borrowed from `self` cannot coexist with `&mut self`.
+    /// Destructuring `self` into disjoint field borrows is the safe form of what
+    /// C gets for free by holding one pointer.
+    fn write_bytes_into(bytes: &mut [u8], base: usize, ring: usize, data: &[u8], head: usize) -> usize {
+        // The two copies, and the two the C makes. A payload longer than the
+        // ring is refused before this, so that case cannot arrive.
+        if data.len() <= ring {
+            let upto = ring.wrapping_sub(head);
             let first = data.len().min(upto);
-            let from = b.base.wrapping_add(head);
-            if let (Some(dst), Some(src)) = (
-                self.bytes.get_mut(from..from.wrapping_add(first)),
-                data.get(..first),
-            ) {
+            let from = base.wrapping_add(head);
+            if let (Some(dst), Some(src)) =
+                (bytes.get_mut(from..from.wrapping_add(first)), data.get(..first))
+            {
                 dst.copy_from_slice(src);
             }
             let rest = data.len().wrapping_sub(first);
             if rest > 0 {
-                if let (Some(dst), Some(src)) = (
-                    self.bytes.get_mut(b.base..b.base.wrapping_add(rest)),
-                    data.get(first..),
-                ) {
+                if let (Some(dst), Some(src)) =
+                    (bytes.get_mut(base..base.wrapping_add(rest)), data.get(first..))
+                {
                     dst.copy_from_slice(src);
                 }
                 return rest;
             }
             let next = head.wrapping_add(first);
-            return if next >= b.length { 0 } else { next };
-        }
-
-        let mut head = head;
-        for byte in data {
-            if let Some(slot) = self.bytes.get_mut(b.base.wrapping_add(head)) {
-                *slot = *byte;
-            }
-            head = head.wrapping_add(1);
-            if head >= b.length {
-                head = 0;
-            }
+            return if next >= ring { 0 } else { next };
         }
         head
     }
@@ -1021,112 +1105,74 @@ where
     /// `prvReadBytesFromBuffer`.
     ///
     /// Bounded as [`Kernel::write_bytes`] is, and for the same reasons.
-    fn read_bytes(&mut self, b: &StreamBuffer, out: &mut [u8], tail: usize) -> usize {
-        // The mirror of `write_bytes`: two copies rather than a byte at a
-        // time, taken only when the request fits the ring once.
-        if out.len() <= b.length {
-            let upto = b.length.wrapping_sub(tail);
+    /// The mirror of [`Self::write_bytes_into`], and takes the arena the same
+    /// way -- as a slice, so a caller can hold `&mut` to a descriptor in
+    /// `self.buffers` across it. A request longer than the ring cannot arrive:
+    /// `read_message` clamps `count` to `available`, which the ring's spare byte
+    /// holds below `ring`.
+    ///
+    /// It asked for `&mut self` until 2026-09-25 while only ever READING the
+    /// arena, and that single word is why `read_length_prefix` carried its own
+    /// copy of this whole ring walk: with `&self` it could not call this.
+    ///
+    /// In line at both callers: out of line it became a shared symbol and cost
+    /// +12 B, because each caller freezes a different length.
+    #[inline(always)]
+    fn read_bytes_from(bytes: &[u8], base: usize, ring: usize, out: &mut [u8], tail: usize) -> usize {
+        if out.len() <= ring {
+            let upto = ring.wrapping_sub(tail);
             let first = out.len().min(upto);
-            let from = b.base.wrapping_add(tail);
-            if let (Some(dst), Some(src)) = (
-                out.get_mut(..first),
-                self.bytes.get(from..from.wrapping_add(first)),
-            ) {
+            let from = base.wrapping_add(tail);
+            if let (Some(dst), Some(src)) =
+                (out.get_mut(..first), bytes.get(from..from.wrapping_add(first)))
+            {
                 dst.copy_from_slice(src);
             }
             let rest = out.len().wrapping_sub(first);
             if rest > 0 {
-                if let (Some(dst), Some(src)) = (
-                    out.get_mut(first..),
-                    self.bytes.get(b.base..b.base.wrapping_add(rest)),
-                ) {
+                if let (Some(dst), Some(src)) =
+                    (out.get_mut(first..), bytes.get(base..base.wrapping_add(rest)))
+                {
                     dst.copy_from_slice(src);
                 }
                 return rest;
             }
             let next = tail.wrapping_add(first);
-            return if next >= b.length { 0 } else { next };
-        }
-
-        let mut tail = tail;
-        for slot in out.iter_mut() {
-            *slot = self
-                .bytes
-                .get(b.base.wrapping_add(tail))
-                .copied()
-                .unwrap_or(0);
-            tail = tail.wrapping_add(1);
-            if tail >= b.length {
-                tail = 0;
-            }
+            return if next >= ring { 0 } else { next };
         }
         tail
     }
 
     /// The message length, written little-endian across
     /// [`Kernel::MESSAGE_LENGTH_BYTES`] bytes of the ring.
-    fn write_length_prefix(&mut self, b: &StreamBuffer, length: usize, head: usize) -> usize {
-        let bytes = (length as u64).to_le_bytes();
-        // The prefix is bytes in the ring like any other, and `write_bytes`
-        // already wraps in two copies -- this loop was a third hand-rolled
-        // version of the same walk.
-        let prefix = bytes.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&bytes);
-        self.write_bytes(b, prefix, head)
-    }
 
     /// The message length back out, and where the message starts.
     /// Bounded as [`Kernel::read_bytes`] is, and converted for the same
     /// reasons: `tail` is below `length`, `base + length` is at most
     /// `BYTES`, `first` is `min(want, upto)`, and every index passes through
     /// a `get` that refuses anything the ring does not own.
-    fn read_length_prefix(&self, b: &StreamBuffer, tail: usize) -> (usize, usize) {
-        let mut raw = [0_u8; 8];
-        let want = Self::MESSAGE_LENGTH_BYTES;
-
-        // Two reads rather than a byte at a time, the way the write side now
-        // writes it. `read_bytes` would do this, but it needs `&mut self` and
-        // this does not have it.
-        if want <= b.length {
-            let upto = b.length.wrapping_sub(tail);
-            let first = want.min(upto);
-            let from = b.base.wrapping_add(tail);
-            if let (Some(dst), Some(src)) = (
-                raw.get_mut(..first),
-                self.bytes.get(from..from.wrapping_add(first)),
-            ) {
-                dst.copy_from_slice(src);
-            }
-            let rest = want.wrapping_sub(first);
-            if rest > 0 {
-                if let (Some(dst), Some(src)) = (
-                    raw.get_mut(first..want),
-                    self.bytes.get(b.base..b.base.wrapping_add(rest)),
-                ) {
-                    dst.copy_from_slice(src);
-                }
-                return (u64::from_le_bytes(raw) as usize, rest);
-            }
-            let next = tail.wrapping_add(first);
-            let next = if next >= b.length { 0 } else { next };
-            return (u64::from_le_bytes(raw) as usize, next);
-        }
-
-        let mut tail = tail;
-        for i in 0..want {
-            let byte = self
-                .bytes
-                .get(b.base.wrapping_add(tail))
-                .copied()
-                .unwrap_or(0);
-            if let Some(slot) = raw.get_mut(i) {
-                *slot = byte;
-            }
-            tail = tail.wrapping_add(1);
-            if tail >= b.length {
-                tail = 0;
-            }
-        }
-        (u64::from_le_bytes(raw) as usize, tail)
+    /// The prefix is converted at the TARGET's width, not always through `u64`.
+    ///
+    /// This used `[0_u8; 8]` and `u64::from_le_bytes(..) as usize`. On rv32 that
+    /// reads eight bytes as two words and throws the top one away, because
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE` is `size_t` and `size_t` is FOUR bytes
+    /// there. `usize` is the width the C's type actually has on whichever target
+    /// this is, so it is the right one to build.
+    fn read_length_prefix_from(bytes: &[u8], base: usize, ring: usize, tail: usize) -> (usize, usize) {
+        let mut raw = [0_u8; core::mem::size_of::<usize>()];
+        // Delegated. This held its OWN two-copy ring walk plus a byte-at-a-time
+        // fallback -- a third hand-rolled version of the same walk -- and the
+        // only reason was that `read_bytes` asked for `&mut self` when it never
+        // needed it.
+        // A prefix wider than the target's `usize` cannot be represented, and
+        // on the oracle host the two are equal, so this clamp is the identity
+        // wherever the arms are matched.
+        let want = Self::MESSAGE_LENGTH_BYTES.min(raw.len());
+        let next = match raw.get_mut(..want) {
+            Some(slot) => Self::read_bytes_from(bytes, base, ring, slot, tail),
+            None => tail,
+        };
+        (usize::from_le_bytes(raw), next)
     }
 }
 
@@ -1167,6 +1213,7 @@ mod tests {
         64,
         0,
         0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     fn kernel() -> K {

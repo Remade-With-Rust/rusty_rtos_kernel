@@ -243,6 +243,15 @@ macro_rules! system {
             /// Slots for two list items per task, one per timer, and one
             /// end marker per list — rounded up to a power of two.
             pub const ITEMS: usize = $crate::list_slots_for(TASKS, TIMERS, LISTS);
+            /// The timer daemon's mailbox, taken from the config rather than
+            /// from a hardcoded ceiling.
+            ///
+            /// It was `MAX_TIMER_COMMANDS`, a fixed 32, which scaled with
+            /// nothing and so cost the same 768 bytes in a two-task blinker as
+            /// in a twenty-four-task corpus — 39 % of the former's whole
+            /// static footprint. A declared system gets what it declared.
+            pub const TIMER_CMDS: usize =
+                <$cfg as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH;
 
             // A declared priority the config has no ready list for is a
             // compile error, not a create that answers `Err` at startup on
@@ -265,6 +274,7 @@ macro_rules! system {
             pub type Kernel<P, T, H> = $crate::Kernel<
                 $cfg, P, T, H,
                 TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS,
+                TIMER_CMDS,
             >;
 
             /// The declared system: every task and every queue, by name.
@@ -505,7 +515,7 @@ pub(crate) mod tests {
     pub struct NoTrace;
 
     impl Trace for NoTrace {
-// Nothing here reads a task name, so the kernel is told not to build one.
+        // Nothing here reads a task name, so the kernel is told not to build one.
         // Without this the trait default is `true` and every traced event costs a
         // name lookup plus a UTF-8 validation for a sink that drops it: measured
         // at 3.86x on one row (2026-09-21).
@@ -957,6 +967,7 @@ pub(crate) mod tests {
         64,
         0,
         0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     /// `xStreamBufferSetTriggerLevel`'s contract, pinned.
@@ -1072,6 +1083,7 @@ pub(crate) mod tests {
         8,
         1,
         1,
+        { <SliceConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     /// The same declaration driven by a port that COUNTS switch requests,
@@ -1094,6 +1106,7 @@ pub(crate) mod tests {
         8,
         1,
         1,
+        { <SliceConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     /// Tick a kernel whose two equal-priority tasks never block, and count
@@ -1342,6 +1355,7 @@ pub(crate) mod tests {
             2048,
             32,
             4,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
         >;
 
         let declared = core::mem::size_of::<K>();

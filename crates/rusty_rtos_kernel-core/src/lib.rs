@@ -66,6 +66,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// List items a kernel needs for `tasks` tasks: a state item and an event
 /// item each, exactly the two `ListItem_t`s in a C `TCB_t`.
 #[must_use]
+#[inline]
 pub const fn items_for(tasks: usize, timers: usize) -> usize {
     tasks.saturating_mul(2).saturating_add(timers)
 }
@@ -87,6 +88,7 @@ pub const fn items_for(tasks: usize, timers: usize) -> usize {
 /// per timer — because that is a true number and worth being able to say.
 /// This wraps it.
 #[must_use]
+#[inline]
 pub const fn list_slots_for(tasks: usize, timers: usize, lists: usize) -> usize {
     rusty_rtos_core::list::slots_for(items_for(tasks, timers), lists)
 }
@@ -96,6 +98,7 @@ pub const fn list_slots_for(tasks: usize, timers: usize, lists: usize) -> usize 
 /// event lists (`xTasksWaitingToSend`, `xTasksWaitingToReceive`) of every
 /// queue and the one (`xTasksWaitingForBits`) of every event group.
 #[must_use]
+#[inline]
 pub const fn lists_for(max_priorities: u8, queues: usize, groups: usize) -> usize {
     (max_priorities as usize)
         .saturating_add(OVERHEAD_LISTS)

@@ -98,6 +98,7 @@ impl Command {
         }
     }
 
+    #[inline]
     const fn is_from_isr(self) -> bool {
         self.id() >= Self::FIRST_FROM_ISR
     }
@@ -146,14 +147,75 @@ impl Default for Message {
     }
 }
 
+/// A `u64` held as two `u32`s, so it does not force eight-byte alignment.
+///
+/// `Timer` lives in an arena, and an arena slot pays its value's ALIGNMENT as
+/// padding around the generation beside it. `Timer`'s fields sum to 36 bytes,
+/// but two `u64`s aligned the struct to 8 and rounded the slot to 48. Aligned
+/// to 4 it is 40 -- the same as the `Timer_t` the C allocates.
+///
+/// The public API still takes and answers `u64`; only the storage is split.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(target_pointer_width = "32")]
+pub(crate) struct Split64 {
+    lo: u32,
+    hi: u32,
+}
+
+/// On a 64-bit host a `u64` IS one register, so splitting it is pure cost:
+/// every read pays a shift and an or to put back something the machine was
+/// holding whole. Measured on `bench/sb-ir`, `StreamBufferDemo` **149,452,276
+/// against 139,479,427** -- 7.2 % of the oracle, for a representation that
+/// exists to help a machine the oracle is not.
+///
+/// This is STORAGE, not arithmetic: `new` and `get` are lossless and every
+/// value computed from them is identical on both widths, so the conformance
+/// corpus proves the same behaviour either way. The layout already differs by
+/// pointer width (`usize` is four bytes on the targets and eight here), so
+/// this adds no new axis of divergence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(not(target_pointer_width = "32"))]
+pub(crate) struct Split64 {
+    whole: u64,
+}
+
+#[cfg(target_pointer_width = "32")]
+impl Split64 {
+    /// Split a `u64`.
+    pub(crate) const fn new(value: u64) -> Self {
+        Self {
+            lo: (value & 0xFFFF_FFFF) as u32,
+            hi: (value >> 32) as u32,
+        }
+    }
+
+    /// Put it back together.
+    pub(crate) const fn get(self) -> u64 {
+        (self.hi as u64) << 32 | self.lo as u64
+    }
+}
+
+#[cfg(not(target_pointer_width = "32"))]
+impl Split64 {
+    /// Keep it whole.
+    pub(crate) const fn new(value: u64) -> Self {
+        Self { whole: value }
+    }
+
+    /// Hand it back.
+    pub(crate) const fn get(self) -> u64 {
+        self.whole
+    }
+}
+
 /// One software timer: a `Timer_t` without the pointers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timer {
     pub(crate) name: Name,
     /// `xTimerPeriodInTicks`.
-    pub(crate) period: u64,
+    pub(crate) period: Split64,
     /// `pvTimerID`.
-    pub(crate) id: u64,
+    pub(crate) id: Split64,
     /// Which callback the application's hook should run.
     pub(crate) callback: u16,
     /// `ucStatus`.
@@ -174,7 +236,8 @@ impl<
     const BYTES: usize,
     const TIMERS: usize,
     const GROUPS: usize,
-> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS>
+    const TIMER_CMDS: usize,
+> Kernel<C, P, T, H, TASKS, ITEMS, LISTS, QUEUES, SLOTS, BUFFERS, BYTES, TIMERS, GROUPS, TIMER_CMDS>
 where
     H: TickHook<Self>,
 {
@@ -193,7 +256,7 @@ where
     /// The list item a timer sorts by. Task items come first, then one per
     /// timer.
     pub(crate) fn timer_item(timer: TimerHandle) -> u16 {
-        (TASKS.saturating_mul(2) as u16).saturating_add(timer.index())
+        (TASKS.saturating_mul(2) as u16).saturating_add(timer.index() as u16)
     }
 
     // ---------------------------------------------------------- creating --
@@ -228,8 +291,8 @@ where
                 // is thirteen characters and `configMAX_TASK_NAME_LEN` is
                 // twelve.
                 name: Name::new(name, crate::NAME_CAPACITY),
-                period,
-                id,
+                period: Split64::new(period),
+                id: Split64::new(id),
                 callback,
                 status,
             })
@@ -237,17 +300,26 @@ where
         // `prvInitialiseNewTimer` opens with `prvCheckForValidListAndQueue`.
         self.check_for_valid_list_and_queue()?;
         let tick = self.tick;
-        let name = self
-            .timers
-            .resolve(handle)
-            .map(|t| t.name)
-            .unwrap_or_default();
-        self.trace.note_exits(self.port.exits());
+        // Gated, as its sibling `trace_command_send` already was: a sink that
+        // never reads a name pays for neither the resolve nor the copy of the
+        // whole `Name`. And the `as_str` is gated TOO, not just the resolve --
+        // turning even a default `Name` into a `&str` calls
+        // `core::str::from_utf8`, which is 534 bytes of validation this
+        // kernel links for no other reason.
+        let name = if T::WANTS_NAMES {
+            self.timers
+                .resolve(handle)
+                .map(|t| t.name)
+                .unwrap_or_default()
+        } else {
+            Name::default()
+        };
+        self.note_exits();
         self.trace.event(
             tick,
             Event::TimerCreate {
                 timer: handle,
-                name: name.as_str(),
+                name: if T::WANTS_NAMES { name.as_str() } else { "" },
             },
         );
         Ok(handle)
@@ -264,9 +336,20 @@ where
     ///
     /// # Errors
     /// As [`Kernel::queue_create`].
+    // Out of line at BOTH callers: win 29, -8 B of flash and 2 fewer rv32
+    // instructions, against `andi` +1.
+    //
+    // This said "A3: ONE caller in the linked kernel, so this pays a prologue
+    // and epilogue for a single call" and carried `#[inline(always)]`. The
+    // caller count was wrong -- `timer.rs` and `kernel.rs` both call it -- so
+    // A3 never applied, and at two callers `always` DUPLICATES an 86-byte body
+    // rather than moving it. Found by auditing every inline rationale in the
+    // kernel against the actual census, which is the third wrong or
+    // contradictory inline rationale found on 2026-09-25.
+    #[inline(never)]
     pub(crate) fn check_for_valid_list_and_queue(&mut self) -> Result<()> {
         self.enter_critical();
-        let result = if self.timer_queue == QueueHandle::NULL {
+        let result = if self.timer_queue.is_null() {
             match self.queue_create(C::TIMER_QUEUE_LENGTH) {
                 Ok(queue) => {
                     self.timer_queue = queue;
@@ -288,7 +371,7 @@ where
     pub fn timer_id(&mut self, timer: TimerHandle) -> Result<u64> {
         // The C wraps this in a critical section.
         self.enter_critical();
-        let id = self.timers.resolve(timer).map(|t| t.id);
+        let id = self.timers.resolve(timer).map(|t| t.id.get());
         self.exit_critical();
         id
     }
@@ -300,7 +383,7 @@ where
     pub fn timer_set_id(&mut self, timer: TimerHandle, id: u64) -> Result<()> {
         self.enter_critical();
         let result = self.timers.resolve_mut(timer).map(|t| {
-            t.id = id;
+            t.id = Split64::new(id);
         });
         self.exit_critical();
         result
@@ -311,7 +394,7 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn timer_period(&self, timer: TimerHandle) -> Result<u64> {
-        self.timers.resolve(timer).map(|t| t.period)
+        self.timers.resolve(timer).map(|t| t.period.get())
     }
 
     /// `xTimerIsTimerActive`.
@@ -593,6 +676,13 @@ where
     }
 
     fn trace_command_send(&mut self, timer: TimerHandle, command: Command, value: u64) {
+        // Nothing to say, so nothing to build. `trace_failure_or_owe` returns
+        // at once for a sink that emits nothing, but the forty-byte
+        // `OwedTrace::TimerCommandSend` is assembled at THIS call site before
+        // the call, and a `Name` copy with it.
+        if !T::EMITS {
+            return;
+        }
         let tick = self.tick;
         // A sink that never reads a name pays for neither the resolve nor
         // the copy of the whole `Name` that goes with it.
@@ -604,12 +694,14 @@ where
         } else {
             Name::default()
         };
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(
             tick,
             Event::TimerCommandSend {
                 timer,
-                name: name.as_str(),
+                // Gated for the same reason the resolve above is: `as_str` on
+                // even a default `Name` reaches `core::str::from_utf8`.
+                name: if T::WANTS_NAMES { name.as_str() } else { "" },
                 command: command.id(),
                 value,
             },
@@ -625,6 +717,13 @@ where
         command: Command,
         value: u64,
     ) {
+        // Nothing to say, so nothing to build. `trace_failure_or_owe` returns
+        // at once for a sink that emits nothing, but the forty-byte
+        // `OwedTrace::TimerCommandSend` is assembled at THIS call site before
+        // the call, and a `Name` copy with it.
+        if !T::EMITS {
+            return;
+        }
         // A sink that never reads a name pays for neither the resolve nor
         // the copy of the whole `Name` that goes with it.
         let name = if T::WANTS_NAMES {
@@ -649,7 +748,7 @@ where
     /// Put a message in the ring and its index on the queue.
     fn post_timer_message(&mut self, message: Message, ticks: u64) -> Result<Wait<bool>> {
         let slot = self.stage_timer_message(message);
-        match self.queue_send_generic(self.timer_queue, slot, ticks, Position::Back)? {
+        match self.send_generic_outlined(self.timer_queue, slot, ticks, Position::Back)? {
             Wait::Blocked => Ok(Wait::Blocked),
             Ready(()) => {
                 self.commit_timer_message();
@@ -751,7 +850,7 @@ where
     /// `prvSwitchTimerLists`: everything left on the current list has
     /// expired, so run it, then swap.
     fn switch_timer_lists(&mut self) -> Result<()> {
-        while self.lists.is_empty(self.timer_list()) == Ok(false) {
+        while !self.lists.is_empty_of(self.timer_list()) {
             let next = self.lists.head_value(self.timer_list()).unwrap_or(0);
             self.process_expired_timer(next, Self::MAX_DELAY)?;
         }
@@ -773,7 +872,7 @@ where
         // loops until this list is empty, so an item this cannot resolve —
         // a timer deleted while its entry was still queued — would spin
         // here for ever if the removal came after the lookup.
-        let _ = self.lists.remove(item);
+        let _ = self.lists.unlink(item);
         let Some(timer) = self.timer_of_item(item) else {
             return Ok(());
         };
@@ -802,7 +901,7 @@ where
             let period = self
                 .timers
                 .resolve(timer)
-                .map(|t| t.period)
+                .map(|t| t.period.get())
                 .unwrap_or(1)
                 .max(1);
             let next = expired_at.wrapping_add(period) & Self::MAX_DELAY;
@@ -817,11 +916,11 @@ where
     /// The callback itself, through the application's hook.
     fn fire_timer(&mut self, timer: TimerHandle) {
         let (name, callback, id) = match self.timers.resolve(timer) {
-            Ok(t) => (t.name, t.callback, t.id),
+            Ok(t) => (t.name, t.callback, t.id.get()),
             Err(_) => return,
         };
         let tick = self.tick;
-        self.trace.note_exits(self.port.exits());
+        self.note_exits();
         self.trace.event(
             tick,
             Event::TimerExpired {
@@ -845,11 +944,17 @@ where
         command_time: u64,
     ) -> Result<bool> {
         let item = Self::timer_item(timer);
-        if self.lists.container(item)?.is_some() {
-            let _ = self.lists.remove(item);
-        }
+        // `remove` is its own guard: it answers `NotActive` for an item
+        // in no list, and the container test read the same node to learn
+        // what `remove` was about to say. Same fold as `suspend` and
+        // `add_current_task_to_delayed_list`.
+        let _ = self.lists.unlink(item);
         self.lists.set_value(item, expiry)?;
-        let period = self.timers.resolve(timer).map(|t| t.period).unwrap_or(1);
+        let period = self
+            .timers
+            .resolve(timer)
+            .map(|t| t.period.get())
+            .unwrap_or(1);
         if expiry <= now {
             if now.wrapping_sub(command_time) & Self::MAX_DELAY >= period {
                 return Ok(true);
@@ -919,9 +1024,11 @@ where
             return Ok(Ready(true));
         }
         let item = Self::timer_item(timer);
-        if self.lists.container(item)?.is_some() {
-            let _ = self.lists.remove(item);
-        }
+        // `remove` is its own guard: it answers `NotActive` for an item
+        // in no list, and the container test read the same node to learn
+        // what `remove` was about to say. Same fold as `suspend` and
+        // `add_current_task_to_delayed_list`.
+        let _ = self.lists.unlink(item);
         // `traceTIMER_COMMAND_RECEIVED` is not one of the harness's hooks.
         let (now, _switched) = self.timer_sample_time_now()?;
 
@@ -929,7 +1036,11 @@ where
             if let Ok(t) = self.timers.resolve_mut(timer) {
                 t.status |= STATUS_ACTIVE;
             }
-            let period = self.timers.resolve(timer).map(|t| t.period).unwrap_or(1);
+            let period = self
+                .timers
+                .resolve(timer)
+                .map(|t| t.period.get())
+                .unwrap_or(1);
             let expiry = message.value.wrapping_add(period) & Self::MAX_DELAY;
             if self.insert_timer_in_active_list(timer, expiry, now, message.value)? {
                 let auto = self
@@ -951,13 +1062,17 @@ where
         } else if message.command.is_change_period() {
             if let Ok(t) = self.timers.resolve_mut(timer) {
                 t.status |= STATUS_ACTIVE;
-                t.period = message.value;
+                t.period = Split64::new(message.value);
             }
-            let period = self.timers.resolve(timer).map(|t| t.period).unwrap_or(1);
+            let period = self
+                .timers
+                .resolve(timer)
+                .map(|t| t.period.get())
+                .unwrap_or(1);
             let expiry = now.wrapping_add(period) & Self::MAX_DELAY;
             let _ = self.insert_timer_in_active_list(timer, expiry, now, now)?;
         } else if message.command == Command::Delete {
-            let _ = self.timers.remove(timer);
+            let _ = self.timers.discard(timer);
             // `vPortFree( pxTimer )`, which every `heap_N.c` wraps in
             // `vTaskSuspendAll` / `xTaskResumeAll` exactly as it wraps
             // malloc -- so a delete costs one outermost critical-section
@@ -1023,6 +1138,7 @@ mod tests {
         0,
         2,
         0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
     >;
 
     /// A started kernel with the daemon PARKED, so a queued command stays

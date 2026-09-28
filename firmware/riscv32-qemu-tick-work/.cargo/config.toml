@@ -14,4 +14,16 @@ target = "riscv32imac-unknown-none-elf"
 # three runs read 199,902 / 199,902 / 199,902 -- identical to the
 # instruction. That is the difference between a number and a measurement.
 runner = "qemu-system-riscv32 -machine virt -cpu rv32 -nographic -semihosting-config enable=on,target=native -bios none -icount shift=0 -kernel"
-rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-Tlink.x"]
+# ★ `+relax` because the C arm of this bench is clang-built and clang enables
+# `-mrelax` by DEFAULT, while rustc does not. Without it every one of our calls
+# is an eight-byte `auipc`+`jalr` where the C arm gets a four-byte `jal` -- two
+# instructions against one, on a bench that counts instructions. The rows were
+# comparing a relaxed C arm against an unrelaxed Rust one.
+#
+# It is an UNSTABLE `-C target-feature`, which is worth knowing: a stable
+# toolchain cannot produce these numbers today.
+rustflags = [
+    "-C", "link-arg=-Tmemory.x",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "target-feature=+relax",
+]
