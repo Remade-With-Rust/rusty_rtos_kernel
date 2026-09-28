@@ -1123,7 +1123,7 @@ where
             // `check_for_timeout` above already resolved the TCB and wrote
             // this field; `remaining_ticks` resolved it a second time to read
             // it back.
-            let ticks_left = left.unwrap_or(0);
+            let ticks_left = left.map_or(0, core::num::NonZeroU64::get);
             self.place_on_event_list(Self::queue_send_list(queue), ticks_left)?;
             self.unlock_queue(queue)?;
             if !self.resume_all() {
@@ -1455,7 +1455,7 @@ where
         }
         // `left` is `Some` here, and it carries the block time
         // `check_for_timeout` has just written into the TCB.
-        self.queue_take_locked(caller, queue, peek, kind, left.unwrap_or(0))
+        self.queue_take_locked(caller, queue, peek, kind, left.map_or(0, core::num::NonZeroU64::get))
     }
 
     /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.

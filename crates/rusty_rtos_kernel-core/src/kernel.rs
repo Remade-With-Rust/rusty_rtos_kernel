@@ -22,6 +22,8 @@ use core::marker::PhantomData;
 
 use rusty_rtos_core::arena::Arena;
 use rusty_rtos_core::config::Config;
+use core::num::NonZeroU64;
+
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{
     EventGroup as EventGroupKind, EventGroupHandle, Queue as QueueKind, QueueHandle,
@@ -3762,7 +3764,27 @@ where
     /// immediately afterwards by resolving the TCB again, which
     /// the same TCB out of the arena again to read the very field the match
     /// below has just written.
-    pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> Option<u64> {
+    /// ★ `Option<NonZeroU64>`, not `Option<u64>`, and the reason is the
+    /// CALLER's register budget.
+    ///
+    /// `Option<u64>` has no niche, so it is sixteen bytes — two registers —
+    /// and `queue_take_blocking` holds it live across the branch that tests
+    /// it. That function sits at a register cliff: six callee-saved pushes, a
+    /// 72-byte frame, `caller`'s index spilled and re-read five times, and
+    /// four separate attempts to make it cheaper all LOST because each added a
+    /// live value or a branch (+200,668, +11,619, +254,429, +624,386; see
+    /// `docs/LEDGER.md`). The one shape left is to make an existing value
+    /// smaller, which is `rusty-compiler-leverage` B5 — the representation
+    /// change that won −987,806 elsewhere by turning a 16-byte `Option` into
+    /// one word.
+    ///
+    /// `Some(0)` is unreachable, which is what makes this free: the indefinite
+    /// arm answers `MAX_DELAY` (non-zero at either tick width), and the
+    /// still-waiting arm answers `held - elapsed` under `elapsed < held`, so at
+    /// least one. `NonZeroU64::new` therefore maps every reachable `Some` to
+    /// itself; a zero would become `None`, which is the same verdict a caller
+    /// draws from zero ticks left anyway.
+    pub(crate) fn check_for_timeout(&mut self, task: TaskHandle) -> Option<NonZeroU64> {
         self.enter_critical();
         // An aborted delay is not the same as a time out, but it has the
         // same result: stop waiting.
@@ -3800,8 +3822,10 @@ where
                 let held = tcb.wait.ticks.get() & Self::MAX_DELAY;
                 let elapsed = now.wrapping_sub(entering) & Self::MAX_DELAY;
                 if held == Self::MAX_DELAY {
-                    // An indefinite block never times out.
-                    Some(Self::MAX_DELAY)
+                    // An indefinite block never times out. `MAX_DELAY` is
+                    // non-zero at either tick width, so this is always `Some`.
+                    debug_assert_ne!(Self::MAX_DELAY, 0, "MAX_DELAY must be non-zero");
+                    NonZeroU64::new(Self::MAX_DELAY)
                 } else if overflows != tcb.wait.overflows && now >= entering {
                     tcb.wait.ticks = crate::timer::Split64::new(0);
                     None
@@ -3810,7 +3834,11 @@ where
                     tcb.wait.ticks = crate::timer::Split64::new(left);
                     tcb.wait.entering = crate::timer::Split64::new(now);
                     tcb.wait.overflows = overflows;
-                    Some(left)
+                    // `elapsed < held` on this arm, so `left` is at least one
+                    // and this is always `Some`. The assert is what keeps the
+                    // niche honest if that ever stops being true.
+                    debug_assert_ne!(left, 0, "left must be non-zero on the still-waiting arm");
+                    NonZeroU64::new(left)
                 } else {
                     tcb.wait.ticks = crate::timer::Split64::new(0);
                     None
