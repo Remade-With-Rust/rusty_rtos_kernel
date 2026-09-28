@@ -1604,7 +1604,7 @@ where
         // cursor, so it is its own emptiness probe and the level that loses
         // is left exactly as it was found.
         let mut top = self.top_ready_priority;
-        // â˜… `Err` is folded into "that level is empty" below, and the fold IS
+        // ★ `Err` is folded into "that level is empty" below, and the fold IS
         // the win: with three arms the walk carried a packed
         // `Result<Option<ItemId>>` across the back edge -- a `setb`/`shl`/`or`
         // to build it and a `test`/`jne` to take it apart, on every one of the
