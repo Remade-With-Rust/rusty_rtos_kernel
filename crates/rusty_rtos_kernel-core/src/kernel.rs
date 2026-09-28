@@ -236,8 +236,27 @@ pub(crate) struct Tcb {
     /// `mul`. It is a deliberate flash-for-RAM trade: 254 bytes of flash
     /// against 36 bytes of RAM per task, so it pays below roughly eight tasks
     /// and is the owner's call above that.
-    _stride_pad: [u32; 9],
+    _stride_pad: [u32; STRIDE_PAD_WORDS],
 }
+
+/// How many `u32`s of [`Tcb::_stride_pad`] it takes to make `Slot<Tcb>` a power
+/// of two, which is what keeps `index * stride` a shift instead of a multiply.
+///
+/// It differs by pointer width because the fields it pads out do: `usize` and
+/// the `Name` alignment (see [`crate::name::Name`], aligned to eight on a
+/// 64-bit host only) both change size. Nine words gives 128 bytes on a 32-bit
+/// target -- the number `bench/kernel-ram` pins and `bench/kernel-flash`'s
+/// `mul = 0` depends on -- and four gives 128 on the host.
+///
+/// Before this was split, the host slot was 144 bytes and every TCB index cost
+/// a `lea`+`shl` where a power-of-two stride costs one `shl`.
+#[cfg(target_pointer_width = "64")]
+pub(crate) const STRIDE_PAD_WORDS: usize = 4;
+
+/// See the 64-bit case above; nine words is what makes an rv32 `Slot<Tcb>` 128
+/// bytes, and that number is pinned by two benches.
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const STRIDE_PAD_WORDS: usize = 9;
 
 /// How many notification slots a task has room for.
 ///
@@ -1395,7 +1414,7 @@ where
             stream_timed: false,
             stream_waited: false,
             stream_local: 0,
-            _stride_pad: [0; 9],
+            _stride_pad: [0; STRIDE_PAD_WORDS],
         };
         let handle = match self.tcbs.try_insert(tcb) {
             Ok(h) => h,
