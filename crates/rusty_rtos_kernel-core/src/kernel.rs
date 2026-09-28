@@ -3984,8 +3984,34 @@ where
     }
 
     /// `vTaskPlaceOnEventList`: sorted by priority, then blocked.
+    // The attribute is load-bearing and the measurement is the reason. The
+    // bound proof below grew this function past LLVM's own inlining threshold,
+    // and outlining it turned a -668,718 row win in `queue_take_blocking` into
+    // a **+154,439 LOSS on the program** -- A3: the frame and the argument
+    // marshalling cost more than the proof saves. Asking for the inline puts it
+    // back to -96,574.
+    //
+    // `#[inline]` and `#[inline(always)]` measured IDENTICALLY here, on both
+    // axes, so the weaker word is the honest one: the 22 bytes of rv32 flash
+    // this costs are the bound check duplicated at each site, not the
+    // attribute's doing.
+    #[inline]
     pub(crate) fn place_on_event_list(&mut self, list: ListId, ticks: u64) -> Result<()> {
         let current = self.current;
+        // B1, and the bound is the whole point: `event_item` is
+        // `TASKS.saturating_add(index)`, which tells LLVM only that the result
+        // fits a `u16` -- so `insert_keeping_value` still emits its own check
+        // that the item names a real node, and the saturate costs a `mov` and a
+        // `cmov` besides. Proving the index here instead makes the sum provably
+        // below `2 * TASKS`, and both of those fold.
+        //
+        // It has to be proved HERE rather than relied on: `self.current` is a
+        // live task on every path that reaches this function, but the calls in
+        // between take `&mut self`, so LLVM cannot carry that across them.
+        if current.index() as usize >= TASKS {
+            self.note_stall(Stall::ListError);
+            return Err(Error::Gone);
+        }
         let item = Self::event_item(current);
         // The item keeps the value its call set; reading it out only to
         // hand it back made the list read the item twice and write it once
