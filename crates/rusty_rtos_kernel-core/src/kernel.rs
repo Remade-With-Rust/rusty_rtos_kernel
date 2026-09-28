@@ -1585,10 +1585,28 @@ where
         // cursor, so it is its own emptiness probe and the level that loses
         // is left exactly as it was found.
         let mut top = self.top_ready_priority;
+        // â˜… `Err` is folded into "that level is empty" below, and the fold IS
+        // the win: with three arms the walk carried a packed
+        // `Result<Option<ItemId>>` across the back edge -- a `setb`/`shl`/`or`
+        // to build it and a `test`/`jne` to take it apart, on every one of the
+        // 1.58 levels a call walks. Two arms took this function from 168.0 to
+        // 157.7 Ir per call, -937,965 on `bench/kernel-ir`, all of it here.
+        //
+        // But an out-of-range list id is a different fault from an empty level,
+        // and the fold alone would have reported it as `NoReadyTask`. So it is
+        // proved HERE instead, once, where it can still name itself:
+        // `ready_list` is the identity, so the only way the walk can index out
+        // of range is a `top_ready_priority` above the configured ceiling.
+        // That is the diagnostic bought back, and the cost of buying it is in
+        // the commit message beside the fold's.
+        if top >= C::MAX_PRIORITIES {
+            self.note_stall(Stall::ListError);
+            return;
+        }
         let item = loop {
             match self.lists.next_round_robin(Self::ready_list(top)) {
                 Ok(Some(item)) => break item,
-                Ok(None) => {
+                Ok(None) | Err(_) => {
                     if top == 0 {
                         // The C `configASSERT( uxTopPriority )`. The idle
                         // task keeps priority 0 non-empty, so reaching here
@@ -1601,10 +1619,6 @@ where
                     }
                     // At least 1: the arm above returns at zero.
                     top = top.wrapping_sub(1);
-                }
-                Err(_) => {
-                    self.note_stall(Stall::ListError);
-                    return;
                 }
             }
         };
