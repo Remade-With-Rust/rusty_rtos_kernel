@@ -39,6 +39,7 @@ type IpcKernel = Kernel<
     2048,
     32,
     4,
+    { <PosixDemoConfig as rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
 >;
 
 const ROUNDS: u32 = 2_000;
