@@ -66,7 +66,16 @@ use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::NoTrace;
 use rusty_rtos_kernel_core::kernel::NotifyAction;
 use rusty_rtos_kernel_core::{list_slots_for, lists_for, Kernel};
-use rusty_rtos_port_core::sim::SimPort;
+// `--features real-port` runs the kernel on the SHIPPED port. Without it the
+// rows measure the kernel on `SimPort` -- which is what every rv32 row on the
+// scorecard has been until 2026-09-30, and it charges Kairos for the sim's
+// software clock (an unwinding marker in every `hand_over`, an exits tally in
+// every critical-section exit). Neither exists on `RiscvPort`, whose
+// `begin_unwind` is a no-op and whose critical section is `csrrci`/`csrsi`.
+#[cfg(not(feature = "real-port"))]
+use rusty_rtos_port_core::sim::SimPort as BenchPort;
+#[cfg(feature = "real-port")]
+use rusty_rtos_port_riscv::RiscvPort as BenchPort;
 use rusty_rtos_port_riscv::minstret;
 
 /// How many samples per row. The same 512 the C arm uses, and the same 512
@@ -110,7 +119,7 @@ const GROUPS: usize = 1;
 
 type K = Kernel<
     MatchedConfig,
-    SimPort,
+    BenchPort,
     NoTrace,
     NoTickHook,
     TASKS,
@@ -183,7 +192,7 @@ fn main() -> ! {
     hprintln!("TAX median={}", tax);
 
     // ----------------------------------------------------------- the setup --
-    let mut kernel = match K::new(SimPort::new(), NoTrace) {
+    let mut kernel = match K::new(BenchPort::new(), NoTrace) {
         Ok(k) => k,
         Err(_) => fail("the kernel geometry was refused"),
     };
@@ -578,7 +587,8 @@ fn main() -> ! {
     // arms did different work and the comparison is void.
     hprintln!();
     hprintln!(
-        "ANCHOR samples={} tick_calls={} switch_calls={} tick_count={}",
+        "ANCHOR port={} samples={} tick_calls={} switch_calls={} tick_count={}",
+        if cfg!(feature = "real-port") { "RiscvPort" } else { "SimPort" },
         SAMPLES,
         2 * SAMPLES * REPEAT,
         SAMPLES * REPEAT,

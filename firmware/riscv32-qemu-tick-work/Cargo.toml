@@ -40,6 +40,10 @@ overflow-checks = false
 [workspace]
 
 [features]
+# Run the kernel on the SHIPPED RISC-V port instead of SimPort. Every row
+# still runs: `switch_context` only selects (the register swap is `yield_now`),
+# and a yield here raises CLINT msip, which stays pending with mie.MSIE clear.
+real-port = []
 # The POISON arm. run.sh builds this cell BOTH ways and requires every row to
 # move by one call's worth; a bracket that measures the loop rather than the
 # callee does not move, and the run fails.
