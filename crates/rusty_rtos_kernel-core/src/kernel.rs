@@ -1689,7 +1689,9 @@ where
         // set, and the rest returns at once unless this task owes
         // something. Neither is duplicated -- the cold half still runs
         // both in full.
-        if self.unwinding.is_null() {
+        // On a `COMMITS_SWITCH` port `unwinding` is never set (see `hand_over`),
+        // and saying so with the const lets LLVM drop the load and the branch.
+        if P::COMMITS_SWITCH || self.unwinding.is_null() {
             // Nothing to settle, which is the shape of almost every call.
             // `settle_unwind` would test `unwinding` and return at once, and
             // the cold half would then re-read the very byte this line reads
@@ -1908,6 +1910,10 @@ where
     /// so this is called once, at the top of [`Kernel::resume_pending`],
     /// which is the first thing the runner does.
     fn settle_unwind(&mut self) {
+        // Never anything to settle on a port that commits its own switches.
+        if P::COMMITS_SWITCH {
+            return;
+        }
         // Nothing to settle is the common case by a wide margin, and `take()`
         // writes `None` back even then -- a store, on every call, to clear a
         // slot that was already clear. Peeking first leaves the store for the
@@ -2099,7 +2105,16 @@ where
     fn hand_over(&mut self, incoming: TaskHandle) {
         // A tail that switches again is still the first frame's tail: the
         // code after the second switch is on the same abandoned stack.
-        if self.unwinding.is_null() {
+        // The unwinding marker exists for a port that does NOT commit the switch:
+        // there `switch_context` returns into the OUTGOING task's Rust frame,
+        // whose tail then runs on an abandoned stack and must be tallied rather
+        // than counted. A `COMMITS_SWITCH` port saves the registers itself and
+        // resumes the incoming task in ITS frame; nothing is abandoned, its
+        // `begin_unwind` is a no-op and its `end_unwind` answers 0 -- so on
+        // those ports this only forced `resume_pending` down its cold path
+        // once per switch to settle a tally of zero. The const folds the whole
+        // thing away on silicon and leaves the sim untouched.
+        if !P::COMMITS_SWITCH && self.unwinding.is_null() {
             self.unwinding = self.current;
             self.port.begin_unwind();
         }
