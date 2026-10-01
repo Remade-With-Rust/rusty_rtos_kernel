@@ -58,6 +58,13 @@ fn idle_wait() {
     pend_switch();
 }
 
+/// The latency decomposition is an S3 instrument; here it is switched off.
+const DECOMPOSE: bool = false;
+
+fn mark(_: Mark) {}
+
+fn mark_done(_: usize, _: u32, _: u32, _: u32) {}
+
 fn report_done(passed: bool) -> ! {
     std::process::exit(if passed { 0 } else { 1 })
 }

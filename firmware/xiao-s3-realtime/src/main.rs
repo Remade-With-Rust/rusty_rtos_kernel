@@ -61,6 +61,21 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // same file runs on OS threads in `host/`, as a functional check before a flash.
 include!("workload.rs");
 
+#[cfg(feature = "decompose")]
+mod decompose;
+#[cfg(feature = "decompose")]
+use decompose::{done as mark_done, mark};
+
+const DECOMPOSE: bool = cfg!(feature = "decompose");
+
+#[cfg(not(feature = "decompose"))]
+#[inline(always)]
+fn mark(_: Mark) {}
+
+#[cfg(not(feature = "decompose"))]
+#[inline(always)]
+fn mark_done(_: usize, _: u32, _: u32, _: u32) {}
+
 // ------------------------------------------------- what the workload needs --
 
 /// Cycles per microsecond at the S3's 240 MHz.
@@ -85,6 +100,8 @@ fn idle_wait() {
 }
 
 fn report_done(_passed: bool) -> ! {
+    #[cfg(feature = "decompose")]
+    decompose::report();
     loop {
         delay(1_000_000);
     }
@@ -173,6 +190,7 @@ fn clear_alarm(cell: &AlarmCell) {
 #[esp_hal::ram]
 #[unsafe(export_name = "Software0")]
 fn switching_interrupt(trap_frame: &mut Context) {
+    mark(Mark::SwIn);
     clear_switch_request();
     let from = CURRENT.load(Ordering::Acquire) as usize;
     let to = with_kernel_in_isr(|k| {
@@ -180,10 +198,12 @@ fn switching_interrupt(trap_frame: &mut Context) {
         k.current().index() as usize
     })
     .unwrap_or(from);
+    mark(Mark::SwKernelOut);
     if from == to || to >= CONTEXTS {
         return;
     }
     note_switch(from, to);
+    mark(Mark::SwNoted);
     CURRENT.store(to as u32, Ordering::Release);
     // SAFETY: single core; this handler is the only reader or writer of the
     // store while a switch is in progress, and both indices are < CONTEXTS.
@@ -192,6 +212,7 @@ fn switching_interrupt(trap_frame: &mut Context) {
         let base = (&raw mut CONTEXTS_STORE).cast::<Context>();
         switch_context(Some(base.add(from)), base.add(to), trap_frame);
     }
+    mark(Mark::SwOut);
 }
 
 /// `SYSTIMER` alarm 0: the 1 kHz tick.
@@ -209,9 +230,11 @@ fn tick_interrupt() {
 fn irq_source() {
     let stamp = get_cycle_count();
     clear_alarm(&IRQ_ALARM);
+    mark(Mark::Cleared);
     if irq_fire(stamp) {
         yield_now();
     }
+    mark(Mark::Raised);
 }
 
 extern "C" fn task_entry(task_fn: usize, param: usize) {
@@ -331,6 +354,13 @@ fn main() -> ! {
     unsafe {
         *KERNEL.0.get() = Some(kernel);
     }
+
+    // Before any interrupt that could reach the kernel is started: one bare
+    // esp-hal interrupt's entry and exit, on their own.
+    #[cfg(feature = "decompose")]
+    decompose::probe_entry_exit(esp_hal::interrupt::software::SoftwareInterrupt::new(
+        peripherals.FROM_CPU_INTR1,
+    ));
 
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
     // Each alarm goes into the cell its handler clears BEFORE it is started. A

@@ -14,6 +14,9 @@ long = []
 # The negative control: the mutex becomes a binary semaphore, which has no
 # priority inheritance, so the two inheritance checks must FAIL.
 no-inherit = []
+# Cut the interrupt -> task latency into ten stamped segments, and measure one
+# bare esp-hal interrupt's entry and exit; see src/decompose.rs.
+decompose = []
 
 [dependencies]
 rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }

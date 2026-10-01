@@ -19,6 +19,10 @@
 //
 // and its scheduler hook calls `note_switch(from, to)` on every switch, after
 // publishing the idle task's slot in `IDLE_SLOT`.
+//
+// For the latency decomposition (`--features decompose` on the S3) it also
+// supplies `const DECOMPOSE: bool`, `fn mark(Mark)` and
+// `fn mark_done(slot, a, j, k)`; elsewhere they are no-ops.
 //   const REALTIME: bool              whether timing checks are meaningful
 //   const RUN_MS: u32
 //   fn report_done(passed: bool) -> !
@@ -364,6 +368,22 @@ fn park_if_stopped() {
 
 // ------------------------------------------------------ the interrupt source --
 
+/// The points along interrupt -> task that `--features decompose` stamps, in
+/// path order; see `src/decompose.rs`. The workload marks C and D; the S3
+/// handlers mark the rest.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum Mark {
+    Cleared = 1,
+    KernelIn = 2,
+    KernelOut = 3,
+    Raised = 4,
+    SwIn = 5,
+    SwKernelOut = 6,
+    SwNoted = 7,
+    SwOut = 8,
+}
+
 /// One firing of the interrupt source, called in interrupt context with the
 /// stamp taken at its first statement. Wakes one of three priority-5 tasks,
 /// rotating notify -> queue -> semaphore. `true` when a switch is owed.
@@ -376,6 +396,7 @@ fn irq_fire(stamp: u32) -> bool {
     if let Some(c) = IRQ_FIRED.get(which) {
         c.fetch_add(1, Ordering::Relaxed);
     }
+    mark(Mark::KernelIn);
     let woken = with_kernel_in_isr(|k| match which {
         0 => k
             .notify_from_isr(task_h(&H_IRQ_N), 0, stamp, NotifyAction::Overwrite)
@@ -386,6 +407,7 @@ fn irq_fire(stamp: u32) -> bool {
             k.semaphore_give_from_isr(queue_h(&H_IRQ_S))
         }
     });
+    mark(Mark::KernelOut);
     match woken {
         Some(Ok(w)) => w.needed(),
         _ => {
@@ -397,10 +419,33 @@ fn irq_fire(stamp: u32) -> bool {
 
 // ---------------------------------------------------------------- the tasks --
 
-fn record_irq(slot: usize, hist: &Hist, stamp: u32) {
+/// `block_on` for the woken interrupt tasks: also the moment the task came
+/// back from the call that blocked it (point J of the decomposition).
+fn block_on_resumed<T>(mut f: impl FnMut(&mut K) -> Result<Wait<T>>) -> Option<(T, u32)> {
+    let mut resumed = 0;
+    loop {
+        match with_kernel(|k| f(k))? {
+            Ok(Wait::Ready(value)) => return Some((value, resumed)),
+            Ok(Wait::Blocked) => {
+                if DECOMPOSE {
+                    resumed = cycles();
+                }
+            }
+            Err(_) => {
+                KERNEL_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+    }
+}
+
+fn record_irq(slot: usize, hist: &Hist, stamp: u32, resumed: u32) {
     let now = cycles();
     if GO.load(Ordering::Relaxed) {
         hist.record(now.wrapping_sub(stamp));
+        if DECOMPOSE && resumed != 0 {
+            mark_done(slot, stamp, resumed, now);
+        }
         if let Some(c) = IRQ_GOT.get(slot) {
             c.fetch_add(1, Ordering::Relaxed);
         }
@@ -409,8 +454,8 @@ fn record_irq(slot: usize, hist: &Hist, stamp: u32) {
 
 extern "C" fn task_irq_notify(_: usize) -> ! {
     loop {
-        if let Some(stamp) = block_on(|k| k.notify_take(0, true, FOREVER)) {
-            record_irq(0, &LAT_NOTIFY, stamp);
+        if let Some((stamp, resumed)) = block_on_resumed(|k| k.notify_take(0, true, FOREVER)) {
+            record_irq(0, &LAT_NOTIFY, stamp, resumed);
         }
         park_if_stopped();
     }
@@ -418,8 +463,8 @@ extern "C" fn task_irq_notify(_: usize) -> ! {
 
 extern "C" fn task_irq_queue(_: usize) -> ! {
     loop {
-        if let Some(stamp) = block_on(|k| k.queue_receive(queue_h(&H_IRQ_Q), FOREVER)) {
-            record_irq(1, &LAT_QUEUE, stamp as u32);
+        if let Some((stamp, resumed)) = block_on_resumed(|k| k.queue_receive(queue_h(&H_IRQ_Q), FOREVER)) {
+            record_irq(1, &LAT_QUEUE, stamp as u32, resumed);
         }
         park_if_stopped();
     }
@@ -427,8 +472,8 @@ extern "C" fn task_irq_queue(_: usize) -> ! {
 
 extern "C" fn task_irq_sem(_: usize) -> ! {
     loop {
-        if block_on(|k| k.semaphore_take(queue_h(&H_IRQ_S), FOREVER)).is_some() {
-            record_irq(2, &LAT_SEM, IRQ_SEM_STAMP.load(Ordering::Relaxed));
+        if let Some(((), resumed)) = block_on_resumed(|k| k.semaphore_take(queue_h(&H_IRQ_S), FOREVER)) {
+            record_irq(2, &LAT_SEM, IRQ_SEM_STAMP.load(Ordering::Relaxed), resumed);
         }
         park_if_stopped();
     }
