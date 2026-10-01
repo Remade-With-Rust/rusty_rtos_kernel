@@ -256,7 +256,7 @@ Levers, by predicted saving on notify:
 | Kernel queue/semaphore wake paths | up to ~-350 on those mechanisms | `rusty_rtos_kernel` |
 | Interrupt-path kernel code in IRAM | the tails, if (5) holds | linker |
 
-## The four fixes (built 2026-10-01; board numbers pending)
+## The four fixes (built and measured 2026-10-01)
 
 | fix | how to select it | predicted (notify) |
 |---|---|---|
@@ -286,4 +286,49 @@ Notes on each:
   esp-hal's `esp32s3.x` inlined and one block added, because that block must follow esp-hal's
   last `INSERT` and precede its `.text`. D/IRAM is one physical SRAM, so the script reserves
   matching DRAM, and an `ASSERT` fails the link if `.data` could overlap the moved code.
+
+### Measured: `board-sweep.ps1`, 2026-10-01 (all five PASS, 0 incoherent events)
+
+Every build carries `decompose` (about 96 cycles of stamps), and the kernel fix is in all five.
+
+| build | notify p50 | queue p50 | semaphore p50 | notify p99 | notify max | control p99.9 | notify cycles (sum) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 6.26 us | 7.60 | 7.33 | 8.26 | 62.70 | 41.73 | 1,498 |
+| + switch-in-trap | **5.06** | **6.26** | **6.00** | 9.20 | 63.50 | *60.80* | 1,203 |
+| + no FP save | **5.86** | **7.06** | **6.93** | 13.73 | 69.82 | *65.06* | 1,356 |
+| + iram | 6.26 | 7.60 | 7.33 | **6.40** | **17.87** | 38.53 | 1,496 |
+| **all three** | **4.53** | **5.73** | **5.60** | **4.66** | **15.91** | 37.06 | **1,072** |
+
+All three together: interrupt -> task **-28 % (notify), -25 % (queue), -24 % (semaphore)** at p50,
+the p99 from 8.26 to 4.66 us, and the worst case from 62.7 to 15.9 us.
+
+Against the predictions:
+
+1. **switch-in-trap: -295 cycles, predicted ~-360.** The second trap is gone (E>F 345 -> 4). But
+   trap exit + resume rose 100 -> 156: the alarm's trap now exits through esp-hal's peripheral
+   dispatcher, which finishes its pending-source loop, where `Software0` exited by the short
+   CPU-internal path.
+2. **No FP save: -142 cycles, predicted -100..-150.** The context copy fell 347 -> 247, the trap
+   pair 345 -> 314, and exit + resume 100 -> 84. A bare peripheral trap's entry and exit fell
+   465 / 169 -> 451 / 152.
+3. **The kernel's single resolve: the queue's and the semaphore's call made again fell 340 ->
+   292 and 308 -> 260** (-48 each), against the run before it. Notify is unchanged at 140.
+4. **IRAM: p50 unchanged, as predicted, and the tails were the instruction cache.** The kernel
+   segments' worst cases collapse: `_from_isr` max 4,788 -> 314 cycles, the call made again
+   5,142 -> 2,069, `irq_fire` 2,322 -> 87. Notify's max fell 62.7 -> 17.9 us and its p99
+   8.26 -> 6.40.
+
+Two findings the fixes did not predict:
+
+- **Fixes 1 and 2 alone made the control loop's tail WORSE** (p99.9 41.7 -> 60.8 and 65.1 us), and
+  **with IRAM it is better than baseline** (37.1 us). A change that moves code in flash moves the
+  cache conflicts with it, so in a flash build the tail is set by layout rather than by the code.
+  Ship them together.
+- **The event-group skew's one-tick p99 (1,160 us) disappears in every IRAM build** (30.5 and
+  11.1 us). The round-robin explanation recorded above does not predict that; it is reopened.
+
+What remains in the tails: trap exit + task resume keeps a ~2,850-cycle max in every build,
+and every mechanism's p99.9 stays at 11–15 us. The likely cause is the tick and the interrupt
+source landing in the same window (997 us against 1,000 us beat about every third of a second).
+That is untested.
 
