@@ -10,7 +10,7 @@
 //! | notify / queue / semaphore `_from_isr` | `SYSTIMER` alarm 1, 997 us, wakes three priority-5 tasks in turn | interrupt -> task latency, per mechanism |
 //! | `delay_until`, preemption | a 2 ms control loop at priority 4 doing fixed work | release jitter, deadline misses |
 //! | software timers + daemon | a 5 ms auto-reload timer, callback through `TickHook::timer` | callback jitter |
-//! | mutex + priority inheritance | high / medium hog / low holding the mutex, on co-prime periods | high's worst blocking, inheritance observed |
+//! | mutex + priority inheritance | low takes the mutex on tick T; high and a medium hog both wake on T+1, every 12 ms | high's worst blocking, inheritance observed |
 //! | event groups | three tasks rendezvous through `event_group_sync` every 20 ms | release skew |
 //! | message buffers | sequence-numbered, timestamped 16-byte messages every 1 ms | send -> receive latency, loss, corruption |
 //! | idle | the core halts (`waiti`) between events | CPU load |

@@ -6,6 +6,10 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "The xiao-s3-realtime workload, unchanged, on OS threads: every Kairos kernel feature at once, checked for function before it is flashed and timed."
 
+[features]
+# The negative control; see xiao-s3-realtime's Cargo.toml.
+no-inherit = []
+
 [dependencies]
 # The SAME kernel and core sources the S3 firmware builds, by path, so a pass
 # here is a statement about the tree that is about to be flashed.

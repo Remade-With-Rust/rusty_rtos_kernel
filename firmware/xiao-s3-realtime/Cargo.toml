@@ -11,6 +11,9 @@ default = []
 # Run for ten minutes instead of twenty seconds: the worst case only means
 # something over a long run.
 long = []
+# The negative control: the mutex becomes a binary semaphore, which has no
+# priority inheritance, so the two inheritance checks must FAIL.
+no-inherit = []
 
 [dependencies]
 rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }

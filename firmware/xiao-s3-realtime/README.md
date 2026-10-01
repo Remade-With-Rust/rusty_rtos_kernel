@@ -13,7 +13,7 @@ carries its own measurement, taken with Xtensa `ccount` (one cycle = 4.17 ns at
 | `notify_from_isr` / `queue_send_from_isr` / `semaphore_give_from_isr` | `SYSTIMER` alarm 1 every 997 us wakes three priority-5 tasks in turn | interrupt → task latency, per mechanism |
 | `delay_until`, preemption | a 2 ms control loop at priority 4 doing 200 us of fixed work | release jitter, deadline misses |
 | software timers + daemon | a 5 ms auto-reload timer; the callback arrives through `TickHook::timer` | callback jitter |
-| mutex + priority inheritance | high (7 ms) / medium 3 ms CPU hog (11 ms) / low holding the mutex for 500 us (3 ms) | high's worst wait; inheritance observed |
+| mutex + priority inheritance | staged every 12 ms: low takes the mutex on tick T and holds it 2.5 ms; high and a 3 ms medium hog both wake on T+1 | high's worst wait; inheritance observed |
 | event groups | three tasks rendezvous through `event_group_sync` every 20 ms | release skew |
 | message buffers | sequence-numbered, timestamped 16-byte messages every 1 ms | send → receive latency, loss, corruption |
 | idle | the core halts (`waiti`) between events | CPU load |
@@ -24,6 +24,10 @@ carries its own measurement, taken with Xtensa `ccount` (one cycle = 4.17 ns at
 ```sh
 # on the board -- 20 s after a 0.5 s warm-up; `--features long` runs 10 minutes
 cargo +esp run --release
+
+# the negative control: the mutex becomes a binary semaphore (no inheritance),
+# and the two inheritance checks must FAIL
+cargo +esp run --release --features no-inherit
 
 # the same workload on OS threads first: a functional check, no board needed
 cd ../xiao-s3-realtime-host && cargo run --release
@@ -71,11 +75,11 @@ Recorded so the silicon numbers have something to be checked against:
 
 | quantity | predicted | from |
 |---|---|---|
-| CPU load | ~52–56 % | control 10 % + medium hog 27.3 % + low holder ~14 % + high 0.7 %, plus the kernel |
+| CPU load | ~56–60 % | control 10 % + medium hog 25 % + low holder 20.8 % + high 0.4 %, plus the kernel (staged scenario; the first prediction, ~52–56 %, was for the co-prime one) |
 | interrupt → task, p50 | ~3–5 us | `xiao-s3-cycles`: ISR wake 430 cycles + switch 166, plus handler return and resume |
 | control-loop jitter, p99.9 | < 20 us | only the priority-5 tasks and the tick outrank it |
 | timer-callback jitter, max | up to ~200 us | the daemon runs at priority 4, equal to the control loop, and waits out its 200 us of work |
-| high task's mutex wait, max | < 1,150 us (the bound checked) | low's 500 us critical section + up to two control releases + 150 us |
+| high task's mutex wait | p50 ~1.5–1.9 ms; max < 3,050 us (the bound checked) | the ~1.5 ms low has left after T+1, plus control releases; the bound is low's whole 2.5 ms + two control releases + 150 us. With `no-inherit`, >= 4,500 us |
 | deadline misses, lost ticks, lost messages | 0 | |
 
 ## Three defects the host run caught before the board did
@@ -117,4 +121,30 @@ its own min (1,299.97 us), and the CPU load read 99.2 % against a predicted ~54 
 The run's counts are clock-independent, and they stand: 20,061/20,061
 interrupts delivered, 0 of 18,457 messages bad, 909/909 contended waits
 inherited, 0 stalls, 0 errors, and 20,050 ticks in 20,050 ms. Its times do not.
+
+## The second board run (2026-10-01): clock right, inheritance never exercised
+
+`ccount` measured 239 MHz against SYSTIMER, so this run's times are admissible.
+It failed two checks: **0 contended waits out of 2,858**, and so no inheritance
+was seen. The cause was the scenario, not the kernel. Every task wakes on a
+tick; `hi` outranks `lo` when they wake together; and a 500 us hold almost
+never spans the next tick. The first run had contended only because its spins
+took three times as long at 80 MHz. The scenario is now staged (the table
+above), with a negative control.
+
+Staging it found one more defect, on the host: an anchor ahead of the tick
+count makes `delay_until` never block -- FreeRTOS reads it as a tick overflow --
+and `hi` starved everything below priority 3 (`pi_anchor`).
+
+What that run measured, against the predictions made before any board run:
+
+| quantity | predicted | measured | |
+|---|---|---|---|
+| CPU load | ~52–56 % | **52.8 %** | hit |
+| interrupt → task, p50 | ~3–5 us | notify **6.26**, queue **7.46**, semaphore **7.33** us | missed: ~1,500–1,800 cycles, against 430 + 166 for the kernel's share in `xiao-s3-cycles`. The remainder is not yet decomposed; esp-hal's two trap entries (alarm 1, then `Software0`) are the first suspect, untested |
+| control-loop jitter, p99.9 | < 20 us | **34.80** us (max 38.39) | missed |
+| timer-callback jitter | up to ~200 us | p99 **221.86** us; max **1,021.19** us | p99 as predicted (the daemon shares priority 4 with the control loop's 200 us); the max is one tick late, once, unexplained |
+| deadline misses, lost ticks, lost messages | 0 | **0, 0, 0** | hit |
+| interrupts delivered | all | **20,060 / 20,060** | |
+| message buffer, p99 | (not predicted) | **1,100.80** us | `mb_rx` shares priority 2 with the 3 ms hog and waits for the round robin |
 

@@ -52,13 +52,24 @@ const CTRL_WORK_US: u32 = 200;
 const IRQ_PERIOD_US: u64 = 997;
 /// The software timer.
 const TIMER_PERIOD: u64 = 5;
-/// Priority inheritance, on co-prime periods so every phase of the three occurs.
-const HI_PERIOD: u64 = 7;
+/// Priority inheritance, STAGED rather than left to chance. Every `PI_PERIOD`
+/// ticks: `lo` takes the mutex on tick T and holds it for `LO_HOLD_US`; `hi`
+/// and `mid` both wake on T+1. `hi` blocks on the mutex, so `lo` must inherit
+/// its priority -- or `mid`'s burst runs ahead of `lo`, and `hi` waits for it.
+///
+/// The first version used co-prime periods, 7 / 11 / 3 ticks, and a 500 us
+/// hold, and at 240 MHz it never contended once in 2,858 tries: every task
+/// wakes on a tick, `hi` outranks `lo` when they wake together, and a hold
+/// shorter than a tick almost never spans the next one. It had only
+/// contended at 80 MHz, where every spin took three times as long.
+const PI_PERIOD: u64 = 12;
+/// Where `hi` and `mid` sit in the round, ticks after `lo`.
+const PI_OFFSET: u64 = 1;
 const HI_HOLD_US: u32 = 50;
-const MID_PERIOD: u64 = 11;
 const MID_BURST_US: u32 = 3_000;
-const LO_PERIOD: u64 = 3;
-const LO_WORK_US: u32 = 500;
+/// Over two ticks, so `lo` still holds the mutex when `hi` arrives on T+1
+/// even on the host, where a tick runs long.
+const LO_HOLD_US: u32 = 2_500;
 /// Event-group rendezvous period.
 const EV_PERIOD: u64 = 20;
 /// Message-buffer send period, and one message's size.
@@ -457,12 +468,28 @@ extern "C" fn task_ctrl(_: usize) -> ! {
     }
 }
 
-/// Priority inheritance, high: take the mutex, hold it briefly, give it.
+/// The `delay_until` anchor for a task `offset` ticks into the inheritance
+/// round: the latest tick AT OR BEFORE now on that schedule.
+///
+/// Never later than now. `xTaskDelayUntil` reads a previous wake time ahead of
+/// the tick count as a tick-count overflow, does not delay, and moves the
+/// anchor on a period -- so an anchor set in the future never blocks again.
+/// The first staged version started `hi` at `last = 1` on tick 0 and starved
+/// every task below priority 3; the host twin caught it.
+fn pi_anchor(offset: u64) -> u64 {
+    // Make sure `now >= offset`, so the subtraction below cannot wrap.
+    delay(PI_PERIOD);
+    let now = now_tick();
+    now - (now - offset) % PI_PERIOD
+}
+
+/// Priority inheritance, high: on T+1, take the mutex `lo` holds, hold it
+/// briefly, give it.
 extern "C" fn task_pi_hi(_: usize) -> ! {
     let mutex = queue_h(&H_MUTEX);
-    let mut last = now_tick();
+    let mut last = pi_anchor(PI_OFFSET);
     loop {
-        delay_until(&mut last, HI_PERIOD);
+        delay_until(&mut last, PI_PERIOD);
         let t0 = cycles();
         if block_on(|k| k.semaphore_take(mutex, FOREVER)).is_some() {
             let waited = cycles().wrapping_sub(t0);
@@ -483,25 +510,27 @@ extern "C" fn task_pi_hi(_: usize) -> ! {
 /// Priority inheritance, medium: a CPU hog that would starve `lo` -- and with
 /// it the mutex `hi` waits for -- if inheritance did not lift `lo` above it.
 extern "C" fn task_pi_mid(_: usize) -> ! {
-    let mut last = now_tick();
+    let mut last = pi_anchor(PI_OFFSET);
     loop {
-        delay_until(&mut last, MID_PERIOD);
+        delay_until(&mut last, PI_PERIOD);
         spin_us(MID_BURST_US);
         MID_ROUNDS.fetch_add(1, Ordering::Relaxed);
         park_if_stopped();
     }
 }
 
-/// Priority inheritance, low: hold the mutex for a fixed amount of work, and
-/// look at its own priority while it does -- above `P_LO` means it inherited.
+/// Priority inheritance, low: on tick T, hold the mutex for a fixed amount of
+/// work, and look at its own priority while it does -- above `P_LO` means it
+/// inherited.
 extern "C" fn task_pi_lo(_: usize) -> ! {
     let mutex = queue_h(&H_MUTEX);
+    let mut last = pi_anchor(0);
     loop {
-        delay(LO_PERIOD);
+        delay_until(&mut last, PI_PERIOD);
         if block_on(|k| k.semaphore_take(mutex, FOREVER)).is_some() {
             let mut lifted = false;
             for _ in 0..10 {
-                spin_us(LO_WORK_US / 10);
+                spin_us(LO_HOLD_US / 10);
                 let p = with_kernel(|k| k.task_priority_get(None)).and_then(|r| r.ok());
                 lifted |= p.is_some_and(|p| p > P_LO);
             }
@@ -670,7 +699,16 @@ extern "C" fn task_timer(_: usize) -> ! {
 fn build_workload(kernel: &mut K) -> Result<[(TaskHandle, TaskFn); 12]> {
     let irq_q = kernel.queue_create(4)?;
     let irq_s = kernel.semaphore_create_binary()?;
-    let mutex = kernel.mutex_create()?;
+    // `no-inherit` is the negative control: a binary semaphore, given once,
+    // locks exactly like the mutex and has no priority inheritance. Both
+    // inheritance checks must then FAIL -- which is what shows they can.
+    let mutex = if cfg!(feature = "no-inherit") {
+        let s = kernel.semaphore_create_binary()?;
+        kernel.semaphore_give(s)?;
+        s
+    } else {
+        kernel.mutex_create()?
+    };
     let group = kernel.event_group_create()?;
     let mb = kernel.message_buffer_create(128)?;
     let timer = kernel.timer_create("rt5ms", TIMER_PERIOD, true, 0, CB_PERIODIC)?;
@@ -742,6 +780,9 @@ fn finish() -> ! {
 
     println!();
     println!("=== Kairos, every kernel feature at once ===");
+    if cfg!(feature = "no-inherit") {
+        println!("NEGATIVE CONTROL: the mutex is a binary semaphore; both inheritance checks must FAIL");
+    }
     println!(
         "window  {window_ms} ms wall, {window_ticks} ticks, after {WARMUP} warm-up releases; CPU load {}.{}%",
         load_permille / 10,
@@ -767,11 +808,12 @@ fn finish() -> ! {
     let contended = PI_CONTENDED.load(Ordering::Relaxed);
     let inherited = INHERIT_SEEN.load(Ordering::Relaxed);
     let pi_max = PI_BLOCK.max.load(Ordering::Relaxed);
-    // What `hi` may wait for with inheritance working: `lo`'s whole critical
-    // section, plus up to two control-loop releases that outrank both, plus
-    // 150 us of switches and margin. Without inheritance, `mid`'s 3 ms burst
-    // lands inside the wait and blows straight through this.
-    let pi_bound = (LO_WORK_US + 2 * CTRL_WORK_US + 150) * CYC_PER_US;
+    // What `hi` may wait for with inheritance working: at most `lo`'s whole
+    // critical section, plus up to two control-loop releases that outrank
+    // both, plus 150 us of switches and margin -- 3,050 us. Without
+    // inheritance `mid`'s 3 ms burst runs before the ~1.5 ms `lo` has left,
+    // so `hi` waits at least 4,500 us and fails this.
+    let pi_bound = (LO_HOLD_US + 2 * CTRL_WORK_US + 150) * CYC_PER_US;
     let errors = KERNEL_ERRORS.load(Ordering::Relaxed);
     let refused = IRQ_REFUSED.load(Ordering::Relaxed);
     let mb_bad = MB_BAD.load(Ordering::Relaxed);
