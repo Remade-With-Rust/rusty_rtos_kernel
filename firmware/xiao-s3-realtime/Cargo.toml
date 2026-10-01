@@ -1,0 +1,40 @@
+[package]
+name = "xiao-s3-realtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Every Kairos kernel feature at once on a XIAO ESP32-S3, with real-time latency, jitter and deadline measurements on the 1-cycle ccount."
+
+[features]
+default = []
+# Run for ten minutes instead of twenty seconds: the worst case only means
+# something over a long run.
+long = []
+
+[dependencies]
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
+rusty_rtos_port-xtensa = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-xtensa", default-features = false }
+xtensa-lx = "0.12"
+esp-hal = { version = "=1.2.1", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32s3"] }
+esp-println = { version = "=0.18.0", default-features = false, features = [
+    "esp32s3",
+    "jtag-serial",
+] }
+esp-backtrace = { version = "=0.20.0", features = [
+    "esp32s3",
+    "panic-handler",
+    "println",
+] }
+critical-section = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+
+[workspace]

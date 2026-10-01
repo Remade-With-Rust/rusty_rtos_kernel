@@ -1,0 +1,20 @@
+[package]
+name = "xiao-s3-realtime-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "The xiao-s3-realtime workload, unchanged, on OS threads: every Kairos kernel feature at once, checked for function before it is flashed and timed."
+
+[dependencies]
+# The SAME kernel and core sources the S3 firmware builds, by path, so a pass
+# here is a statement about the tree that is about to be flashed.
+rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
+rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false, features = ["std"] }
+rusty_rtos_port-host = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-host" }
+
+[profile.release]
+opt-level = 2
+overflow-checks = true
+
+[workspace]
