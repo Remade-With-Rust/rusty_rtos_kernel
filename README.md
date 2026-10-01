@@ -180,19 +180,46 @@ unmodified**, with the oracle's own first-party RISC-V port.
 
 | rv32, retired instructions per call | FreeRTOS | Kairos | |
 |---|---:|---:|---:|
-| tick, empty delayed list | 15 | 56 | 3.73× |
-| tick, one task delayed | 15 | 56 | 3.73× |
-| scheduler selection | 27 | 79 | 2.93× |
+| tick, empty delayed list | 15 | **9** | **0.60× — faster** |
+| tick, one task delayed | 15 | **9** | **0.60× — faster** |
+| scheduler selection | 27 | **45** | 1.67× against us |
 
-**Two of those are against us and are published as findings, not caveats.**
-But a switch is selection *plus* the register file, and the two kernels put
-their weight in opposite halves — so quoting the selection row alone is
-quoting a third of the answer:
+**Selection is against us and is published as a finding, not a caveat.** Its
+floor is 30, measured by deleting both handle validation and the stackless
+bookkeeping — so the last 15 instructions are the safety and the RAM saving,
+and below 30 is C's data representation, not ours. But a switch is selection
+*plus* the register file, and the two kernels put their weight in opposite
+halves, so quoting the selection row alone is quoting a third of the answer:
 
 | whole switch, rv32 | FreeRTOS | Kairos | |
 |---|---:|---:|---:|
-| cooperative | 27 + 83 = 110 | 79 + 30 = **109** | **parity** |
-| preemptive | 27 + 83 = 110 | 79 + 74 = **153** | 1.39× against us |
+| cooperative (a yield, a queue that blocks, a semaphore take) | 27 + 83 = 110 | 45 + 30 = **75** | **0.68× — 32% faster** |
+| preemptive (a tick or ISR switches you out) | 27 + 83 = 110 | 45 + 74 = **119** | 1.08× against us |
+
+**C pays 110 for every switch**, because its `portYIELD()` is a trap. Kairos
+pays 75 for a yield and 119 for a preemption, and a real application's mix is
+dominated by yields.
+
+These rows hold on the **shipped** RISC-V port, not only on the simulator: the
+bench takes `--features real-port`, which runs the kernel on `RiscvPort` itself.
+
+### Memory and flash, against the C
+
+| | FreeRTOS | Kairos | |
+|---|---:|---:|---:|
+| RAM per task | 596 B (TCB + 512 B stack) | **176 B** | **0.30×** |
+| RAM per event group | 28 B | **8 B** | **0.29×** |
+| RAM per queue | 72 B | **64 B** | 0.89× |
+| static RAM, a blinker | 1,704 B | **1,640 B** | 0.96× |
+| flash, kernel + RISC-V port | 13,924 B | 19,726 B | 1.42× against us |
+
+**Flash is the price of the rows above it.** Decomposed to the byte, the
+structural extra is handle validation (1,464 B — what turns a stale handle
+into a typed error instead of undefined behaviour), the stackless resume
+machinery that deletes the per-task stack, and `u16` list ids; that floor is
+about 1.27×. The rest is speed already spent on the queue fast paths. The RAM
+saved pays for the flash at roughly fourteen tasks — earlier still in the
+resource a microcontroller actually runs out of.
 
 Gated twice: identical work-parity anchors — with the tick count read back, so
 FreeRTOS's `uxSchedulerSuspended` early-out cannot pass as a tick — and a
@@ -202,7 +229,9 @@ and requires every row to move.
 ### On silicon
 
 XIAO ESP32-S3, Xtensa `ccount` at one cycle of resolution, median of 512 with
-the instrument's own tax measured and subtracted:
+the instrument's own tax measured and subtracted. Measured 2026-09-21, before
+the instruction-count work in 0.2.1; not re-measured on silicon for this
+release, so treat them as an upper bound:
 
 | | cycles | at 240 MHz |
 |---|---:|---:|
@@ -224,6 +253,8 @@ measured beside.
 
 ```sh
 bench/tick-work/run.sh       # the tick and selection rows, both arms
+bench/kernel-ram/run.sh      # the RAM rows
+bench/kernel-flash/run.sh    # the flash row
 bench/switch-cost/run.sh     # the register half
 ```
 
