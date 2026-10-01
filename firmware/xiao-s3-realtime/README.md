@@ -173,6 +173,23 @@ cycling through three phases of the 12-tick round, about a third of
 rendezvous would be exposed: p99 a tick, p50 untouched. FreeRTOS would behave
 the same; the workload produces it, not the kernel.
 
-Still to run on the board: `--features no-inherit`, which must FAIL both
-inheritance checks.
+## The negative control on the board (2026-10-01): FAILS, as it must
+
+`--features no-inherit`, same workload, the mutex replaced by a binary
+semaphore:
+
+| quantity | with inheritance | without | |
+|---|---|---|---|
+| high task's mutex wait | p50 1,749.33, max 2,017.02 us | min **4,709.70**, p50 **4,744.53**, max **5,259.14** us | predicted >= 4,500: `mid`'s 3 ms burst lands inside the wait |
+| contended / inheritance seen | 1,667 / 1,667 | 1,667 / **0** | |
+| checks | 9 ok | inheritance bound **FAIL**, inherited priority **FAIL**, 7 ok | |
+| event_group_sync skew, p99 | 1,169.06 us | **25.60** us | |
+
+The two inheritance checks can fail, and fail only when inheritance is absent.
+So the third run's PASS on them is evidence.
+
+The event-group row is a second probe of the hypothesis above. In this run `lo`
+never rises to priority 3, so it cannot share a round robin with the event tasks,
+and the p99 drops from a tick to 25.6 us. The hypothesis survives a probe it
+could have failed. It is not yet confirmed by a direct measurement.
 
