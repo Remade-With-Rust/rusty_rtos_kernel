@@ -256,3 +256,34 @@ Levers, by predicted saving on notify:
 | Kernel queue/semaphore wake paths | up to ~-350 on those mechanisms | `rusty_rtos_kernel` |
 | Interrupt-path kernel code in IRAM | the tails, if (5) holds | linker |
 
+## The four fixes (built 2026-10-01; board numbers pending)
+
+| fix | how to select it | predicted (notify) |
+|---|---|---|
+| 1. switch inside the interrupt's own trap | `--features switch-in-trap` | ~-360 cycles (the second trap, 345, plus the raise) |
+| 2. no FP save/restore | `--no-default-features` (drops `fp-save`) | ~-100..-150 on the context copy, plus cheaper trap saves |
+| 3. the kernel's receive path resolves the queue once | always on (`rusty_rtos_kernel` `42e183b`) | queue and semaphore only: the outlined `copy_data_from_queue` call leaves the call made again |
+| 4. the interrupt path's code in IRAM | `--features iram` (`kairos_iram.x`) | the tails, if they are cache misses; little at p50 |
+
+`board-sweep.ps1` flashes and runs all five combinations that matter (baseline, each firmware
+fix alone, all three together), every one with `decompose`, and keeps each log:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .oard-sweep.ps1
+```
+
+Notes on each:
+
+- **switch-in-trap** relies on esp-hal =1.2.1's dispatcher passing peripheral handlers the
+  trap frame it restores. `#[esp_hal::handler]` accepts `fn(&mut Context)` but fails to
+  type-check it in that version, so `framed()` wires the handler by hand. The pointer is
+  stored as `extern "C" fn()` and called back as exactly the type it began as.
+- **no FP save**: with `float-save-restore` off, xtensa-lx-rt traps with CPENABLE = 0, and the
+  port zero-fills a new task's context, so every task runs with the FPU disabled. A float in a
+  task faults (a coprocessor-disabled exception) instead of corrupting another task's FP state.
+  This is right for this firmware, which uses no floats, and wrong for one that does.
+- **iram**: `build.rs` passes `kairos_iram.x` in place of `linkall.x`. It is `linkall.x` with
+  esp-hal's `esp32s3.x` inlined and one block added, because that block must follow esp-hal's
+  last `INSERT` and precede its `.text`. D/IRAM is one physical SRAM, so the script reserves
+  matching DRAM, and an `ASSERT` fails the link if `.data` could overlap the moved code.
+
