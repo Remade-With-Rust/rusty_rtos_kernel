@@ -1,6 +1,6 @@
 # Threat model — `rusty_rtos_kernel`
 
-**Unit tier:** critical-path. **Model version:** 1, 2026-09-21.
+**Unit tier:** critical-path. **Model version:** 2, 2026-10-01 (v1: 2026-09-21).
 **Scope:** the scheduler, its IPC objects and its timers — `rusty_rtos_kernel-core`
 and the facade over it. The ports, the heaps, the C ABI and the network
 libraries are separate units with their own models; where a risk belongs to
@@ -9,6 +9,13 @@ does not have.
 
 Satisfies `use-protection-please` **H-01**. The secrets position is §5
 (**H-20**); the residual-risk register is §7 (**H-41**).
+
+**Revision 2 (H-02), 2026-10-01**, after the hardening pass that added
+`cargo vet` coverage and a coverage-guided fuzz target over the whole API.
+What changed: §4.3 and §4.5 now cite them; in §7, R-2 is closed, R-3 is
+narrowed to the calendar half of the fuzzing gate, R-7 is closed by this
+revision, and every row has an owner and a review date. The trust boundary
+itself did not move: no new input, no new secret, no new `unsafe`.
 
 ---
 
@@ -107,8 +114,14 @@ unwrap, expect, panic and unchecked arithmetic are lint-denied in library
 code; every fallible path returns `Result`. A no-panic suite pins the
 property.
 
-*Residual:* see §7 — the no-panic suite here is small, and the fuzzing gates
-(H-26, H-27) are not met in this unit.
+*Fuzzed:* `fuzz/kernel_api` drives every public call with arguments chosen
+by libFuzzer -- forged, stale and foreign handles, extreme tick counts,
+lengths past the arenas -- through the SAME dispatcher as `tests/no_panic.rs`
+(`tests/hammer/`), so a crash reproduces as an ordinary test. First run:
+3,738,702 inputs in ten minutes, 2,150 edges, no crash.
+
+*Residual:* see §7 -- continuous fuzzing (H-27) needs thirty nights of the
+scheduled job before it counts.
 
 ### 4.4 Calling an ISR-safe API from a task, or the reverse
 
@@ -126,7 +139,9 @@ resolves in a **fresh clone** rather than only on a developer's box.
 `libc`-linked crates across every repository in the family; `cargo deny
 check` runs in the fleet gate.
 
-*Residual:* `cargo vet` coverage (H-10) is not established — see §7.
+`cargo vet` (`supply-chain/`) covers the whole tree with no exemptions: the
+one dependency, `rusty_rtos_core`, is the house's own and trusted by its
+publisher. CI runs `cargo vet --locked` and `cargo deny check` on every push.
 
 ---
 
@@ -171,17 +186,19 @@ feature.
 ## 7. Residual risks — H-41
 
 Listed, accepted, and each with the condition that closes it. **A waiver
-without a condition is a decision nobody will revisit.**
+without a condition is a decision nobody will revisit.** **Owner:** the
+Architect named in the README's hardening block. **Review:** at every
+release, and no later than 2027-01-01.
 
 | # | residual risk | severity | why accepted for now | closes when |
 |---|---|---|---|---|
 | R-1 | **No privilege separation between tasks.** A hostile task can pass any value to any API and can corrupt any memory it can address. | high | this is what an RTOS is; the mitigation is the MPU package, which is scoped after 1.0 by the mission plan | the MPU unit ships and a firmware runs tasks unprivileged |
-| R-2 | **`cargo vet` coverage not established** (H-10). Dependencies are pinned, denied by policy and locked, but not audited row by row. | medium | the dependency set is deliberately tiny and `*-sys`/`libc` crates are denied outright, so the surface is small | a `supply-chain/` config exists and the fleet gate runs `cargo vet` |
-| R-3 | **No fuzzing in this unit** (H-26, H-27). The kernel parses nothing, so there is no parser to fuzz — but its APIs take adversarial arguments and are not fuzzed. | medium | the API surface is instead covered by a 26-scenario differential, Kani harnesses and a mutation survey | an API-level fuzz target exists and runs continuously |
+| R-2 | ~~`cargo vet` coverage not established (H-10).~~ **Closed 2026-10-01:** `supply-chain/`, zero exemptions, `cargo vet --locked` in CI. | -- | -- | closed |
+| R-3 | **Continuous fuzzing has not yet run 30 days** (H-27). The API-level target exists (`fuzz/kernel_api`, H-26) and ran clean; the nightly job is `scheduled.yml`. | medium | the remaining half of the gate is calendar time | 30 nights of `scheduled.yml` with no open crash |
 | R-4 | **Kani proves the data structures, not the running kernel.** Measured 2026-09-21: harnesses over lists, arenas and names converge in 2–4 s and pass; harnesses that create a task or start the scheduler do **not converge** within 240 s. | medium | the running kernel is covered by the differential and by mutation testing instead; the proofs that do converge cover exactly what a proof is good at | the kernel harnesses converge, or the geometry they run at is shrunk until they do |
 | R-5 | **The corpus is a floor.** Trace-identity proves agreement on what the demos do. An API path no scenario reaches is unproven. | medium | the gap is measured rather than assumed — the unreached set was enumerated and reduced to a documented remainder | a coverage instrument replaces the by-hand enumeration |
 | R-6 | **No hostile-input testing of the C ABI from this unit.** The shim validates every handle and length; that validation is evidenced in the ABI unit, not here. | low | correct ownership: the boundary belongs to the unit that implements it | the ABI unit's own model covers it |
-| R-7 | **Threat model not yet revisited after a major change** (H-02). This is version 1. | low | there has been no major change since it was written | the next change that alters the trust boundary |
+| R-7 | ~~Threat model not yet revisited after a major change (H-02).~~ **Closed 2026-10-01** by revision 2. Reopens at the next change that alters the trust boundary. | -- | -- | closed |
 
 ---
 

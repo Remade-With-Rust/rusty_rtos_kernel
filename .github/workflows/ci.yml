@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # No token, and that is the point.
@@ -24,9 +27,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
         with:
+          toolchain: stable
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -36,12 +40,56 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.19.9
       # The permissive-only, no-C posture deny.toml states, checked on every
       # push rather than by hand.
       - run: cargo deny check
+
+  vet:
+    name: cargo vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-vet@0.10.2
+      # --locked: audit against supply-chain/imports.lock, fetch nothing new.
+      - run: cargo vet --locked
+
+  hardening:
+    name: hardening gates (unsafe census, README table)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Every unsafe_code fence is inventoried in UNSAFE.md (H-22).
+      - run: python3 tools/unsafe_census.py
+      # The README's hardening table is the render of the plan file (H-37).
+      - run: python3 tools/render_hardening_table.py --all --root . --check
+
+  fuzz-regression:
+    name: fuzz regression (seed corpus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-fuzz@0.13.2
+      # Every seed, once: a regression gate, not a search. The search is the
+      # nightly job in scheduled.yml.
+      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz run kernel_api fuzz/corpus/kernel_api -- -runs=0
 
   no_std:
     name: no_std (${{ matrix.target }})
@@ -55,9 +103,10 @@ jobs:
           - riscv32imac-unknown-none-elf    # ESP32-C6 / C61 / H2 class, QEMU virt
           - riscv32imafc-unknown-none-elf   # ESP32-P4 class
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - run: cargo check -p rusty_rtos_kernel-core --no-default-features --target ${{ matrix.target }}
       - run: cargo check -p rusty_rtos_kernel-core --no-default-features --features alloc --target ${{ matrix.target }}

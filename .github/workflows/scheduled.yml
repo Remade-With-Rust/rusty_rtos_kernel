@@ -1,0 +1,68 @@
+name: scheduled
+
+# The slow half of the hardening gates: continuous fuzzing (H-27) and
+# advisory monitoring (H-40). Nightly, and on demand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [kernel_api]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-fuzz@0.13.2
+      # The corpus grows night over night: restore yesterday's, save tonight's.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=1200 -print_final_stats=1
+      # A crash is kept as an artifact; it becomes a seed and a test once fixed.
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.19.9
+      - run: cargo deny check advisories
+
+  sanitizers:
+    name: sanitizers and cargo careful (H-24, H-25)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-careful@0.4.10
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --workspace --lib --tests
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+      - run: cargo +nightly careful test --workspace --lib --tests
