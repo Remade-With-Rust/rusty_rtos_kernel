@@ -20,9 +20,9 @@
 
 use core::marker::PhantomData;
 
+use core::num::NonZeroU64;
 use rusty_rtos_core::arena::Arena;
 use rusty_rtos_core::config::Config;
-use core::num::NonZeroU64;
 
 use rusty_rtos_core::error::{Error, Result};
 use rusty_rtos_core::handle::{

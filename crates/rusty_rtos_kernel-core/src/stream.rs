@@ -383,10 +383,7 @@ where
     pub fn stream_buffer_reset(&mut self, buffer: StreamBufferHandle) -> Result<bool> {
         self.enter_critical();
         let done = match self.buffers.resolve_mut(buffer) {
-            Ok(b)
-                if b.waiting_to_receive.is_null()
-                    && b.waiting_to_send.is_null() =>
-            {
+            Ok(b) if b.waiting_to_receive.is_null() && b.waiting_to_send.is_null() => {
                 b.head = 0;
                 b.tail = 0;
                 true
@@ -1037,7 +1034,8 @@ where
         let mut available = available;
         let next_length;
         if is_message {
-            let (message_length, tail) = Self::read_length_prefix_from(bytes, base, ring, next_tail);
+            let (message_length, tail) =
+                Self::read_length_prefix_from(bytes, base, ring, next_tail);
             next_tail = tail;
             available = available.saturating_sub(Self::MESSAGE_LENGTH_BYTES);
             next_length = if message_length > out.len() {
@@ -1075,23 +1073,31 @@ where
     /// a `&StreamBuffer` borrowed from `self` cannot coexist with `&mut self`.
     /// Destructuring `self` into disjoint field borrows is the safe form of what
     /// C gets for free by holding one pointer.
-    fn write_bytes_into(bytes: &mut [u8], base: usize, ring: usize, data: &[u8], head: usize) -> usize {
+    fn write_bytes_into(
+        bytes: &mut [u8],
+        base: usize,
+        ring: usize,
+        data: &[u8],
+        head: usize,
+    ) -> usize {
         // The two copies, and the two the C makes. A payload longer than the
         // ring is refused before this, so that case cannot arrive.
         if data.len() <= ring {
             let upto = ring.wrapping_sub(head);
             let first = data.len().min(upto);
             let from = base.wrapping_add(head);
-            if let (Some(dst), Some(src)) =
-                (bytes.get_mut(from..from.wrapping_add(first)), data.get(..first))
-            {
+            if let (Some(dst), Some(src)) = (
+                bytes.get_mut(from..from.wrapping_add(first)),
+                data.get(..first),
+            ) {
                 dst.copy_from_slice(src);
             }
             let rest = data.len().wrapping_sub(first);
             if rest > 0 {
-                if let (Some(dst), Some(src)) =
-                    (bytes.get_mut(base..base.wrapping_add(rest)), data.get(first..))
-                {
+                if let (Some(dst), Some(src)) = (
+                    bytes.get_mut(base..base.wrapping_add(rest)),
+                    data.get(first..),
+                ) {
                     dst.copy_from_slice(src);
                 }
                 return rest;
@@ -1118,21 +1124,29 @@ where
     /// In line at both callers: out of line it became a shared symbol and cost
     /// +12 B, because each caller freezes a different length.
     #[inline(always)]
-    fn read_bytes_from(bytes: &[u8], base: usize, ring: usize, out: &mut [u8], tail: usize) -> usize {
+    fn read_bytes_from(
+        bytes: &[u8],
+        base: usize,
+        ring: usize,
+        out: &mut [u8],
+        tail: usize,
+    ) -> usize {
         if out.len() <= ring {
             let upto = ring.wrapping_sub(tail);
             let first = out.len().min(upto);
             let from = base.wrapping_add(tail);
-            if let (Some(dst), Some(src)) =
-                (out.get_mut(..first), bytes.get(from..from.wrapping_add(first)))
-            {
+            if let (Some(dst), Some(src)) = (
+                out.get_mut(..first),
+                bytes.get(from..from.wrapping_add(first)),
+            ) {
                 dst.copy_from_slice(src);
             }
             let rest = out.len().wrapping_sub(first);
             if rest > 0 {
-                if let (Some(dst), Some(src)) =
-                    (out.get_mut(first..), bytes.get(base..base.wrapping_add(rest)))
-                {
+                if let (Some(dst), Some(src)) = (
+                    out.get_mut(first..),
+                    bytes.get(base..base.wrapping_add(rest)),
+                ) {
                     dst.copy_from_slice(src);
                 }
                 return rest;
@@ -1142,9 +1156,6 @@ where
         }
         tail
     }
-
-    /// The message length, written little-endian across
-    /// [`Kernel::MESSAGE_LENGTH_BYTES`] bytes of the ring.
 
     /// The message length back out, and where the message starts.
     /// Bounded as [`Kernel::read_bytes`] is, and converted for the same
@@ -1158,7 +1169,12 @@ where
     /// `configMESSAGE_BUFFER_LENGTH_TYPE` is `size_t` and `size_t` is FOUR bytes
     /// there. `usize` is the width the C's type actually has on whichever target
     /// this is, so it is the right one to build.
-    fn read_length_prefix_from(bytes: &[u8], base: usize, ring: usize, tail: usize) -> (usize, usize) {
+    fn read_length_prefix_from(
+        bytes: &[u8],
+        base: usize,
+        ring: usize,
+        tail: usize,
+    ) -> (usize, usize) {
         let mut raw = [0_u8; core::mem::size_of::<usize>()];
         // Delegated. This held its OWN two-copy ring walk plus a byte-at-a-time
         // fallback -- a third hand-rolled version of the same walk -- and the

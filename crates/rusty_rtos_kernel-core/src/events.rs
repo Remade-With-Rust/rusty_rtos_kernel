@@ -812,7 +812,10 @@ mod tests {
             "the premise of the hazard: the arena reused the same slot, so              both groups name the SAME list"
         );
         assert!(
-            k.lists.head(K::event_group_list(g2)).expect("a list").is_none(),
+            k.lists
+                .head(K::event_group_list(g2))
+                .expect("a list")
+                .is_none(),
             "and the fresh group has inherited no waiters"
         );
     }

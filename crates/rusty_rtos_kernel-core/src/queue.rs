@@ -693,9 +693,7 @@ where
             self.copy_data_to_queue(set, &container, u64::from(queue.to_raw()), Position::Back)?;
         if tx_lock == UNLOCKED {
             let receivers = Self::queue_receive_list(set);
-            if !self.lists.is_empty_of(receivers)
-                && self.remove_from_event_list(receivers)?
-            {
+            if !self.lists.is_empty_of(receivers) && self.remove_from_event_list(receivers)? {
                 woke = true;
             }
         } else {
@@ -779,9 +777,7 @@ where
                 return Ok(woken);
             }
             let receivers = Self::queue_receive_list(queue);
-            if !self.lists.is_empty_of(receivers)
-                && self.remove_from_event_list(receivers)?
-            {
+            if !self.lists.is_empty_of(receivers) && self.remove_from_event_list(receivers)? {
                 woken = Woken::YES;
             }
         } else {
@@ -1364,7 +1360,11 @@ where
             // `copy_data_from_queue`, in place, on the reference above.
             let value = if kind.carries_data() {
                 let next = wrap_next(q.read_from, q.length);
-                let value = self.slots.get(q.base.wrapping_add(next)).copied().unwrap_or(0);
+                let value = self
+                    .slots
+                    .get(q.base.wrapping_add(next))
+                    .copied()
+                    .unwrap_or(0);
                 if !peek {
                     q.read_from = next;
                     // Wrapping: `waiting > 0` was read under this section.
@@ -1391,9 +1391,7 @@ where
                 // A peek wakes another *receiver*, not a sender: the item
                 // is still there.
                 let receivers = Self::queue_receive_list(queue);
-                if !self.lists.is_empty_of(receivers)
-                    && self.remove_from_event_list(receivers)?
-                {
+                if !self.lists.is_empty_of(receivers) && self.remove_from_event_list(receivers)? {
                     self.port_yield();
                 }
             } else {
@@ -1402,9 +1400,7 @@ where
                     self.increment_mutexes_held(caller);
                 }
                 let senders = Self::queue_send_list(queue);
-                if !self.lists.is_empty_of(senders)
-                    && self.remove_from_event_list(senders)?
-                {
+                if !self.lists.is_empty_of(senders) && self.remove_from_event_list(senders)? {
                     self.port_yield();
                 }
             }
@@ -1479,7 +1475,13 @@ where
         }
         // `left` is `Some` here, and it carries the block time
         // `check_for_timeout` has just written into the TCB.
-        self.queue_take_locked(caller, queue, peek, kind, left.map_or(0, core::num::NonZeroU64::get))
+        self.queue_take_locked(
+            caller,
+            queue,
+            peek,
+            kind,
+            left.map_or(0, core::num::NonZeroU64::get),
+        )
     }
 
     /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.
@@ -1487,11 +1489,7 @@ where
     /// [`Kernel::queue_take_blocking`]: both call sites have already
     /// established that it is `self.current`.
     #[cold]
-    fn queue_take_timed_out(
-        &mut self,
-        queue: QueueHandle,
-        peek: bool,
-    ) -> Result<Wait<u64>> {
+    fn queue_take_timed_out(&mut self, queue: QueueHandle, peek: bool) -> Result<Wait<u64>> {
         let caller = self.current;
         // `kind` is read HERE rather than handed down from the caller,
         // because it is the one field of the descriptor that cannot change

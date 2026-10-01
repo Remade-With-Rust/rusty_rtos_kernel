@@ -21,7 +21,7 @@
 
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
-use rusty_rtos_core::handle::{QueueHandle, TaskHandle, TimerHandle};
+use rusty_rtos_core::handle::{TaskHandle, TimerHandle};
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::list::ListId;
