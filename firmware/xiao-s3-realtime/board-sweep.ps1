@@ -5,9 +5,10 @@
 #     powershell -ExecutionPolicy Bypass -File .\board-sweep.ps1          # COM4
 #     powershell -ExecutionPolicy Bypass -File .\board-sweep.ps1 -Port COM5
 #
-# Every run carries `decompose`, so every log has the segment table. The kernel
-# fix (queue_take's single resolve) is in all five, being a kernel change; the
-# baseline here is therefore the earlier decompose run plus that fix alone.
+# Every run carries `decompose`, so every log has the segment table. The three
+# firmware fixes are the default, so run 1 is all of them and each run after
+# opts ONE back out; run 5 opts out of all three. The kernel and port fixes
+# are in every run, being changes to those crates.
 #
 # Logs: .\sweep-logs\<n>-<name>.log. Each run takes about 25 s after the flash
 # and is stopped at its closing "done --" line (or after 120 s).
@@ -21,11 +22,11 @@ New-Item -ItemType Directory -Force $logs | Out-Null
 $elf = Join-Path $here "target\xtensa-esp32s3-none-elf\release\xiao-s3-realtime"
 
 $runs = @(
-    @{ name = "1-baseline";       args = @("--features", "decompose") },
-    @{ name = "2-switch-in-trap"; args = @("--features", "decompose,switch-in-trap") },
-    @{ name = "3-no-fp-save";     args = @("--no-default-features", "--features", "decompose") },
-    @{ name = "4-iram";           args = @("--features", "decompose,iram") },
-    @{ name = "5-all";            args = @("--no-default-features", "--features", "decompose,switch-in-trap,iram") }
+    @{ name = "1-default";          args = @("--features", "decompose") },
+    @{ name = "2-software0-switch"; args = @("--features", "decompose,software0-switch") },
+    @{ name = "3-fp-save";          args = @("--features", "decompose,fp-save") },
+    @{ name = "4-flash-code";       args = @("--features", "decompose,flash-code") },
+    @{ name = "5-none";             args = @("--features", "decompose,software0-switch,fp-save,flash-code") }
 )
 
 Push-Location $here

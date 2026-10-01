@@ -1,4 +1,4 @@
-/* --features iram: run the firmware's, the kernel's and the port's code from
+/* The default (opt out with --features flash-code): run the firmware's, the kernel's and the port's code from
  * IRAM instead of from flash behind the instruction cache.
  *
  * The decomposition found the latency TAILS in the kernel segments while the

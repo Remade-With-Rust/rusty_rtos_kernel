@@ -7,7 +7,10 @@ license = "MIT OR Apache-2.0"
 description = "Every Kairos kernel feature at once on a XIAO ESP32-S3, with real-time latency, jitter and deadline measurements on the 1-cycle ccount."
 
 [features]
-default = ["fp-save"]
+# The interrupt-path fixes are the DEFAULT: the in-trap switch, no FP
+# save/restore, and the hot code in IRAM. Each has an opt-out below, named for
+# the behaviour it restores, so every comparison stays one flag away.
+default = []
 # Run for ten minutes instead of twenty seconds: the worst case only means
 # something over a long run.
 long = []
@@ -17,19 +20,19 @@ no-inherit = []
 # Cut the interrupt -> task latency into ten stamped segments, and measure one
 # bare esp-hal interrupt's entry and exit; see src/decompose.rs.
 decompose = []
-# Fix 1: an interrupt that wakes a task switches inside its own trap, instead
-# of raising `Software0` and taking a second trap to do it.
-switch-in-trap = []
-# Fix 2 is the ABSENCE of this one: esp-hal's `float-save-restore`, which
-# saves and restores 18 FP words on every trap and makes the port copy them on
-# every switch. Nothing here uses the FPU. Build with `--no-default-features`
-# to drop it; xtensa-lx-rt then traps with CPENABLE = 0, and every task starts
-# with the FPU disabled (the port zero-fills a new context), so a float in a
-# task faults loudly instead of corrupting another task's FP registers.
+# Opt-out of fix 1: switch by raising `Software0` and taking a second trap,
+# instead of inside the waking interrupt's own trap.
+software0-switch = []
+# Opt-out of fix 2: esp-hal's `float-save-restore`, 18 FP words saved and
+# restored on every trap and copied on every switch. WITHOUT it (the default)
+# xtensa-lx-rt traps with CPENABLE = 0 and every task starts with the FPU
+# disabled (the port zero-fills a new context), so a float in a task faults
+# loudly instead of corrupting another task's FP registers. A firmware whose
+# tasks use floats needs this feature.
 fp-save = ["esp-hal/float-save-restore"]
-# Fix 4: the firmware's, the kernel's and the port's code in IRAM instead of
-# flash behind the instruction cache (`kairos_iram.x`, via `build.rs`).
-iram = []
+# Opt-out of fix 4: leave the code in flash behind the instruction cache,
+# instead of IRAM (`kairos_iram.x`, chosen by `build.rs`).
+flash-code = []
 
 [dependencies]
 rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }

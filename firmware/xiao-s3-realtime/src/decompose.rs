@@ -114,6 +114,29 @@ impl<const BIN: u32> Seg<BIN> {
 /// Per mechanism (notify, queue, semaphore): ten segments, and the total.
 static SEG: [[Seg<4>; 10]; 3] = [const { [const { Seg::new() }; 10] }; 3];
 static TOTAL: [Seg<32>; 3] = [const { Seg::new() }; 3];
+
+// ---- the tick test --------------------------------------------------------
+//
+// The tails that survive IRAM (trap exit + resume keeps a ~2,850-cycle max,
+// p99.9 stays at 11-15 us) were put down to the tick: the tick (1,000 us) and
+// this interrupt source (997 us) beat, and a tick taken inside the window
+// puts its whole trap inside the latency. Untested until this: every event
+// is filed by whether a tick handler ran between A and K.
+
+static TICK_SEQ: AtomicU32 = AtomicU32::new(0);
+static TICK_AT_A: AtomicU32 = AtomicU32::new(0);
+static TICKED: [Seg<32>; 3] = [const { Seg::new() }; 3];
+static CLEAN: [Seg<32>; 3] = [const { Seg::new() }; 3];
+
+/// The tick handler, on entry.
+pub fn tick() {
+    TICK_SEQ.store(TICK_SEQ.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+}
+
+/// The interrupt source, at point A.
+pub fn event_begin() {
+    TICK_AT_A.store(TICK_SEQ.load(Ordering::Relaxed), Ordering::Relaxed);
+}
 static INCOHERENT: AtomicU32 = AtomicU32::new(0);
 
 /// Called by the woken task with the event's first stamp (A), its resume
@@ -134,6 +157,10 @@ pub fn done(slot: usize, a: u32, j: u32, k: u32) {
     }
     if let Some(total) = TOTAL.get(slot) {
         total.record(k.wrapping_sub(a));
+    }
+    let ticked = TICK_SEQ.load(Ordering::Relaxed) != TICK_AT_A.load(Ordering::Relaxed);
+    if let Some(split) = if ticked { TICKED.get(slot) } else { CLEAN.get(slot) } {
+        split.record(k.wrapping_sub(a));
     }
 }
 
@@ -165,6 +192,19 @@ pub fn report() {
         );
     }
     println!("events rejected as incoherent: {}", INCOHERENT.load(Ordering::Relaxed));
+    println!("the tick test -- A>K total, by whether a tick handler ran inside it (cycles):");
+    for ((name, t), c) in names.iter().zip(TICKED.iter()).zip(CLEAN.iter()) {
+        for (label, s) in [("tick inside", t), ("clean", c)] {
+            println!(
+                "  {name:<9} {label:<11} n={:<6} p50 {:>5}  p99 {:>5}  p99.9 {:>5}  max {:>6}",
+                s.n.load(Ordering::Relaxed),
+                s.p(5_000),
+                s.p(9_900),
+                s.p(9_990),
+                s.max.load(Ordering::Relaxed)
+            );
+        }
+    }
     let (e, x, tax) = (ENTRY.load(Ordering::Relaxed), EXIT.load(Ordering::Relaxed), TAX.load(Ordering::Relaxed));
     println!("one bare esp-hal peripheral interrupt (FROM_CPU_INTR1, median of {PROBES}):");
     println!("  entry: raise -> handler's first statement   {e:>5}");

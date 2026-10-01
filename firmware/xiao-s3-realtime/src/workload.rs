@@ -312,6 +312,8 @@ static GO: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 static IRQ_FIRED: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+/// Which mechanism the interrupt source uses next: notify, queue, semaphore.
+static IRQ_NEXT: AtomicU32 = AtomicU32::new(0);
 static IRQ_GOT: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 static IRQ_REFUSED: AtomicU32 = AtomicU32::new(0);
 static IRQ_SEM_STAMP: AtomicU32 = AtomicU32::new(0);
@@ -391,10 +393,15 @@ fn irq_fire(stamp: u32) -> bool {
     if STOP.load(Ordering::Relaxed) || !GO.load(Ordering::Relaxed) {
         return false;
     }
-    let n = IRQ_FIRED.iter().map(|c| c.load(Ordering::Relaxed)).sum::<u32>();
-    let which = (n % 3) as usize;
+    // The demo's own bookkeeping, and it sits inside the latency being
+    // measured, so it is kept to loads and stores. This handler is the only
+    // writer of both, so no read-modify-write is needed. The first version
+    // summed three counters, took them modulo 3 and did an atomic
+    // `fetch_add`: 87 cycles of every interrupt -> task row.
+    let which = IRQ_NEXT.load(Ordering::Relaxed) as usize;
+    IRQ_NEXT.store(if which >= 2 { 0 } else { which as u32 + 1 }, Ordering::Relaxed);
     if let Some(c) = IRQ_FIRED.get(which) {
-        c.fetch_add(1, Ordering::Relaxed);
+        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     }
     mark(Mark::KernelIn);
     let woken = with_kernel_in_isr(|k| match which {

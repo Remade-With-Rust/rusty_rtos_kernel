@@ -190,8 +190,8 @@ fn clear_alarm(cell: &AlarmCell) {
     }
 }
 
-/// `--features switch-in-trap`: an interrupt that wakes a task switches to
-/// it inside its OWN trap, on the frame that trap is about to restore, rather
+/// The default (opt out with `--features software0-switch`): an interrupt
+/// that wakes a task switches to it inside its OWN trap, on the frame that trap is about to restore, rather
 /// than raising `Software0` and taking a second trap to do it.
 ///
 /// That is FreeRTOS's Xtensa shape -- the switch happens on the way out of
@@ -199,7 +199,7 @@ fn clear_alarm(cell: &AlarmCell) {
 /// cycles of a 1,485-cycle notify wake. It is possible here because esp-hal's
 /// dispatcher hands every peripheral handler the trap frame, and `#[handler]`
 /// accepts `fn(&mut Context)` for exactly that.
-const SWITCH_IN_TRAP: bool = cfg!(feature = "switch-in-trap");
+const SWITCH_IN_TRAP: bool = !cfg!(feature = "software0-switch");
 
 /// `Software0`: the switch. The port raises it; the kernel decides.
 #[esp_hal::ram]
@@ -255,6 +255,8 @@ fn framed(f: fn(&mut Context)) -> esp_hal::interrupt::InterruptHandler {
 
 /// `SYSTIMER` alarm 0: the 1 kHz tick.
 fn tick_interrupt(frame: &mut Context) {
+    #[cfg(feature = "decompose")]
+    decompose::tick();
     clear_alarm(&TICK_ALARM);
     if with_kernel_in_isr(Kernel::increment_tick).unwrap_or(false) {
         if SWITCH_IN_TRAP {
@@ -269,6 +271,8 @@ fn tick_interrupt(frame: &mut Context) {
 /// is the handler's first statement; everything after it is in the latency.
 fn irq_source(frame: &mut Context) {
     let stamp = get_cycle_count();
+    #[cfg(feature = "decompose")]
+    decompose::event_begin();
     clear_alarm(&IRQ_ALARM);
     mark(Mark::Cleared);
     if irq_fire(stamp) {
