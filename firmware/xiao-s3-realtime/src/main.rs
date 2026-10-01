@@ -102,6 +102,10 @@ fn idle_wait() {
 fn report_done(_passed: bool) -> ! {
     #[cfg(feature = "decompose")]
     decompose::report();
+    // The firmware never exits: every task is parked and the monitor keeps
+    // listening, which looks like a hang unless it is said.
+    println!();
+    println!("done -- every task is parked; Ctrl+C leaves the monitor");
     loop {
         delay(1_000_000);
     }

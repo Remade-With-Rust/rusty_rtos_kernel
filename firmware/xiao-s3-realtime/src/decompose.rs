@@ -60,18 +60,20 @@ const SEGMENTS: [&str; 10] = [
     "J>K  the call again: Ready",
 ];
 
-/// A small histogram in cycles: 4-cycle bins to 1,024, the max kept exactly.
+/// A small histogram in cycles: `BIN`-cycle bins to `256 * BIN`, the max kept
+/// exactly. Segments use 4 (to 1,024); the total uses 32 (to 8,192). The first
+/// board run used 4 for the total too: every total overflowed, and its p50
+/// printed as its max.
 const NB: usize = 256;
-const BIN: u32 = 4;
 
-struct Seg {
+struct Seg<const BIN: u32> {
     bins: [AtomicU32; NB],
     n: AtomicU32,
     min: AtomicU32,
     max: AtomicU32,
 }
 
-impl Seg {
+impl<const BIN: u32> Seg<BIN> {
     const fn new() -> Self {
         Self {
             bins: [const { AtomicU32::new(0) }; NB],
@@ -109,8 +111,9 @@ impl Seg {
     }
 }
 
-/// Per mechanism (notify, queue, semaphore): ten segments and the total.
-static SEG: [[Seg; 11]; 3] = [const { [const { Seg::new() }; 11] }; 3];
+/// Per mechanism (notify, queue, semaphore): ten segments, and the total.
+static SEG: [[Seg<4>; 10]; 3] = [const { [const { Seg::new() }; 10] }; 3];
+static TOTAL: [Seg<32>; 3] = [const { Seg::new() }; 3];
 static INCOHERENT: AtomicU32 = AtomicU32::new(0);
 
 /// Called by the woken task with the event's first stamp (A), its resume
@@ -129,7 +132,7 @@ pub fn done(slot: usize, a: u32, j: u32, k: u32) {
     for (s, v) in row.iter().zip(segs) {
         s.record(v);
     }
-    if let Some(total) = row.get(10) {
+    if let Some(total) = TOTAL.get(slot) {
         total.record(k.wrapping_sub(a));
     }
 }
@@ -138,7 +141,7 @@ pub fn report() {
     println!();
     println!("=== interrupt -> task, decomposed (cycles @ 240 MHz; p50 [min .. p99] max) ===");
     let names = ["notify", "queue", "semaphore"];
-    for (name, row) in names.iter().zip(SEG.iter()) {
+    for ((name, row), t) in names.iter().zip(SEG.iter()).zip(TOTAL.iter()) {
         println!("{name}:");
         let mut sum = 0u32;
         for (label, s) in SEGMENTS.iter().zip(row.iter()) {
@@ -151,17 +154,15 @@ pub fn report() {
                 s.max.load(Ordering::Relaxed)
             );
         }
-        if let Some(t) = row.get(10) {
-            println!(
-                "  {:<30} {:>5}  [{:>5} .. {:>5}] {:>6}   n={}, sum of segment p50s {sum}",
-                "A>K  total",
-                t.p(5_000),
-                t.min.load(Ordering::Relaxed),
-                t.p(9_900),
-                t.max.load(Ordering::Relaxed),
-                t.n.load(Ordering::Relaxed)
-            );
-        }
+        println!(
+            "  {:<30} {:>5}  [{:>5} .. {:>5}] {:>6}   n={}, sum of segment p50s {sum}",
+            "A>K  total (32-cycle bins)",
+            t.p(5_000),
+            t.min.load(Ordering::Relaxed),
+            t.p(9_900),
+            t.max.load(Ordering::Relaxed),
+            t.n.load(Ordering::Relaxed)
+        );
     }
     println!("events rejected as incoherent: {}", INCOHERENT.load(Ordering::Relaxed));
     let (e, x, tax) = (ENTRY.load(Ordering::Relaxed), EXIT.load(Ordering::Relaxed), TAX.load(Ordering::Relaxed));

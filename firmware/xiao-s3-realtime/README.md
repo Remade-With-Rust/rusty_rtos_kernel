@@ -193,3 +193,66 @@ never rises to priority 3, so it cannot share a round robin with the event tasks
 and the p99 drops from a tick to 25.6 us. The hypothesis survives a probe it
 could have failed. It is not yet confirmed by a direct measurement.
 
+## Interrupt -> task, decomposed (2026-10-01, `--features decompose`)
+
+The headline row missed its 3–5 us prediction. That prediction added only the
+kernel's inline share measured by `xiao-s3-cycles` (ISR wake 430 + switch 166),
+which has no interrupt entry, no trap exit and no real switch, so it left out
+the whole platform path. The decomposition stamps eleven points along the real
+path. Run: 0 events rejected as incoherent; the segment p50s sum to 1,485 cycles
+for notify, against a measured minimum total of 1,474. Instrument tax: the
+headline p50 rose from 1,440 cycles (6.00 us) to 1,536 (6.40 us) with the stamps in.
+
+p50 cycles at 240 MHz:
+
+| segment | notify | queue | semaphore | owner |
+|---|---:|---:|---:|---|
+| A>B clear the alarm | 13 | 13 | 13 | demo |
+| B>C `irq_fire` bookkeeping | 88 | 87 | 87 | demo |
+| C>D kernel `_from_isr` | **312** | **460** | **441** | Kairos |
+| D>E raise `Software0`, unwind | 20 | 17 | 17 | demo / port |
+| E>F trap exit + `Software0` trap entry | **345** | 344 | 344 | esp-hal |
+| F>G kernel `switch_context` | **103** | 103 | 103 | Kairos |
+| G>H idle accounting | 24 | 24 | 24 | demo |
+| H>I port context copy (twice) | **344** | 344 | 344 | port |
+| I>J trap exit + task resume | 96 | 108 | 100 | esp-hal |
+| J>K the call again: `Ready` | **140** | **340** | **308** | Kairos |
+| **sum** | **1,485** | **1,840** | **1,781** | |
+
+Not in the headline at all: the trap ENTRY before the handler's first
+statement. A bare `FROM_CPU_INTR1`, dispatched by the same esp-hal path,
+measured entry **465** (raise -> first statement, including the raise's own
+register write) and exit **169**. So notify's true interrupt-to-task time is
+about **1,935 cycles, 8.1 us**.
+
+By owner, notify: esp-hal + port **785** (53 %), Kairos **555** (37 %), demo
+glue **145** (10 %), plus ~450 of entry outside the headline.
+
+Findings:
+
+1. **Every wake takes two traps.** esp-hal's level-1 dispatcher serves one
+   class per trap, CPU-internal first, so the alarm's trap returns and
+   `Software0` takes a second one: 345 cycles.
+2. **The context copy is 344 cycles.** `Context` carries 18 FP words
+   (esp-hal's default `float-save-restore`), and the port copies it out and in.
+   Nothing in this firmware uses floats.
+3. **A peripheral interrupt's entry costs ~275 more than a CPU-internal one.**
+   A peripheral entry is ~450. `Software0`'s exit + entry is 345, and a bare
+   exit is 169, which leaves ~176 for an internal entry. The likely cause is
+   esp-hal scanning the interrupt matrix for pending sources. It is upstream.
+4. **Kairos's queue and semaphore wakes cost ~900 against notify's 555,** in
+   `_from_isr` (+150) and in the call made again after the wake (+200).
+5. **The tails sit in the kernel segments, not the trap ones.** C>D max 4,794
+   and J>K max 6,130 cycles, while E>F and H>I never move off 344–345. Kernel
+   code runs from flash through the cache, and the guess is cache misses. It is
+   untested.
+
+Levers, by predicted saving on notify:
+
+| lever | predicted | where |
+|---|---|---|
+| Switch inside the interrupt's own trap. esp-hal already passes the trap frame to peripheral handlers. This is FreeRTOS's Xtensa shape: the switch happens on interrupt exit, with no second trap. | ~-360 (-19 %) | firmware, then the port |
+| Drop FP save/restore when no task uses the FPU | ~-100..-150 on the copy, plus cheaper trap saves | `Cargo.toml` (esp-hal features) |
+| Kernel queue/semaphore wake paths | up to ~-350 on those mechanisms | `rusty_rtos_kernel` |
+| Interrupt-path kernel code in IRAM | the tails, if (5) holds | linker |
+
