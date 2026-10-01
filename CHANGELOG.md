@@ -3,7 +3,7 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
-## Unreleased
+## 0.2.2 — 2026-10-01
 
 ### Security
 - `cargo vet` coverage (`supply-chain/`), zero exemptions.

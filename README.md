@@ -211,7 +211,7 @@ bench takes `--features real-port`, which runs the kernel on `RiscvPort` itself.
 | RAM per event group | 28 B | **8 B** | **0.29×** |
 | RAM per queue | 72 B | **64 B** | 0.89× |
 | static RAM, a blinker | 1,704 B | **1,640 B** | 0.96× |
-| flash, kernel + RISC-V port | 13,924 B | 19,726 B | 1.42× against us |
+| flash, kernel + RISC-V port | 13,924 B | 19,484 B | 1.40× against us |
 
 **Flash is the price of the rows above it.** Decomposed to the byte, the
 structural extra is handle validation (1,464 B — what turns a stale handle
