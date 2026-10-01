@@ -201,11 +201,38 @@ fn deviation(actual: u32, nominal: u32) -> u32 {
 
 // ---------------------------------------------------------- the instrument --
 
-/// A latency histogram in clock units: 32-unit bins (133 ns on the S3), the
-/// last bin catching everything above 32,768 units, with exact min and max
-/// beside it. Each one has a single writer, so plain atomics suffice.
-const NB: usize = 1024;
+/// A latency histogram in clock units, exact min and max kept beside it. Each
+/// one has a single writer, so plain atomics suffice.
+///
+/// Two tiers: 1,024 fine bins of 32 units (133 ns on the S3) up to 32,768
+/// units, then 1,024 coarse bins of 2,048 units (8.5 us) up to 2,129,920 units
+/// (8.9 ms). The first version had the fine tier alone, 136 us in all, and
+/// reported the overflow bin's EDGE as a percentile -- a p50 of 136.53 us
+/// printed beside a min of 1,299.97. Anything that still overflows is
+/// reported as the max, never as an edge.
+const FINE: usize = 1024;
 const BIN: u32 = 32;
+const COARSE: usize = 1024;
+const CBIN: u32 = 2048;
+const NB: usize = FINE + COARSE;
+const FINE_TOP: u32 = FINE as u32 * BIN;
+
+const fn bin_of(units: u32) -> usize {
+    if units < FINE_TOP {
+        (units / BIN) as usize
+    } else {
+        let i = FINE + ((units - FINE_TOP) / CBIN) as usize;
+        if i < NB { i } else { NB - 1 }
+    }
+}
+
+const fn upper_edge(i: usize) -> u32 {
+    if i < FINE {
+        (i as u32 + 1) * BIN
+    } else {
+        FINE_TOP + (i - FINE) as u32 * CBIN + CBIN
+    }
+}
 
 struct Hist {
     bins: [AtomicU32; NB],
@@ -225,8 +252,7 @@ impl Hist {
     }
 
     fn record(&self, units: u32) {
-        let i = ((units / BIN) as usize).min(NB - 1);
-        if let Some(bin) = self.bins.get(i) {
+        if let Some(bin) = self.bins.get(bin_of(units)) {
             bin.fetch_add(1, Ordering::Relaxed);
         }
         self.n.fetch_add(1, Ordering::Relaxed);
@@ -238,7 +264,8 @@ impl Hist {
         self.n.load(Ordering::Relaxed)
     }
 
-    /// The upper edge of the bin holding the `per_10k`-th fraction.
+    /// The upper edge of the bin holding the `per_10k`-th fraction, clamped
+    /// into `[min, max]`; the overflow bin answers with the max itself.
     fn percentile(&self, per_10k: u64) -> u32 {
         let n = u64::from(self.count());
         if n == 0 {
@@ -249,8 +276,8 @@ impl Hist {
         for (i, bin) in self.bins.iter().enumerate() {
             seen += u64::from(bin.load(Ordering::Relaxed));
             if seen >= target {
-                let edge = (i as u32 + 1) * BIN;
-                return edge.min(self.max.load(Ordering::Relaxed));
+                let (lo, hi) = (self.min.load(Ordering::Relaxed), self.max.load(Ordering::Relaxed));
+                return if i == NB - 1 { hi } else { upper_edge(i).clamp(lo, hi) };
             }
         }
         self.max.load(Ordering::Relaxed)

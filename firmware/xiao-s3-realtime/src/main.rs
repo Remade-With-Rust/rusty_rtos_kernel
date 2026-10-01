@@ -262,11 +262,31 @@ fn start_alarm(alarm: &Alarm<'static>, period_us: u64, handler: esp_hal::interru
 
 #[esp_hal::main]
 fn main() -> ! {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    // `CpuClock::max()` must be ASKED for: esp-hal's default config runs the S3
+    // at 80 MHz. The first board run did, and every time it printed was a
+    // third of the truth while every fixed amount of work took three times as
+    // long -- a CPU load of 99.2% that was the clock, not the kernel.
+    let peripherals =
+        esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
     println!();
     println!("=== xiao-s3-realtime: every Kairos kernel feature, measured on silicon ===");
     println!("run {RUN_MS} ms after warm-up; 12 application tasks + idle + timer daemon");
+
+    // Every number this firmware prints divides `ccount` by `CYC_PER_US`, so
+    // that constant is checked against the clock, not assumed: `ccount` is
+    // counted across 10 ms of SYSTIMER, which runs from its own crystal.
+    let configured = esp_hal::clock::cpu_clock().as_hz() / 1_000_000;
+    let (w0, c0) = (wall_us(), get_cycle_count());
+    while wall_us() - w0 < 10_000 {
+        core::hint::spin_loop();
+    }
+    let (w1, c1) = (wall_us(), get_cycle_count());
+    let measured = u64::from(c1.wrapping_sub(c0)) / (w1 - w0).max(1);
+    println!("clock   configured {configured} MHz, ccount measured {measured} MHz against SYSTIMER");
+    if configured != CYC_PER_US || measured.abs_diff(u64::from(CYC_PER_US)) > 2 {
+        halt("ccount does not run at CYC_PER_US: every time printed would be wrong");
+    }
 
     let mut kernel = match K::new(XtensaPort::new(), NoTrace) {
         Ok(k) => k,

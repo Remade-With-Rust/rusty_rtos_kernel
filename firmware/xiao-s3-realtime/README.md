@@ -94,3 +94,27 @@ Recorded so the silicon numbers have something to be checked against:
    and the load read **1.3 %**. The window is now measured on the wall clock, and
    "ticks = milliseconds" became a check of its own. On silicon that check
    catches a tick handler held off past its next alarm.
+
+## Two more, caught by the first board run (2026-10-01)
+
+The first run on silicon passed all nine checks and was **not admissible**. Two
+of its numbers could not be true: the control loop's p50 (136.53 us) sat below
+its own min (1,299.97 us), and the CPU load read 99.2 % against a predicted ~54 %.
+
+4. **The CPU was at 80 MHz.** esp-hal's default `Config` does not select
+   `CpuClock::max()`; it has to be asked for. Every time printed was
+   `ccount / 240` of an 80 MHz count, so a third of the truth, and every
+   `spin_us` ran three times as long. That alone accounts for the load. The
+   arithmetic is exact: a 2 ms period is 160,000 cycles at 80 MHz, read as
+   667 us, which is 1,333 us off nominal. The run measured 1,300–1,367 us. The
+   firmware now requests 240 MHz, measures `ccount` against SYSTIMER for 10 ms
+   at startup, and halts if the two disagree. That is the `clock` line in its
+   output.
+5. **The histogram was 136 us wide, and its overflow bin answered with its
+   edge.** It now has a coarse tier to 8.9 ms, every percentile is clamped into
+   `[min, max]`, and an overflowing percentile reports the max.
+
+The run's counts are clock-independent, and they stand: 20,061/20,061
+interrupts delivered, 0 of 18,457 messages bad, 909/909 contended waits
+inherited, 0 stalls, 0 errors, and 20,050 ticks in 20,050 ms. Its times do not.
+
