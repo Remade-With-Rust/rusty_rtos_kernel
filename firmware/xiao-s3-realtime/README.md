@@ -148,3 +148,31 @@ What that run measured, against the predictions made before any board run:
 | interrupts delivered | all | **20,060 / 20,060** | |
 | message buffer, p99 | (not predicted) | **1,100.80** us | `mb_rx` shares priority 2 with the 3 ms hog and waits for the round robin |
 
+## The third board run (2026-10-01): PASS, staged inheritance exercised
+
+`ccount` 239 MHz against SYSTIMER; all nine checks `ok`.
+
+| quantity | predicted | measured |
+|---|---|---|
+| high task's mutex wait | p50 ~1.5–1.9 ms, max < 3,050 us | p50 **1,749.33** us, max **2,017.02** us |
+| contended / inheritance seen | every round | **1,667 / 1,667** |
+| CPU load | ~56–60 % | **55.7 %** |
+| deadline misses, lost ticks, lost messages | 0 | **0, 0, 0** (17,190 messages) |
+| interrupts delivered | all | **20,060 / 20,060** |
+| interrupt → task, p50 | ~3–5 us | notify **6.00**, queue **7.46**, semaphore **7.33** us -- missed, and identical to the second run |
+| control-loop jitter, p99.9 | < 20 us | **34.80** us -- missed, and identical to the second run |
+| timer-callback jitter | p99 ~200 us | p99 **221.86** us; max **998.22** us |
+| event_group_sync skew | (73 us p99 in the second run) | p50 **11.73**, p99 **1,169.06** us |
+
+The two misses reproduce to the hundredth of a microsecond, so they are fixed
+costs to decompose, not noise. The event-group p99 moved with the staged
+scenario. The hypothesis, untested: the event tasks share priority 3 with `hi`,
+and during each round `lo` runs at priority 3 too, by inheritance. An event wake
+inside that window waits a tick for its round-robin turn. With event wakes
+cycling through three phases of the 12-tick round, about a third of
+rendezvous would be exposed: p99 a tick, p50 untouched. FreeRTOS would behave
+the same; the workload produces it, not the kernel.
+
+Still to run on the board: `--features no-inherit`, which must FAIL both
+inheritance checks.
+
