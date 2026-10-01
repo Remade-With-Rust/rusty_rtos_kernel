@@ -1,0 +1,31 @@
+[package]
+name = "rusty_rtos_kernel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Coverage-guided fuzzing of the kernel's public API (hardening gates H-26/H-27)."
+
+# Test tooling, never shipped: `libfuzzer-sys` builds libFuzzer, which is C++.
+# This is its own workspace, so none of it reaches the kernel's dependency
+# graph, its `cargo vet` / `cargo deny` scope, or tools/no-c-audit.sh.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_rtos_kernel-core = { path = "../crates/rusty_rtos_kernel-core" }
+rusty_rtos_core = { version = "0.2.1", default-features = false }
+
+[[bin]]
+name = "kernel_api"
+path = "fuzz_targets/kernel_api.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
