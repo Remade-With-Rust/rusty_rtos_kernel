@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "Every Kairos kernel feature at once on a XIAO ESP32-S3, with real-time latency, jitter and deadline measurements on the 1-cycle ccount."
 
 [features]
-default = []
+default = ["fp-save"]
 # Run for ten minutes instead of twenty seconds: the worst case only means
 # something over a long run.
 long = []
@@ -17,13 +17,26 @@ no-inherit = []
 # Cut the interrupt -> task latency into ten stamped segments, and measure one
 # bare esp-hal interrupt's entry and exit; see src/decompose.rs.
 decompose = []
+# Fix 1: an interrupt that wakes a task switches inside its own trap, instead
+# of raising `Software0` and taking a second trap to do it.
+switch-in-trap = []
+# Fix 2 is the ABSENCE of this one: esp-hal's `float-save-restore`, which
+# saves and restores 18 FP words on every trap and makes the port copy them on
+# every switch. Nothing here uses the FPU. Build with `--no-default-features`
+# to drop it; xtensa-lx-rt then traps with CPENABLE = 0, and every task starts
+# with the FPU disabled (the port zero-fills a new context), so a float in a
+# task faults loudly instead of corrupting another task's FP registers.
+fp-save = ["esp-hal/float-save-restore"]
+# Fix 4: the firmware's, the kernel's and the port's code in IRAM instead of
+# flash behind the instruction cache (`kairos_iram.x`, via `build.rs`).
+iram = []
 
 [dependencies]
 rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
 rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
 rusty_rtos_port-xtensa = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-xtensa", default-features = false }
 xtensa-lx = "0.12"
-esp-hal = { version = "=1.2.1", features = ["esp32s3", "unstable"] }
+esp-hal = { version = "=1.2.1", default-features = false, features = ["esp32s3", "unstable", "rt", "exception-handler"] }
 esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32s3"] }
 esp-println = { version = "=0.18.0", default-features = false, features = [
     "esp32s3",

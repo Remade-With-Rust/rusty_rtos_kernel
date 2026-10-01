@@ -190,12 +190,30 @@ fn clear_alarm(cell: &AlarmCell) {
     }
 }
 
+/// `--features switch-in-trap`: an interrupt that wakes a task switches to
+/// it inside its OWN trap, on the frame that trap is about to restore, rather
+/// than raising `Software0` and taking a second trap to do it.
+///
+/// That is FreeRTOS's Xtensa shape -- the switch happens on the way out of
+/// the interrupt -- and the decomposition priced the second trap at 345
+/// cycles of a 1,485-cycle notify wake. It is possible here because esp-hal's
+/// dispatcher hands every peripheral handler the trap frame, and `#[handler]`
+/// accepts `fn(&mut Context)` for exactly that.
+const SWITCH_IN_TRAP: bool = cfg!(feature = "switch-in-trap");
+
 /// `Software0`: the switch. The port raises it; the kernel decides.
 #[esp_hal::ram]
 #[unsafe(export_name = "Software0")]
 fn switching_interrupt(trap_frame: &mut Context) {
     mark(Mark::SwIn);
     clear_switch_request();
+    switch_on(trap_frame);
+}
+
+/// The switch itself, on the trap frame the current trap will restore:
+/// ask the kernel who is next, and swap the frame for that task's context.
+#[esp_hal::ram]
+fn switch_on(trap_frame: &mut Context) {
     let from = CURRENT.load(Ordering::Acquire) as usize;
     let to = with_kernel_in_isr(|k| {
         k.switch_context();
@@ -219,23 +237,48 @@ fn switching_interrupt(trap_frame: &mut Context) {
     mark(Mark::SwOut);
 }
 
+/// A peripheral handler that is given the trap frame.
+///
+/// esp-hal =1.2.1 (pinned) stores every handler as `extern "C" fn()` and its
+/// dispatcher (`handle_interrupts`) transmutes it back to `fn(&mut Context)`
+/// and calls it with the frame it will restore. A `fn(&mut Context)` stored
+/// here therefore round-trips to exactly its own type. `#[esp_hal::handler]`
+/// accepts the same signature but then fails to type-check it in this
+/// version, so the wiring is done by hand.
+fn framed(f: fn(&mut Context)) -> esp_hal::interrupt::InterruptHandler {
+    // SAFETY: a function pointer is one word under either type, and the only
+    // caller transmutes it back to `fn(&mut Context)` before calling it.
+    #[allow(unsafe_code)]
+    let f = unsafe { core::mem::transmute::<fn(&mut Context), extern "C" fn()>(f) };
+    esp_hal::interrupt::InterruptHandler::new(f, esp_hal::interrupt::Priority::min())
+}
+
 /// `SYSTIMER` alarm 0: the 1 kHz tick.
-#[esp_hal::handler]
-fn tick_interrupt() {
+fn tick_interrupt(frame: &mut Context) {
     clear_alarm(&TICK_ALARM);
     if with_kernel_in_isr(Kernel::increment_tick).unwrap_or(false) {
-        yield_now();
+        if SWITCH_IN_TRAP {
+            switch_on(frame);
+        } else {
+            yield_now();
+        }
     }
 }
 
 /// `SYSTIMER` alarm 1: the interrupt source, every `IRQ_PERIOD_US`. The stamp
 /// is the handler's first statement; everything after it is in the latency.
-#[esp_hal::handler]
-fn irq_source() {
+fn irq_source(frame: &mut Context) {
     let stamp = get_cycle_count();
     clear_alarm(&IRQ_ALARM);
     mark(Mark::Cleared);
     if irq_fire(stamp) {
+        if SWITCH_IN_TRAP {
+            // E and F coincide: there is no second trap between them.
+            mark(Mark::Raised);
+            mark(Mark::SwIn);
+            switch_on(frame);
+            return;
+        }
         yield_now();
     }
     mark(Mark::Raised);
@@ -380,7 +423,7 @@ fn main() -> ! {
     };
     let started_ok = match (tick, irq) {
         (Some(tick), Some(irq)) => {
-            start_alarm(tick, TICK_US, tick_interrupt) && start_alarm(irq, IRQ_PERIOD_US, irq_source)
+            start_alarm(tick, TICK_US, framed(tick_interrupt)) && start_alarm(irq, IRQ_PERIOD_US, framed(irq_source))
         }
         _ => false,
     };

@@ -3,8 +3,9 @@ target = "xtensa-esp32s3-none-elf"
 
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor"
+# `-Tlinkall.x` is passed by build.rs, not here: with `--features iram` it is
+# replaced by `kairos_iram.x`, which INCLUDEs it (see that file for why).
 rustflags = [
-    "-C", "link-arg=-Tlinkall.x",
     "-C", "link-arg=-nostartfiles",
 ]
 
