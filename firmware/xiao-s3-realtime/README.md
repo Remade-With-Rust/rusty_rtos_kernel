@@ -332,3 +332,45 @@ and every mechanism's p99.9 stays at 11–15 us. The likely cause is the tick an
 source landing in the same window (997 us against 1,000 us beat about every third of a second).
 That is untested.
 
+### The second sweep (2026-10-01): fixes as the default, the tick test, one refutation
+
+`board-sweep.ps1` after the defaults flipped; all five PASS. Run 1 is the default, and each
+other run opts one fix back out. p50 cycles, notify (sum of segments):
+
+| build | notify | queue | semaphore | headline notify p50 |
+|---|---:|---:|---:|---:|
+| default (all three fixes) | **1,061** | **1,371** | **1,317** | **4.40 us** |
+| `software0-switch` | 1,328 | 1,638 | 1,584 | 5.60 |
+| `fp-save` | 1,286 | 1,595 | 1,541 | 5.33 |
+| `flash-code` | 8,306 * | 1,372 | 1,318 | 12.26 * |
+| none of the three | 1,590 | 1,890 | 1,835 | 6.66 |
+
+\* In this flash build, notify's call made again ran at **7,370 cycles at p50**: a layout whose
+cache conflicts land on that path every time. The previous sweep's flash builds did not show
+it. IRAM is what makes these numbers stable from build to build.
+
+**The tick test confirms the tail hypothesis.** In every IRAM build, the events with no tick
+handler inside them have **no tail at all**: default notify clean n = 6,613, p50 1,056, p99 1,098,
+**max 1,098 cycles (4.6 us)**. Every event above that had a tick inside it (74 events, 1.1 %,
+max 3,806). The same holds for queue (clean max 1,403) and semaphore (1,352). In flash builds the
+clean events still reach 12,000+ cycles: that is the cache, on top of the tick. What is left in
+the tail is real concurrent work. The tick's own trap and its wake-ups land inside the
+interrupt's window, which is load the system has, not a defect in the path.
+
+**The event-group skew's one-tick p99 is layout too.** It is 1,152–1,169 us in both flash builds
+and 27–36 us in all three IRAM builds. The round-robin explanation is withdrawn.
+
+**Measured and kept:**
+- `irq_fire`'s bookkeeping: 87 -> 36 cycles. The tick test's own hook costs +9 in A>B (13 -> 22).
+
+**Measured and reverted:**
+- An in-line context copy in the port in place of `copy_nonoverlapping`. That call lowers to the
+  S3's mask-ROM `memcpy`, and the ROM routine won: 247 vs 278 cycles without FP save, and 347 vs
+  484 with it. It is recorded at the call in `rusty_rtos_port-xtensa`. With the ROM copy back,
+  the default's notify path projects to about 1,030 cycles. That is a projection from the two
+  sweeps, not a measurement.
+
+From the first decomposition (1,485 cycles, notify, every fix off) to the default (1,061
+measured, with the slower copy): **-29 %**, and the worst case without a coincident tick is
+4.6 us. The earliest plain build, without the stamps, read 6.00 us.
+
