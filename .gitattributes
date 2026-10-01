@@ -30,3 +30,5 @@ seam/*.c             linguist-detectable=false
 # `memory.x` is a linker script. Linguist reads a bare `.x` as RPC, which is
 # how "RPC" appeared in the language bar of four of these repositories.
 *.x                  linguist-language=Linker Script
+# cargo vet checks its store byte for byte, in its own format: never CRLF.
+supply-chain/** text eol=lf
