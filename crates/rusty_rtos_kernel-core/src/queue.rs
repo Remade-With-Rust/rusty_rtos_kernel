@@ -1326,21 +1326,30 @@ where
             }
         }
         self.enter_critical();
-        // ONLY the fields the fast path reads. This was `*q` -- the whole
-        // eleven-field descriptor copied to reach five of them, and on rv32
-        // that is nine words of `usize` where four are dead on every
-        // successful receive. Eleven live fields is also more than LLVM will
-        // keep in hand, which is why this function claimed callee-saved
-        // registers it had no use for. The blocking tail below still wants
-        // the whole thing and re-resolves for it, outside the section and at
-        // no cost to the clock, exactly as the resume arms above do.
-        let (waiting, kind, base, length, read_from) = match self.queues.resolve(queue) {
-            Ok(q) => (q.waiting, q.kind, q.base, q.length, q.read_from),
+        // ONE resolve, mutable, for the whole fast path, reading only the
+        // fields it uses. Two earlier shapes, both measured:
+        //  - `*q`, the whole eleven-field descriptor copied to reach five of
+        //    them: nine words of `usize` on rv32 with four dead on every
+        //    successful receive, and more live fields than LLVM keeps in
+        //    hand, so the function claimed callee-saved registers it had no
+        //    use for;
+        //  - the five fields read through `resolve`, then the item taken
+        //    through `copy_data_from_queue`, which resolved the handle AGAIN
+        //    to write `read_from` and `waiting` back. On rv32 LLVM merged the
+        //    two at run time, but every inlined copy carried the second body
+        //    (-242 B of flash, -395,353 kernel-ir), and on the Xtensa S3 the
+        //    copy was an outlined call on every receive.
+        // The blocking tail below still wants the whole descriptor and
+        // re-resolves for it, outside the section and at no cost to the
+        // clock, exactly as the resume arms above do.
+        let q = match self.queues.resolve_mut(queue) {
+            Ok(q) => q,
             Err(e) => {
                 self.exit_critical();
                 return Err(e);
             }
         };
+        let (waiting, kind) = (q.waiting, q.kind);
         // The wait frame is set where the C sets it: `xQueueReceive` and
         // `xQueueGenericSend` call `vTaskInternalSetTimeOutState` only
         // after finding the queue unusable AND the block time non-zero,
@@ -1352,7 +1361,22 @@ where
         // nothing leaves the caller exactly as it found it -- which is
         // what `configASSERT( pxQueue )` means in the C.
         if waiting > 0 {
-            let value = self.copy_data_from_queue(queue, kind, base, length, read_from, peek)?;
+            // `copy_data_from_queue`, in place, on the reference above.
+            let value = if kind.carries_data() {
+                let next = wrap_next(q.read_from, q.length);
+                let value = self.slots.get(q.base.wrapping_add(next)).copied().unwrap_or(0);
+                if !peek {
+                    q.read_from = next;
+                    // Wrapping: `waiting > 0` was read under this section.
+                    q.waiting = q.waiting.wrapping_sub(1);
+                }
+                value
+            } else {
+                if !peek {
+                    q.waiting = q.waiting.wrapping_sub(1);
+                }
+                0
+            };
             self.note_exits();
             let tick = self.tick;
             // `xQueuePeek` is its own function in the C with its own trace

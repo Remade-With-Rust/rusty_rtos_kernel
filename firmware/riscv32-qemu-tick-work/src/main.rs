@@ -558,6 +558,80 @@ fn main() -> ! {
         *slot = b.wrapping_sub(a) as u32;
     }
     let notify_wait_empty = summarise(&mut nw_samples, tax);
+
+    // ------------------- ROWS 20-25: an INTERRUPT wakes a blocked task -----
+    //
+    // Behind `--features isr-rows`, because adding these call sites moves the
+    // rows above: LTO re-decides inlining for the shared paths, and with them
+    // in the binary `block_cycle` read 934 against 924 and `notify_roundtrip`
+    // 70 against 53. The default binary, and every figure recorded from it,
+    // stay as they were.
+    //
+    // `block_cycle`'s shape with the wake moved into an interrupt: the waiter
+    // blocks, the other task runs, a `_from_isr` call wakes the waiter, the
+    // scheduler selects it, and the waiter's call made again returns the
+    // value. The block and the first switch happen OUTSIDE the brackets; the
+    // three bracketed pieces are the kernel's share of an interrupt -> task
+    // latency, and they map onto the S3 decomposition's segments:
+    //
+    //   *_isr     the `_from_isr` call            (S3 segment C>D)
+    //   *_select  `switch_context`               (S3 segment F>G)
+    //   *_again   the call made again: `Ready`   (S3 segment J>K)
+    //
+    // On the S3 (`firmware/xiao-s3-realtime`, `--features decompose`) a queue
+    // wake cost 903 cycles across those three and a notify wake 555.
+    #[cfg(feature = "isr-rows")]
+    let isr_rows = {
+        // `send_full` left the queue full; drain it, so the first receive
+        // blocks.
+        for _ in 0..4 {
+            let _ = kernel.queue_receive(sq, 0);
+        }
+        let waiter = kernel.current();
+        let mut q = [[0u32; SAMPLES]; 3];
+        for i in 0..SAMPLES {
+            let _ = kernel.queue_receive(sq, 10);
+            kernel.switch_context();
+            let t0 = minstret();
+            let _ = kernel.queue_send_from_isr(sq, 7);
+            let t1 = minstret();
+            kernel.switch_context();
+            let t2 = minstret();
+            let _ = kernel.queue_receive(sq, 0);
+            let t3 = minstret();
+            q[0][i] = t1.wrapping_sub(t0) as u32;
+            q[1][i] = t2.wrapping_sub(t1) as u32;
+            q[2][i] = t3.wrapping_sub(t2) as u32;
+        }
+        let mut n = [[0u32; SAMPLES]; 3];
+        for i in 0..SAMPLES {
+            let _ = kernel.notify_take(0, true, 10);
+            kernel.switch_context();
+            let t0 = minstret();
+            let _ = kernel.notify_from_isr(waiter, 0, 7, NotifyAction::Overwrite);
+            let t1 = minstret();
+            kernel.switch_context();
+            let t2 = minstret();
+            let _ = kernel.notify_take(0, true, 0);
+            let t3 = minstret();
+            n[0][i] = t1.wrapping_sub(t0) as u32;
+            n[1][i] = t2.wrapping_sub(t1) as u32;
+            n[2][i] = t3.wrapping_sub(t2) as u32;
+        }
+        if kernel.current() != waiter {
+            fail("an ISR-wake cycle did not hand the CPU back to the waiter");
+        }
+        let [q0, q1, q2] = &mut q;
+        let [n0, n1, n2] = &mut n;
+        [
+            ("isr_wake_queue_isr", summarise(q0, tax)),
+            ("isr_wake_queue_select", summarise(q1, tax)),
+            ("isr_wake_queue_again", summarise(q2, tax)),
+            ("isr_wake_notify_isr", summarise(n0, tax)),
+            ("isr_wake_notify_select", summarise(n1, tax)),
+            ("isr_wake_notify_again", summarise(n2, tax)),
+        ]
+    };
     #[cfg(feature = "census")]
     hprintln!(
         "CENSUS owe_calls_total={}",
@@ -582,6 +656,10 @@ fn main() -> ! {
     report("queue_roundtrip", &queue_roundtrip);
     report("group_roundtrip", &group_roundtrip);
     report("switch_select", &switch_select);
+    #[cfg(feature = "isr-rows")]
+    for (name, row) in &isr_rows {
+        report(name, row);
+    }
 
     // Work-parity anchors: these must match the C arm exactly, or the two
     // arms did different work and the comparison is void.
