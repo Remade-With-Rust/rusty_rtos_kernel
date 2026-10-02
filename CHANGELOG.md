@@ -3,6 +3,26 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
+## 0.3.2 — 2026-10-02
+
+The two-core kernel, made cheaper: fifteen instruction-count wins on the
+SMP paths, each measured on its own and none changing behaviour.
+
+### Changed
+- **SMP scheduling cost.** Callgrind on the two-core demo corpus (20,000
+  ticks) and the two-core differential, the kernel's own instructions:
+  semtest -23.8%, BlockQ -20.3%, recmutex -24.5%, differential -31.8%. The
+  largest pieces: `prvSelectHighestPriorityTask` walks held tasks by slot and
+  resolves only the one it picks, moves the running task with one list
+  operation (`rusty_rtos_core` 0.2.4's `move_to_end`) and is in line in the
+  switch; `prvYieldForTask` reads the idle mark as a TCB flag bit, as the C
+  keeps `taskATTRIBUTE_IS_IDLE`, and tests the running task by slot. Every
+  change kept the nine-scenario two-core corpus and both SMP differentials
+  identical to FreeRTOS.
+- One-core builds are unchanged to the instruction (`bench/kernel-ir`'s
+  kernel rows read 219,103,567 before and after).
+- Requires `rusty_rtos_core` 0.2.4.
+
 ## 0.3.1 — 2026-10-02
 
 SMP is no longer a preview.

@@ -119,6 +119,22 @@ it does what the C does:
 A one-core build is unchanged: conformance-identical and instruction-count
 neutral.
 
+**What two cores cost (0.3.2).** Fifteen measured changes to the SMP paths
+(selection, the yield-for-task test, the core id, the reap), each kept only
+if every gate above still held and the one-core count did not move:
+
+| two-core shape (callgrind, the kernel's own instructions) | 0.3.1 | 0.3.2 | |
+|---|---:|---:|---:|
+| semtest, 20,000 ticks | 19,518,825 | 14,879,499 | **-23.8%** |
+| BlockQ, 20,000 ticks | 22,197,142 | 17,684,287 | **-20.3%** |
+| recmutex, 20,000 ticks | 5,226,170 | 3,947,934 | **-24.5%** |
+| the two-core differential | 4,867,373 | 3,318,645 | **-31.8%** |
+
+Measured on the 64-bit host, which is not a target: the changes were chosen
+not to depend on pointer width, but no 32-bit two-core count has been taken,
+and there is no C arm for these rows yet. Every change, and the fourteen
+refuted on the way, is in the Kairos umbrella's `bench/smp-ir` and LEDGER.
+
 **Not covered:** core affinity, `configRUN_MULTIPLE_PRIORITIES = 0` (the C's
 default when SMP is off), and more than two cores.
 
