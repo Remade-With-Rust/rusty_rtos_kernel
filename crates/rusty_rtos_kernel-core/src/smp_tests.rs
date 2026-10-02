@@ -344,3 +344,163 @@ fn one_core_builds_never_ask_for_a_cross_core_yield() {
     k.create_task("b", 2).expect("b");
     assert_eq!(k.take_core_yields(), 0);
 }
+
+// ------------------------------------------------- S1b: the OTHER core --
+//
+// `vTaskDelete`, `vTaskSuspend`, `vTaskPrioritySet`, `vTaskResume` and a
+// notification, each acting on a task a DIFFERENT core is running or
+// should run.
+
+/// Two cores running `a` (core 0) and `b` (core 1), both at priority 3,
+/// with a third task `c` ready at 2 for whichever core frees up.
+fn two_running() -> (
+    K<SmpConfig>,
+    crate::StartHandles,
+    [rusty_rtos_core::handle::TaskHandle; 3],
+) {
+    let mut k = kernel::<SmpConfig>();
+    let a = k.create_task("a", 3).expect("a");
+    let b = k.create_task("b", 3).expect("b");
+    let c = k.create_task("c", 2).expect("c");
+    let started = k.start_scheduler().expect("start");
+    switch(&mut k, 0);
+    switch(&mut k, 1);
+    assert_eq!((k.current_on(0), k.current_on(1)), (a, b));
+    let _ = k.take_core_yields();
+    (k, started, [a, b, c])
+}
+
+#[test]
+fn deleting_a_task_another_core_is_running_waits_for_that_core() {
+    let (mut k, _, [_a, b, c]) = two_running();
+    k.port().on(0);
+    k.task_delete(Some(b)).expect("delete b from core 0");
+    assert_eq!(k.take_core_yields(), 0b10, "core 1 is told to switch away");
+    // Not freed yet: core 1 is still executing it.
+    k.check_tasks_waiting_termination();
+    assert!(
+        k.priority_of(Some(b)).is_ok(),
+        "the TCB outlives its core's switch"
+    );
+    // Core 1 switches; `b` is in no ready list, so it takes `c`.
+    switch(&mut k, 1);
+    assert_eq!(k.current_on(1), c);
+    // Now nothing holds `b`, and the reaper frees it.
+    k.check_tasks_waiting_termination();
+    assert!(
+        k.priority_of(Some(b)).is_err(),
+        "reaped once no core holds it"
+    );
+}
+
+#[test]
+fn two_deferred_deletions_are_both_reaped() {
+    let (mut k, _, [a, b, _c]) = two_running();
+    k.port().on(0);
+    k.task_delete(Some(b)).expect("b");
+    k.task_delete(None).expect("a deletes itself");
+    switch(&mut k, 0);
+    switch(&mut k, 1);
+    k.check_tasks_waiting_termination();
+    assert!(k.priority_of(Some(a)).is_err());
+    assert!(k.priority_of(Some(b)).is_err());
+}
+
+#[test]
+fn suspending_a_task_another_core_is_running_yields_that_core() {
+    let (mut k, _, [_a, b, c]) = two_running();
+    k.port().on(0);
+    k.suspend(Some(b)).expect("suspend b");
+    assert_eq!(k.take_core_yields(), 0b10);
+    switch(&mut k, 1);
+    assert_eq!(k.current_on(1), c, "a suspended task is not selected");
+}
+
+#[test]
+fn lowering_a_running_task_on_another_core_yields_that_core() {
+    let (mut k, _, [_a, b, c]) = two_running();
+    let d = {
+        k.port().on(0);
+        k.create_task("d", 3).expect("d")
+    };
+    // `d` at 3 was readied with both cores at 3: nobody is preempted.
+    assert_eq!(k.take_core_yields(), 0);
+    // Lower `b` (running on core 1) to 1: `taskYIELD_TASK_CORE` -- core 1.
+    k.set_priority(Some(b), 1).expect("lower b");
+    assert_eq!(k.take_core_yields(), 0b10);
+    switch(&mut k, 1);
+    assert_eq!(
+        k.current_on(1),
+        d,
+        "core 1 takes the waiting priority-3 task"
+    );
+    let _ = c;
+}
+
+#[test]
+fn raising_a_ready_task_preempts_the_lowest_core() {
+    let mut k = kernel::<SmpConfig>();
+    let a = k.create_task("a", 3).expect("a");
+    let b = k.create_task("b", 2).expect("b");
+    let c = k.create_task("c", 1).expect("c");
+    k.start_scheduler().expect("start");
+    switch(&mut k, 0);
+    switch(&mut k, 1);
+    assert_eq!((k.current_on(0), k.current_on(1)), (a, b));
+    let _ = k.take_core_yields();
+    // Raise the ready `c` above `b`: `taskYIELD_ANY_CORE` picks core 1.
+    k.port().on(0);
+    k.set_priority(Some(c), 4).expect("raise c");
+    assert_eq!(k.take_core_yields(), 0b10);
+    switch(&mut k, 1);
+    assert_eq!(k.current_on(1), c);
+}
+
+#[test]
+fn resuming_a_task_wakes_the_lowest_core() {
+    let (mut k, started, [_a, b, _c]) = two_running();
+    let hi = {
+        k.port().on(0);
+        let hi = k.create_task("hi", 4).expect("hi");
+        // `hi` outranks both; core 1 (the higher-numbered of two equal
+        // candidates) is asked.
+        assert_eq!(k.take_core_yields(), 0b10);
+        switch(&mut k, 1);
+        assert_eq!(k.current_on(1), hi);
+        // Park it, and let core 1 go back to `b`.
+        k.port().on(1);
+        k.suspend(None).expect("hi suspends itself");
+        switch(&mut k, 1);
+        hi
+    };
+    assert_eq!(k.current_on(1), b);
+    let _ = k.take_core_yields();
+    k.port().on(0);
+    k.resume(hi).expect("resume hi");
+    assert_eq!(
+        k.take_core_yields(),
+        0b10,
+        "the resumed task preempts core 1"
+    );
+    let _ = started;
+}
+
+#[test]
+fn a_notification_wakes_its_waiter_on_another_core() {
+    let (mut k, _, [a, b, c]) = two_running();
+    // `b` waits for a notification on core 1, which then runs `c`.
+    k.port().on(1);
+    let w = k.notify_take(0, true, 100).expect("take");
+    assert!(matches!(w, crate::queue::Wait::Blocked));
+    switch(&mut k, 1);
+    assert_eq!(k.current_on(1), c);
+    let _ = k.take_core_yields();
+    // Core 0 notifies `b`: it outranks `c` (core 1), not `a` (core 0).
+    k.port().on(0);
+    k.notify(b, 0, 1, crate::kernel::NotifyAction::Increment)
+        .expect("notify");
+    assert_eq!(k.take_core_yields(), 0b10);
+    switch(&mut k, 1);
+    assert_eq!(k.current_on(1), b);
+    assert_eq!(k.current_on(0), a, "the notifier keeps running");
+}

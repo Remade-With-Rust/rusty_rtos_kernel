@@ -2,7 +2,7 @@
 
 **Status, 2026-10-01: slices S1 and S3 pass. The scheduler core is SMP,**
 **one kernel runs BOTH cores of a XIAO ESP32-S3, and the one-core build is**
-**unchanged.** Slices S1b and S2 remain. This is the K8 SMP half of
+**unchanged.** S1b landed 2026-10-02 (7 more two-core scenarios, 16 in all; one core +2 Ir, the new field's initialisation). S2 remains. This is the K8 SMP half of
 `docs/plans/rtos-mission.md` in the umbrella.
 
 ## 0. Why
@@ -95,7 +95,7 @@ right:
 
 | slice | what | kill test |
 |---|---|---|
-| **S1b** | The one-core-only sites, in priority order:<br>- `vTaskDelete` / `vTaskSuspend` of a task running on ANOTHER core (`prvYieldCore` that core, deferred delete);<br>- `vTaskPrioritySet` (`taskYIELD_TASK_CORE` / `ANY_CORE`);<br>- `vTaskResume`, notify-give, the pending-ready drain in `xTaskResumeAll`;<br>- `prvCheckForRunStateChange` on suspend/critical entry. | each with a `smp_tests` scenario from the C |
+| **S1b -- DONE 2026-10-02** | The one-core-only sites, in priority order:<br>- `vTaskDelete` / `vTaskSuspend` of a task running on ANOTHER core (`prvYieldCore` that core, deferred delete);<br>- `vTaskPrioritySet` (`taskYIELD_TASK_CORE` / `ANY_CORE`);<br>- `vTaskResume`, notify-give, the pending-ready drain in `xTaskResumeAll`;<br>- `prvCheckForRunStateChange` on suspend/critical entry. | each with a `smp_tests` scenario from the C |
 | **S2** | **The C oracle with two cores.** FreeRTOS V11.3.1 built with `configNUMBER_OF_CORES 2` on a deterministic two-core sim port. The cores interleave at critical-section exits (sim contract v1, per core), the trace carries a core id, and `kairos conform` diffs it. | the SMP demo tasks (`FreeRTOS-SMP-Demos`) trace-identical |
 | **S3 -- PASSED 2026-10-01** | **Silicon: both S3 cores** (`rusty_rtos_port/firmware/xiao-s3-smp`). Two spins on two cores take 342 ms against 301 ms alone (one core would need ~603). 2,000/2,000 cross-core ping-pong laps at 16.1 µs per hand-off, with 4,009 IPIs. The hand-off cost is untuned. Built from:<br>- start core 1 (`esp-hal` `CpuControl`);<br>- a cross-core spinlock around `with_kernel`;<br>- `Software0`/`Software1` per core as the switch;<br>- `take_core_yields` raising the other core's `FROM_CPU_INTR`. | the corpus checks on both cores for an hour; a cross-core wake measured in cycles |
 | S4 | `configUSE_CORE_AFFINITY`, `configRUN_MULTIPLE_PRIORITIES == 0`, `configUSE_TASK_PREEMPTION_DISABLE` | the C oracle with each switched on |

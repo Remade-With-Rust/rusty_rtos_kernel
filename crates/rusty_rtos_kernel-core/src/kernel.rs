@@ -577,6 +577,11 @@ pub struct Kernel<
     /// SMP: `xIdleTaskHandles`, so a running idle task can be ranked below
     /// every real task of priority 0 (`prvYieldForTask`).
     idle: [TaskHandle; MAX_CORES],
+    /// SMP: a second task deleted while a core still held it. One core can
+    /// owe at most one deferred reap (its own task); two cores can owe two,
+    /// so SMP needs a second slot -- here at the end for the same layout
+    /// reason as the fields above.
+    awaiting_reap_smp: TaskHandle,
 }
 
 impl<
@@ -750,6 +755,7 @@ where
             yield_requested: [false; MAX_CORES],
             core_yields: 0,
             idle: [TaskHandle::NULL; MAX_CORES],
+            awaiting_reap_smp: TaskHandle::NULL,
             task_count: 0,
             stalls: 0,
             first_stall: Stall::None,
@@ -1913,6 +1919,27 @@ where
         if let Some(core) = lowest_core {
             self.yield_core(core);
         }
+    }
+
+    /// SMP: `task` (now at `priority`) has just become ready, so run
+    /// `prvYieldForTask` -- `taskYIELD_ANY_CORE_IF_USING_PREEMPTION` -- and
+    /// answer whether THIS core now owes a yield.
+    ///
+    /// Every one-core "did the woken task outrank the running one?" test has
+    /// this as its SMP arm. Out of line for the MIR-inliner reason the SMP
+    /// tick bodies are.
+    #[cold]
+    #[inline(never)]
+    fn smp_readied(&mut self, task: TaskHandle, priority: u8) -> bool {
+        if C::USE_PREEMPTION {
+            self.yield_for_task(task, priority);
+        }
+        self.pending_here()
+    }
+
+    /// The core holding `task` -- running it, or asked to yield it.
+    fn held_core(&self, task: TaskHandle) -> Option<usize> {
+        (0..Self::cores()).find(|&c| self.current_of(c) == task)
     }
 
     /// The OTHER cores this kernel has asked to yield since the last call,
@@ -3101,7 +3128,14 @@ where
                 self.add_task_to_ready_list(task)?;
             }
             let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-            if woken > self.current_priority() {
+            if C::NUMBER_OF_CORES > 1 {
+                // `prvYieldForTask`; the caller's flag is whether THIS core
+                // now owes a yield, and a task-side notify takes it here.
+                woke_higher = self.smp_readied(task, woken);
+                if woke_higher && !from_isr {
+                    self.port_yield();
+                }
+            } else if woken > self.current_priority() {
                 woke_higher = true;
                 if from_isr {
                     // The C sets `xYieldPendings[ 0 ]` here as well as
@@ -3612,7 +3646,9 @@ where
         // configUSE_PREEMPTION, one core: pend the yield rather than take
         // it, so it lands where `xTaskResumeAll` puts it.
         let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-        if woken > self.current_priority() {
+        if C::NUMBER_OF_CORES > 1 {
+            let _ = self.smp_readied(task, woken);
+        } else if woken > self.current_priority() {
             self.set_pending_here(true);
         }
         let _ = self.resume_all();
@@ -3796,6 +3832,18 @@ where
             self.reset_next_task_unblock_time();
             self.exit_critical();
         }
+        if C::NUMBER_OF_CORES > 1 {
+            // `vTaskSuspend`: the core running `target` switches away -- this
+            // one now, another by `prvYieldCore`.
+            if self.running {
+                match self.running_core(target) {
+                    Some(core) if core == self.core() => self.port_yield(),
+                    Some(core) => self.yield_core(core),
+                    None => {}
+                }
+            }
+            return Ok(());
+        }
         if target == caller {
             if self.running {
                 // portYIELD_WITHIN_API(), outside the section.
@@ -3832,7 +3880,11 @@ where
                 // section, and only when the resumed task outranks the
                 // running one.
                 let resumed = self.tcbs.resolve(task)?.priority;
-                if C::USE_PREEMPTION && self.current_priority() < resumed {
+                if C::NUMBER_OF_CORES > 1 {
+                    if self.smp_readied(task, resumed) {
+                        self.port_yield();
+                    }
+                } else if C::USE_PREEMPTION && self.current_priority() < resumed {
                     self.port_yield();
                 }
             }
@@ -3906,12 +3958,29 @@ where
         // `xSchedulerRunning != pdFALSE && taskTASK_IS_RUNNING_OR_SCHEDULED_
         // _TO_YIELD( pxTCB )`, which at `configNUMBER_OF_CORES 1` is exactly
         // `pxTCB == pxCurrentTCB`.
-        let defer = self.running && target == self.cur();
+        // SMP: a task any core still holds -- running, or asked to yield --
+        // cannot have its TCB freed under that core (`vTaskDelete`'s
+        // `taskTASK_IS_RUNNING_OR_SCHEDULED_TO_YIELD`).
+        let holder = if C::NUMBER_OF_CORES > 1 {
+            self.held_core(target)
+        } else {
+            None
+        };
+        let defer = self.running
+            && if C::NUMBER_OF_CORES > 1 {
+                holder.is_some()
+            } else {
+                target == self.cur()
+            };
         if defer {
             // `vListInsertEnd( &xTasksWaitingTermination, ... )` and
             // `++uxDeletedTasksWaitingCleanUp`. The count is NOT decremented
             // here — the idle task does that when it reaps.
-            self.awaiting_reap = target;
+            if C::NUMBER_OF_CORES > 1 && !self.awaiting_reap.is_null() {
+                self.awaiting_reap_smp = target;
+            } else {
+                self.awaiting_reap = target;
+            }
             self.trace_task(target, |task, name| Event::TaskDelete { task, name });
         } else {
             self.task_count = self.task_count.saturating_sub(1);
@@ -3930,13 +3999,52 @@ where
         // `xSchedulerRunning && pxTCB == pxCurrentTCB`, which is the same
         // condition that chose the deferred path.
         if defer {
-            self.port_yield();
+            if C::NUMBER_OF_CORES > 1 {
+                // The holder switches away: this core now, another core by
+                // `prvYieldCore` -- unless it was already asked.
+                match holder {
+                    Some(core) if core == self.core() => self.port_yield(),
+                    Some(core) if self.running_core(target) == Some(core) => {
+                        self.yield_core(core);
+                    }
+                    _ => {}
+                }
+            } else {
+                self.port_yield();
+            }
         }
         Ok(())
     }
 
     /// `prvDeleteTCB`: two frees, and on the oracle's heap each one suspends
     /// the scheduler, so each is one outermost exit.
+    /// `prvCheckTasksWaitingTermination` on SMP: free a deleted task only
+    /// once NO core holds it -- the other core may not have switched away
+    /// yet.
+    #[cold]
+    #[inline(never)]
+    fn reap_smp(&mut self) {
+        for smp_slot in [false, true] {
+            let task = if smp_slot {
+                self.awaiting_reap_smp
+            } else {
+                self.awaiting_reap
+            };
+            if task.is_null() || self.held_by_any_core(task) {
+                continue;
+            }
+            self.enter_critical();
+            if smp_slot {
+                self.awaiting_reap_smp = TaskHandle::NULL;
+            } else {
+                self.awaiting_reap = TaskHandle::NULL;
+            }
+            self.task_count = self.task_count.saturating_sub(1);
+            self.exit_critical();
+            self.delete_tcb(task);
+        }
+    }
+
     fn delete_tcb(&mut self, task: TaskHandle) {
         // `vPortFreeStack( pxTCB->pxStack )`.
         self.account_for_allocation();
@@ -3981,6 +4089,10 @@ where
     /// it yields before it can return, so a second deferred delete cannot
     /// happen until this has run.
     pub fn check_tasks_waiting_termination(&mut self) {
+        if C::NUMBER_OF_CORES > 1 {
+            self.reap_smp();
+            return;
+        }
         let task = self.awaiting_reap;
         if task.is_null() {
             return;
@@ -4014,6 +4126,15 @@ where
                 priority: Self::priority_value(new_priority),
             });
             let base = self.tcbs.resolve(target)?.base_priority;
+            // SMP (`vTaskPrioritySet`): raising readies a contender anywhere
+            // (`taskYIELD_ANY_CORE`); lowering a RUNNING task yields the core
+            // running it (`taskYIELD_TASK_CORE`), which may not be this one.
+            let mut smp_yield_for = C::NUMBER_OF_CORES > 1 && new_priority > base;
+            let smp_yield_core = if C::NUMBER_OF_CORES > 1 && new_priority < base {
+                self.running_core(target)
+            } else {
+                None
+            };
             if base != new_priority {
                 if new_priority > base {
                     if target != self.cur() && new_priority > self.current_priority() {
@@ -4038,10 +4159,25 @@ where
                 if self.lists.container(item)? == Some(Self::ready_list(used_on_entry)) {
                     let _ = self.lists.remove(item);
                     self.add_task_to_ready_list(target)?;
+                } else {
+                    // Not ready (blocked or suspended): nothing to yield for.
+                    smp_yield_for = false;
                 }
                 // taskYIELD_TASK_CORE_IF_USING_PREEMPTION: inside the
                 // section.
-                if yield_required && C::USE_PREEMPTION {
+                if C::NUMBER_OF_CORES > 1 {
+                    if C::USE_PREEMPTION {
+                        if let Some(core) = smp_yield_core {
+                            self.yield_core(core);
+                        } else if smp_yield_for {
+                            let now = self.tcbs.resolve(target)?.priority;
+                            self.yield_for_task(target, now);
+                        }
+                        if self.pending_here() {
+                            self.port_yield();
+                        }
+                    }
+                } else if yield_required && C::USE_PREEMPTION {
                     self.port_yield();
                 }
             }
@@ -4098,7 +4234,9 @@ where
             }
             moved_any = true;
             let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-            if woken > self.current_priority() {
+            if C::NUMBER_OF_CORES > 1 {
+                let _ = self.smp_readied(task, woken);
+            } else if woken > self.current_priority() {
                 self.set_pending_here(true);
             }
         }
@@ -4457,7 +4595,10 @@ where
         let _ = self.lists.remove(item);
         let _ = self.lists.remove(Self::state_item(task));
         self.add_task_to_ready_list(task)?;
-        if self.tcbs.resolve(task)?.priority > self.current_priority() {
+        let woken = self.tcbs.resolve(task)?.priority;
+        if C::NUMBER_OF_CORES > 1 {
+            let _ = self.smp_readied(task, woken);
+        } else if woken > self.current_priority() {
             self.set_pending_here(true);
         }
         Ok(())
