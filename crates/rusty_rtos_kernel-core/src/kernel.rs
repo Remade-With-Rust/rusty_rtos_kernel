@@ -2605,7 +2605,11 @@ where
     const F_WAIT: u8 = 1 << 2;
     /// `taskATTRIBUTE_IS_IDLE`, SMP only: set on each core's idle task by
     /// `start_scheduler_smp`, cleared whenever a slot gets a new task.
-    const F_IDLE: u8 = 1 << 3;
+    ///
+    /// The SIGN bit on purpose. `yield_for_task` subtracts it as 0 or 1,
+    /// which LLVM builds as a sign mask: from bit 3 that took `shl $4`,
+    /// `sar $7` and a sign-extension per core; from bit 7 the `shl` is gone.
+    const F_IDLE: u8 = 1 << 7;
 
     /// Read one per-task flag.
     ///
