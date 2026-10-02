@@ -155,25 +155,25 @@ dependencies = [
 
 [[package]]
 name = "rusty_rtos_core"
-version = "0.2.0"
+version = "0.2.3"
 
 [[package]]
 name = "rusty_rtos_kernel-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusty_rtos_core",
 ]
 
 [[package]]
 name = "rusty_rtos_port-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusty_rtos_core",
 ]
 
 [[package]]
 name = "rusty_rtos_port-riscv"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusty_rtos_core",
 ]

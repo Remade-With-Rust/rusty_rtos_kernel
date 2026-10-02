@@ -996,7 +996,8 @@ where
     /// things -- give it two names instead of averaging them.
     /// [`Kernel::send_generic_outlined`] is the out-of-line handle, and the
     /// four colder wrappers call that.
-    #[inline(always)]
+    #[cfg_attr(not(feature = "small"), inline(always))]
+    #[cfg_attr(feature = "small", inline(never))]
     pub fn queue_send_generic(
         &mut self,
         queue: QueueHandle,
@@ -1305,7 +1306,8 @@ where
     /// 262,828 up and gives back 427,983 of `khot-ir`'s win, and outlining at
     /// the receive site leaves it 190,238 up and gives back 1,104,183 -- so
     /// the regression is the wrappers growing, not any one call site.
-    #[inline(always)]
+    #[cfg_attr(not(feature = "small"), inline(always))]
+    #[cfg_attr(feature = "small", inline(never))]
     fn queue_take(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
         let caller = self.cur();
         // Resuming below the sampling exit, as `queue_send_generic` does.

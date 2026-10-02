@@ -18,6 +18,13 @@ default = ["std"]
 # A reachability census: counts entries to the failure funnel. Instrument
 # tax INSIDE the measured bracket, so never on for a build that quotes counts.
 census = []
+# The FLASH profile: the hot kernel paths that are inlined for speed -- the
+# queue take and send bodies, `xTaskResumeAll` -- get one out-of-line body
+# each instead. Every one of them is a measured speed-for-flash trade
+# (docs/LEDGER.md, 2026-09-30, "flash, decomposed to the byte"); this spends
+# them all for a part where flash is the constraint. Same behaviour, same
+# trace, fewer bytes and more instructions.
+small = []
 # The feature ladder is the rusty_zstd one: `std` implies `alloc`; with neither,
 # the crate is pure `core` and still builds on Cortex-M and RISC-V bare metal.
 std = ["alloc", "rusty_rtos_core/std"]

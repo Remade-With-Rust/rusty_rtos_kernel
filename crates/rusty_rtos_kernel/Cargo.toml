@@ -17,6 +17,8 @@ categories = ["embedded", "no-std", "os"]
 default = ["std"]
 std = ["rusty_rtos_kernel-core/std"]
 alloc = ["rusty_rtos_kernel-core/alloc"]
+# The flash profile: see `rusty_rtos_kernel-core`'s `small`.
+small = ["rusty_rtos_kernel-core/small"]
 
 [dependencies]
 rusty_rtos_kernel-core = { workspace = true }
