@@ -40,7 +40,11 @@ extern UBaseType_t uxCriticalNestings[ 2 ];
 
 #define portMAX_CORE_COUNT        2
 #define portGET_CORE_ID()         ( ( BaseType_t ) fake_core )
-#define portYIELD()               ( fake_yields |= ( 1u << fake_core ) )
+/* A function, not a store, so the blocking-waits driver can hook it: a task
+ * that has just placed itself on an event list leaves the kernel HERE, as it
+ * would on a real port, and resumes here when it next runs. */
+void fake_yield( void );
+#define portYIELD()               fake_yield()
 #define portYIELD_CORE( a )       ( fake_yields |= ( 1u << ( a ) ) )
 #define portYIELD_FROM_ISR( x )   do { if( x ) { portYIELD(); } } while( 0 )
 #define portEND_SWITCHING_ISR( x ) portYIELD_FROM_ISR( x )

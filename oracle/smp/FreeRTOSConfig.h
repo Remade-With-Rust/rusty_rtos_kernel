@@ -41,6 +41,10 @@
 #define INCLUDE_xTimerGetTimerDaemonTaskHandle  1
 
 void vAssertCalled( const char * file, int line );
+
+/* The blocking-waits driver needs to know when a take is about to block. */
+void fake_trace_blocking( void );
+#define traceBLOCKING_ON_QUEUE_RECEIVE( pxQueue )    fake_trace_blocking()
 #define configASSERT( x )    if( ( x ) == 0 ) vAssertCalled( __FILE__, __LINE__ )
 
 #endif

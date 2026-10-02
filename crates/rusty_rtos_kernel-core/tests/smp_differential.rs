@@ -11,7 +11,14 @@
 //! Kairos, and must print the SAME lines. A divergence names the first step
 //! that differs and prints the neighbourhood.
 //!
-//! Regenerate the trace (WSL, the oracle fetched by `kairos oracle fetch`):
+//! A second script, `smp_block.trace`, lets takes BLOCK. The C driver runs
+//! each blocking take in a coroutine that leaves the kernel at the yield, and
+//! resumes it -- `cont` -- the next time that task is current on either core.
+//! Kairos does the same through its retry protocol: `Wait::Blocked` means
+//! "make the same call again when this task next runs", and the kernel
+//! carries the wait's own state across.
+//!
+//! Regenerate both traces (WSL, the oracle fetched by `kairos oracle fetch`):
 //! `cd oracle/smp && sh run.sh`.
 #![allow(
     clippy::unwrap_used,
@@ -26,7 +33,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use rusty_rtos_core::config::Config;
-use rusty_rtos_core::handle::TaskHandle;
+use rusty_rtos_core::handle::{QueueHandle, TaskHandle};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -36,6 +43,7 @@ use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_kernel_core::{Kernel, list_slots_for, lists_for};
 
 const TRACE: &str = include_str!("../../../oracle/smp/smp.trace");
+const TRACE_BLOCK: &str = include_str!("../../../oracle/smp/smp_block.trace");
 
 /// `oracle/smp/FreeRTOSConfig.h`, field for field.
 struct DiffConfig;
@@ -122,6 +130,8 @@ const SLOTS: usize = 10;
 struct Driver {
     k: K,
     app: [Option<TaskHandle>; SLOTS],
+    /// A take suspended inside the kernel, by slot: its block time.
+    pending: [Option<u64>; SLOTS],
     created: u32,
     out: String,
 }
@@ -143,6 +153,29 @@ impl Driver {
 
     fn is_app(&self, h: TaskHandle) -> bool {
         self.app.contains(&Some(h))
+    }
+
+    fn slot_of(&self, h: TaskHandle) -> Option<usize> {
+        self.app.iter().position(|a| *a == Some(h))
+    }
+
+    /// A take, made or continued, as the C prints it: 1 taken, 0 timed out,
+    /// 2 blocked (and now pending).
+    fn take_blocking(&mut self, slot: usize, sem: QueueHandle, ticks: u64) -> i64 {
+        match self.k.semaphore_take(sem, ticks) {
+            Ok(Wait::Ready(())) => {
+                self.pending[slot] = None;
+                1
+            }
+            Ok(Wait::Blocked) => {
+                self.pending[slot] = Some(ticks);
+                2
+            }
+            Err(_) => {
+                self.pending[slot] = None;
+                0
+            }
+        }
     }
 
     fn switch_core(&mut self, c: u8) {
@@ -176,11 +209,12 @@ impl Driver {
     }
 }
 
-fn run() -> String {
+fn run(blocking: bool) -> String {
     let mut rng = Rng(0x2545_f491);
     let mut d = Driver {
         k: K::new(DiffPort::default(), NoTrace).expect("geometry"),
         app: [None; SLOTS],
+        pending: [None; SLOTS],
         created: 0,
         out: String::new(),
     };
@@ -212,6 +246,22 @@ fn run() -> String {
         let t = d.app[slot];
         let op;
 
+        // A task with a take suspended inside the kernel runs nothing else
+        // until that take returns: if it is current here, the step is the
+        // continuation -- the same call again, which is the retry protocol.
+        if blocking {
+            let cur = d.k.current_on(usize::from(core));
+            if let Some(s) = d.slot_of(cur) {
+                if let Some(ticks) = d.pending[s] {
+                    r = d.take_blocking(s, sem, ticks);
+                    let op = format!("cont {}", d.name(cur));
+                    let mask = d.take_mask();
+                    d.line(step, core, &op, r, mask);
+                    continue;
+                }
+            }
+        }
+
         if kind < 10 {
             if t.is_none() {
                 let name = format!("t{}", d.created);
@@ -232,6 +282,7 @@ fn run() -> String {
             if let Some(h) = t {
                 op = format!("delete {slot} {}", d.name(h));
                 d.app[slot] = None;
+                d.pending[slot] = None;
                 d.k.task_delete(Some(h)).expect("delete");
             } else {
                 op = "noop".to_owned();
@@ -281,7 +332,15 @@ fn run() -> String {
             op = "give_isr".to_owned();
         } else if kind < 86 {
             let cur = d.k.current_on(usize::from(core));
-            if d.is_app(cur) {
+            let ticks = if blocking && arg % 3 != 0 {
+                u64::from(1 + (arg >> 2) % 6)
+            } else {
+                0
+            };
+            if let (Some(s), true) = (d.slot_of(cur), ticks > 0) {
+                r = d.take_blocking(s, sem, ticks);
+                op = format!("takeb {} {ticks}", d.name(cur));
+            } else if d.is_app(cur) {
                 r = i64::from(matches!(d.k.semaphore_take(sem, 0), Ok(Wait::Ready(()))));
                 op = format!("take {}", d.name(cur));
             } else {
@@ -307,8 +366,33 @@ fn run() -> String {
 
 #[test]
 fn two_cores_schedule_exactly_as_the_c_kernel_does() {
-    let ours = run();
-    let theirs = TRACE.replace("\r\n", "\n");
+    compare(&run(false), TRACE);
+}
+
+/// The same, with takes that BLOCK and are continued later -- possibly on the
+/// other core.
+#[test]
+fn two_cores_block_and_wake_exactly_as_the_c_kernel_does() {
+    let theirs = TRACE_BLOCK.replace("\r\n", "\n");
+    // The script must actually block, wake and time out, or this proves
+    // nothing beyond the test above.
+    for (what, at_least) in [(" takeb ", 200), (" cont ", 200)] {
+        let n = theirs.lines().filter(|l| l.contains(what)).count();
+        assert!(
+            n > at_least,
+            "the blocking script has only {n} lines with {what:?}"
+        );
+    }
+    let timeouts = theirs
+        .lines()
+        .filter(|l| l.contains(" cont ") && l.contains(" r=0 "))
+        .count();
+    assert!(timeouts > 0, "no blocked take ever timed out");
+    compare(&run(true), TRACE_BLOCK);
+}
+
+fn compare(ours: &str, theirs: &str) {
+    let theirs = theirs.replace("\r\n", "\n");
     let mut ours_lines = ours.lines();
     for (n, want) in theirs.lines().enumerate() {
         let got = ours_lines.next().unwrap_or("<missing>");

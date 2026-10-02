@@ -9,9 +9,24 @@
  *
  * `tests/smp_differential.rs` runs the SAME script against Kairos and must
  * print the same lines. Any change here must be mirrored there.
+ *
+ * Built with -DBLOCKING_WAITS (run.sh's second binary, `smp_block.trace`), a
+ * take may BLOCK. A single-threaded driver cannot simply call a blocking
+ * `xSemaphoreTake`: the fake `portYIELD` returns straight back into its
+ * `for(;;)`, which would place the task on the event list a second time. So
+ * each app task gets a ucontext coroutine. `traceBLOCKING_ON_QUEUE_RECEIVE`
+ * marks the block, and the yield that follows swaps back to the driver --
+ * leaving the C call suspended exactly where a real port leaves it. When that
+ * task is next current on some core, the step is `cont`: the driver swaps
+ * back in, and the kernel's own loop carries on from the yield, with its own
+ * timeout state.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef BLOCKING_WAITS
+#include <ucontext.h>
+#endif
 
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -40,6 +55,88 @@ static void body(void *p)
     for (;;) {
     }
 }
+
+#ifdef BLOCKING_WAITS
+extern volatile int fake_blocking;
+extern void ( * fake_yield_hook )( void );
+
+#define CORO_STACK ( 256 * 1024 )
+static ucontext_t driver_ctx;
+static ucontext_t coro[ SLOTS ];
+static char *coro_stack[ SLOTS ];
+static int pending[ SLOTS ];       /* a take is suspended inside the kernel */
+static int coro_done[ SLOTS ];
+static long coro_result[ SLOTS ];
+static TickType_t coro_ticks[ SLOTS ];
+static int in_coro = -1;
+static int coro_start_slot;
+
+/* A yield of the core the coroutine runs on: if the take has just blocked,
+ * leave the kernel here. Any other yield (a preemption) is only recorded. */
+static void on_yield( void )
+{
+    if( in_coro >= 0 && fake_blocking )
+    {
+        fake_blocking = 0;
+        int s = in_coro;
+        swapcontext( &coro[ s ], &driver_ctx );
+    }
+}
+
+static void coro_main( void )
+{
+    int s = coro_start_slot;
+    coro_result[ s ] = xSemaphoreTake( sem, coro_ticks[ s ] );
+    coro_done[ s ] = 1;
+    /* returning resumes uc_link: the driver */
+}
+
+/* Run slot s's coroutine until it completes or blocks again.
+ * Answers 1 / 0 (the take's result) or 2 (blocked). */
+static long run_coro( int s )
+{
+    in_coro = s;
+    fake_blocking = 0;
+    swapcontext( &driver_ctx, &coro[ s ] );
+    in_coro = -1;
+    if( coro_done[ s ] )
+    {
+        pending[ s ] = 0;
+        return coro_result[ s ];
+    }
+    pending[ s ] = 1;
+    return 2;
+}
+
+static long start_take( int s, TickType_t ticks )
+{
+    if( coro_stack[ s ] == NULL )
+    {
+        coro_stack[ s ] = malloc( CORO_STACK );
+    }
+    getcontext( &coro[ s ] );
+    coro[ s ].uc_stack.ss_sp = coro_stack[ s ];
+    coro[ s ].uc_stack.ss_size = CORO_STACK;
+    coro[ s ].uc_link = &driver_ctx;
+    coro_done[ s ] = 0;
+    coro_ticks[ s ] = ticks;
+    coro_start_slot = s;
+    makecontext( &coro[ s ], coro_main, 0 );
+    return run_coro( s );
+}
+
+static int slot_of( TaskHandle_t h )
+{
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( app[ i ] && app[ i ] == h )
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+#endif
 
 static const char *name_of(TaskHandle_t h)
 {
@@ -83,6 +180,9 @@ static void line(unsigned step, int core, const char *op, long r, unsigned mask)
 int main(void)
 {
     char op[48];
+#ifdef BLOCKING_WAITS
+    fake_yield_hook = on_yield;
+#endif
     sem = xSemaphoreCreateBinary();
     for (int i = 0; i < 4; i++) {
         char n[8];
@@ -107,6 +207,20 @@ int main(void)
         fake_yields = 0;
         TaskHandle_t t = app[slot];
 
+#ifdef BLOCKING_WAITS
+        /* A task with a take suspended inside the kernel runs nothing else
+         * until that take returns: if it is current here, the step is its
+         * continuation. */
+        int cur_slot = slot_of( xTaskGetCurrentTaskHandleForCore( core ) );
+        if( cur_slot >= 0 && pending[ cur_slot ] )
+        {
+            r = run_coro( cur_slot );
+            snprintf( op, sizeof op, "cont %s", name_of( app[ cur_slot ] ) );
+            line( step, core, op, r, fake_yields );
+            continue;
+        }
+#endif
+
         if (kind < 10) {
             if (t == NULL) {
                 char n[8];
@@ -121,6 +235,9 @@ int main(void)
             if (t) {
                 snprintf(op, sizeof op, "delete %u %s", slot, name_of(t));
                 app[slot] = NULL;
+#ifdef BLOCKING_WAITS
+                pending[ slot ] = 0;   /* its suspended take is abandoned */
+#endif
                 vTaskDelete(t);
             } else {
                 snprintf(op, sizeof op, "noop");
@@ -169,8 +286,17 @@ int main(void)
         } else if (kind < 86) {
             TaskHandle_t cur = xTaskGetCurrentTaskHandleForCore(core);
             if (is_app(cur)) {
+#ifdef BLOCKING_WAITS
+                TickType_t ticks = ( arg % 3 == 0 ) ? 0 : 1 + ( arg >> 2 ) % 6;
+                if( ticks > 0 ) {
+                    r = start_take( slot_of( cur ), ticks );
+                    snprintf(op, sizeof op, "takeb %s %lu", name_of(cur), (unsigned long)ticks);
+                } else
+#endif
+                {
                 r = xSemaphoreTake(sem, 0);
                 snprintf(op, sizeof op, "take %s", name_of(cur));
+                }
             } else {
                 snprintf(op, sizeof op, "noop");
             }
