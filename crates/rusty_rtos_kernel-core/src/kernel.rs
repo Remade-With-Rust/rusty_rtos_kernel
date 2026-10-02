@@ -1096,7 +1096,13 @@ where
         if C::NUMBER_OF_CORES <= 1 {
             0
         } else {
-            usize::from(self.port.core_id()).min(MAX_CORES - 1)
+            // A MASK, not a clamp. `portGET_CORE_ID()` is below the core
+            // count by definition, and for every such id the two agree; the
+            // clamp compiled to a compare and a `setne` at every kernel entry
+            // where the mask is one `and`. An id outside the contract lands
+            // on SOME core's slot either way, never outside the arrays.
+            const { assert!(MAX_CORES.is_power_of_two()) };
+            usize::from(self.port.core_id()) & (MAX_CORES - 1)
         }
     }
 
