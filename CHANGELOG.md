@@ -3,6 +3,28 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
+## 0.3.1 — 2026-10-02
+
+SMP is no longer a preview.
+
+### Fixed
+- **SMP: priority inheritance on two cores.** `xTaskPriorityInherit`,
+  `xTaskPriorityDisinherit` and `vTaskPriorityDisinheritAfterTimeout` each
+  have an SMP arm in the C that this kernel lacked: a raised holder that is
+  not running is yielded for, and a lowered holder that is running has its
+  core yielded. Found by the two-core demo corpus (`recmutex`). One-core
+  builds are unchanged.
+
+### Added
+- **The two-core demo corpus** (`rusty_rtos_demo`, `--features smp`): nine
+  standard demo scenarios identical to FreeRTOS on two cores at 20,000 ticks.
+- **Blocking waits in the two-core differential** (`smp_block.trace`).
+- **`small`**: the flash profile -- 1.24x the C kernel's flash on rv32
+  (1.40x by default), at a priced cost in instructions on the short queue
+  paths. See the README.
+- `tests/invariants.rs`: seven documented invariants checked after every
+  call of 144,000 random kernel calls (hardening gate H-28).
+
 ## 0.3.0 — 2026-10-02
 
 **Breaking** (0.x minor): `Kernel::current` is no longer `const fn`, and

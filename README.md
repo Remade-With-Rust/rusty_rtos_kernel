@@ -29,7 +29,7 @@ the C kernel's own execution trace.
   crate decides *which* task runs and fires the same `TASK_SWITCHED_OUT` /
   `_IN` pair the C kernel fires; a port acts on it.
 
-**Known gaps.** No SMP (`configNUMBER_OF_CORES > 1`), no MPU, no static
+**Known gaps.** SMP is two cores only, with no core affinity; no MPU, no static
 allocation (`xTaskCreateStatic` and friends — this kernel places objects in
 arenas declared at compile time, so there is nothing for a caller's buffer to
 be placed into), and no co-routines, which are a declared non-goal. A queue item
@@ -92,30 +92,49 @@ the length walked 1..=22 on the host and 1..=26 on every 32-bit target. It was
 not trace text: the scenario sent different data, and no counter could see it
 because the number of sends never changed. Both emulators are now 25 of 25.
 
-## SMP (two cores) -- preview
+## SMP (two cores)
 
 Set `Config::NUMBER_OF_CORES = 2` and the kernel schedules two cores, read
 from the pinned FreeRTOS V11.3.1 `tasks.c` with `configRUN_MULTIPLE_PRIORITIES
-= 1` and no core affinity (`docs/plans/smp.md`):
+= 1` and no core affinity (`docs/plans/smp.md`). Three independent proofs that
+it does what the C does:
 
-- **Against the C, step for step.** `tests/smp_differential.rs` replays a
-  20,000-step random script -- create, delete, suspend, resume, priority-set,
-  delay, semaphores, tick and yield, each from a chosen core -- that the C
-  kernel built with two cores ran first (`oracle/smp/`). Every line is
-  identical, and the test has been seen to fail on a one-character change.
+- **The standard demo tasks, on two cores, trace for trace.** Nine
+  `Demo/Common/Minimal` scenarios run on two cores against FreeRTOS built
+  with `configNUMBER_OF_CORES 2` (the umbrella's `oracle/harness-smp`, a
+  deterministic two-core port): every line identical at 20,000 ticks, 900,000
+  lines in all, pinned in `rusty_rtos_demo`'s `smp_conformance` test. Three
+  scenarios fail their own checks on both sides -- they measure single-core
+  timing or assert single-core exclusion -- and fail identically, at the same
+  line.
+- **The scheduler, step for step.** `tests/smp_differential.rs` replays two
+  20,000-step random scripts the C ran first (`oracle/smp/`): one where every
+  call returns, one where takes BLOCK and are continued later, possibly on
+  the other core. Both identical; each has been seen to fail on a
+  one-character change.
 - **On silicon.** One kernel schedules both cores of an ESP32-S3
   (`rusty_rtos_port/firmware/xiao-s3-smp`): two spins in parallel, and 2,000
   cross-core hand-offs.
-- **Free on one core.** A one-core build stays conformance-identical, and
-  instruction-count neutral on every `bench/*-ir`.
 
-**Not yet proven:**
-- blocking waits in the two-core differential;
-- the threaded SMP demo corpus (S2b);
-- core affinity, and `configRUN_MULTIPLE_PRIORITIES = 0` (the C's default).
+A one-core build is unchanged: conformance-identical and instruction-count
+neutral.
+
+**Not covered:** core affinity, `configRUN_MULTIPLE_PRIORITIES = 0` (the C's
+default when SMP is off), and more than two cores.
 
 A port drains cross-core yields with `Kernel::take_core_yields()` and raises
 its inter-processor interrupt; the kernel stays `forbid(unsafe)`.
+
+## Flash profile (`small`)
+
+The default build inlines the hottest kernel paths for speed. The `small`
+feature gives the queue take and send bodies and `xTaskResumeAll` one
+out-of-line body each, for parts where flash is the constraint. On rv32,
+against the C kernel's 13,924 B for the same operations: **17,318 B (1.24x)**
+with `small`, 19,450 B (1.40x) without. Behaviour is identical (every test
+and the conformance corpus pass with it on); the cost is instructions on the
+short queue paths, e.g. `recv_empty` 36 -> 69 and `queue_roundtrip` 113 -> 198
+retired instructions (`docs/LEDGER.md` has every row).
 
 ## Tickless idle
 
