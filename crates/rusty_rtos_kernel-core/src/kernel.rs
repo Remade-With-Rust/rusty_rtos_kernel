@@ -328,13 +328,25 @@ struct WaitFrame {
 /// What [`Kernel::start_scheduler`] created, so a runner can attach bodies.
 #[derive(Debug, Clone, Copy)]
 pub struct StartHandles {
-    /// The idle task.
+    /// The idle task (core 0's, on an SMP build).
     pub idle: TaskHandle,
+    /// SMP: core 1's passive idle task (`IDLE1`); null on one core.
+    pub passive_idle: TaskHandle,
     /// The timer service task.
     pub timer: TaskHandle,
     /// The timer command queue.
     pub timer_queue: QueueHandle,
 }
+
+/// The most cores a kernel can be configured for (`configNUMBER_OF_CORES`).
+///
+/// Two, because the part SMP exists for here is the ESP32-S3. The per-core
+/// state -- `current`, its cached priority, `xYieldPendings` -- is an array
+/// of this length, and on a one-core build every index into it is the
+/// CONSTANT zero ([`Kernel::core`]), so the arrays cost one slot of
+/// `TaskHandle` and two bytes and no instruction: `self.current[0]` is the
+/// same load the scalar field was.
+pub const MAX_CORES: usize = 2;
 
 /// The scheduler.
 ///
@@ -374,7 +386,7 @@ pub struct Kernel<
     /// `xLastTime` in `prvSampleTimeNow`.
     pub(crate) timer_last_time: u64,
     /// `pxCurrentTCB`.
-    pub(crate) current: TaskHandle,
+    pub(crate) current: [TaskHandle; MAX_CORES],
     /// `uxSchedulerSuspended`.
     suspended_depth: u32,
     /// `uxCurrentNumberOfTasks`.
@@ -441,11 +453,11 @@ pub struct Kernel<
     /// `current_priority` debug-asserts it against the resolved value, so the
     /// kernel's own tests and the conformance corpus fail loudly if it ever
     /// drifts.
-    current_priority: u8,
+    current_priority: [u8; MAX_CORES],
     /// `xSchedulerRunning`.
     running: bool,
-    /// `xYieldPendings[0]`.
-    yield_pending: bool,
+    /// `xYieldPendings`, per core.
+    yield_pending: [bool; MAX_CORES],
     /// Which of the two delayed lists is `pxDelayedTaskList` right now.
     delayed_swapped: bool,
     /// Which of the two timer lists is `pxCurrentTimerList` right now.
@@ -543,6 +555,28 @@ pub struct Kernel<
     pub(crate) slots: [u64; SLOTS],
     pub(crate) bytes: [u8; BYTES],
     _config: PhantomData<C>,
+    // ---- SMP state, deliberately LAST ------------------------------------
+    //
+    // `Kernel` is `#[repr(C)]`, so where a field sits is a layout decision.
+    // These three were first added beside `yield_pending` and cost the
+    // ONE-core scheduling bench **+24,000 Ir (+1.6 %)** without a line of SMP
+    // logic running: they moved every hot field behind them. At the end of
+    // the struct they cost nothing (`bench/ksched-ir`, 2026-10-01).
+    /// SMP: `pxCurrentTCBs[ core ]->xTaskRunState == taskTASK_SCHEDULED_TO_YIELD`.
+    ///
+    /// The C keeps a run state in every TCB. Here "running on core `c`" IS
+    /// `current[c]`, so the one state that is not derivable -- "running, but
+    /// another core has asked it to yield" -- is kept per core instead, and
+    /// the TCB is untouched (a one-core build does not pay for it).
+    yield_requested: [bool; MAX_CORES],
+    /// SMP: the cores this kernel has asked to yield and the port has not yet
+    /// interrupted, one bit per core (`portYIELD_CORE`). Drained by
+    /// [`Kernel::take_core_yields`], because raising another core's
+    /// interrupt is the PORT's act and the kernel is `forbid(unsafe)`.
+    core_yields: u8,
+    /// SMP: `xIdleTaskHandles`, so a running idle task can be ranked below
+    /// every real task of priority 0 (`prvYieldForTask`).
+    idle: [TaskHandle; MAX_CORES],
 }
 
 impl<
@@ -704,15 +738,18 @@ where
             free_count: 0,
             free_slots: [(0, 0); QUEUES],
             free_slot_count: 0,
-            current: TaskHandle::NULL,
+            current: [TaskHandle::NULL; MAX_CORES],
             top_ready_priority: 0,
-            current_priority: 0,
+            current_priority: [0; MAX_CORES],
             tick: C::INITIAL_TICK_COUNT,
             pended_ticks: 0,
             suspended_depth: 0,
             running: false,
             next_unblock_time: Self::MAX_DELAY,
-            yield_pending: false,
+            yield_pending: [false; MAX_CORES],
+            yield_requested: [false; MAX_CORES],
+            core_yields: 0,
+            idle: [TaskHandle::NULL; MAX_CORES],
             task_count: 0,
             stalls: 0,
             first_stall: Stall::None,
@@ -835,10 +872,24 @@ where
 
     // ----------------------------------------------------------- getters --
 
-    /// `pxCurrentTCB`.
+    /// `pxCurrentTCB`: the task running on the calling core.
+    ///
+    /// No longer `const`: on an SMP build the answer depends on which core
+    /// asks (`portGET_CORE_ID()`), which is the port's to say.
     #[must_use]
-    pub const fn current(&self) -> TaskHandle {
-        self.current
+    pub fn current(&self) -> TaskHandle {
+        self.cur()
+    }
+
+    /// `pxCurrentTCBs[ core ]`: the task running on `core`, or the null
+    /// handle for a core this configuration does not have.
+    #[must_use]
+    pub fn current_on(&self, core: usize) -> TaskHandle {
+        if core < Self::cores() {
+            self.current_of(core)
+        } else {
+            TaskHandle::NULL
+        }
     }
 
     /// `xTaskGetTickCount`.
@@ -930,7 +981,7 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn priority_of(&self, task: Option<TaskHandle>) -> Result<u8> {
-        let h = task.unwrap_or(self.current);
+        let h = task.unwrap_or(self.cur());
         self.tcbs.resolve(h).map(|t| t.priority)
     }
 
@@ -940,11 +991,11 @@ where
         // Kani proofs and the conformance corpus the moment a new write to
         // `current` or to a priority forgets its helper.
         debug_assert_eq!(
-            self.current_priority,
+            self.cur_priority(),
             self.priority_of(None).unwrap_or(0),
             "the cached current priority went stale -- a write to `current` or              to a task's priority bypassed set_current/set_task_priority"
         );
-        self.current_priority
+        self.cur_priority()
     }
 
     /// Make `task` the running task, keeping [`Self::current_priority`] with
@@ -962,8 +1013,85 @@ where
     /// the parameter and watching `switch_select` go 79 → 88, then 88 → 82
     /// when it was threaded through.
     fn set_current_at(&mut self, task: TaskHandle, priority: u8) {
-        self.current = task;
-        self.current_priority = priority;
+        let core = self.core();
+        if let Some(slot) = self.current.get_mut(core) {
+            *slot = task;
+        }
+        if let Some(slot) = self.current_priority.get_mut(core) {
+            *slot = priority;
+        }
+    }
+
+    /// `pxCurrentTCB` for the calling core.
+    ///
+    /// ★ On one core this DESTRUCTURES element 0 rather than calling
+    /// `.get(0).copied().unwrap_or(..)`. The two should fold to the same
+    /// load and measurably do not: with the `Option` form on every per-core
+    /// accessor the scheduling bench (`bench/ksched-ir`) read **+14,985 Ir
+    /// (+0.98 %)** against the scalar field; destructuring took that to
+    /// +2,985. `.get` stays for the SMP arm, where the index is a runtime
+    /// core id and the kernel stays free of panicking indexing.
+    #[inline(always)]
+    pub(crate) fn cur(&self) -> TaskHandle {
+        if C::NUMBER_OF_CORES <= 1 {
+            let [first, ..] = self.current;
+            return first;
+        }
+        self.current
+            .get(self.core())
+            .copied()
+            .unwrap_or(TaskHandle::NULL)
+    }
+
+    /// The calling core's cached running priority (see `current_priority`).
+    #[inline(always)]
+    fn cur_priority(&self) -> u8 {
+        if C::NUMBER_OF_CORES <= 1 {
+            let [first, ..] = self.current_priority;
+            return first;
+        }
+        self.current_priority.get(self.core()).copied().unwrap_or(0)
+    }
+
+    /// `xYieldPendings[ portGET_CORE_ID() ]`.
+    #[inline(always)]
+    fn pending_here(&self) -> bool {
+        if C::NUMBER_OF_CORES <= 1 {
+            let [first, ..] = self.yield_pending;
+            return first;
+        }
+        self.yield_pending
+            .get(self.core())
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Set `xYieldPendings[ portGET_CORE_ID() ]`.
+    #[inline(always)]
+    fn set_pending_here(&mut self, value: bool) {
+        if C::NUMBER_OF_CORES <= 1 {
+            let [first, ..] = &mut self.yield_pending;
+            *first = value;
+            return;
+        }
+        let core = self.core();
+        if let Some(slot) = self.yield_pending.get_mut(core) {
+            *slot = value;
+        }
+    }
+
+    /// `portGET_CORE_ID()`, as an index into the per-core state.
+    ///
+    /// On a one-core build this is the CONSTANT zero -- the branch is on a
+    /// `const` and folds -- so every `self.cur()` is the same
+    /// load the scalar field was, and the port is never asked.
+    #[inline(always)]
+    pub(crate) fn core(&self) -> usize {
+        if C::NUMBER_OF_CORES <= 1 {
+            0
+        } else {
+            usize::from(self.port.core_id()).min(MAX_CORES - 1)
+        }
     }
 
     /// Write a task's scheduling priority, keeping [`Self::current_priority`]
@@ -978,8 +1106,14 @@ where
     /// refuses, exactly as `resolve_mut` does.
     fn set_task_priority(&mut self, task: TaskHandle, priority: u8) -> Result<()> {
         self.tcbs.resolve_mut(task)?.priority = priority;
-        if task == self.current {
-            self.current_priority = priority;
+        // Every core that is running `task` caches its priority; on one core
+        // the loop is the single compare it always was.
+        for core in 0..Self::cores() {
+            if task == self.current_of(core) {
+                if let Some(slot) = self.current_priority.get_mut(core) {
+                    *slot = priority;
+                }
+            }
         }
         Ok(())
     }
@@ -1007,7 +1141,7 @@ where
     /// # Errors
     /// A list error surfaces as itself.
     pub fn task_state_get(&mut self, task: TaskHandle) -> Result<TaskState> {
-        if task == self.current {
+        if task == self.cur() {
             return Ok(TaskState::Running);
         }
         self.enter_critical();
@@ -1024,7 +1158,7 @@ where
         if !self.tcbs.contains(task) {
             return Ok(TaskState::Deleted);
         }
-        if task == self.current {
+        if task == self.cur() {
             return Ok(TaskState::Running);
         }
         let Some(list) = self.lists.container(Self::state_item(task))? else {
@@ -1384,7 +1518,7 @@ where
     /// [`Error::Full`] when the task arena is full (the C
     /// `errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY`).
     pub fn create_task(&mut self, name: &str, priority: u8) -> Result<TaskHandle> {
-        let caller = self.current;
+        let caller = self.cur();
         // configASSERT( uxPriority < configMAX_PRIORITIES ), then C clamps.
         let priority = priority.min(C::MAX_PRIORITIES.saturating_sub(1));
         // `prvCreateTask` takes the stack and then the TCB from the heap
@@ -1446,7 +1580,7 @@ where
         // on no ready list and `traceTASK_CREATE` has not fired. Running it
         // now would put both events on the wrong side of the switch — which
         // is precisely how `death` first diverged.
-        if self.current != caller {
+        if self.cur() != caller {
             if let Some(slot) = self.owed_trace.get_mut(caller.index() as usize) {
                 *slot = OwedTrace::AddNewTaskToReadyList {
                     task: handle,
@@ -1465,7 +1599,10 @@ where
         self.enter_critical();
         {
             self.task_count = self.task_count.wrapping_add(1);
-            if self.current.is_null() {
+            if C::NUMBER_OF_CORES > 1 {
+                // SMP never assigns `current` at creation: the idle tasks
+                // hold every core from `start_scheduler` on.
+            } else if self.cur().is_null() {
                 self.set_current_at(task, priority);
             } else if !self.running {
                 // `<=`, so the last-created task of the highest priority is
@@ -1482,6 +1619,17 @@ where
             self.add_task_to_ready_list(task)?;
         }
         self.exit_critical();
+        if C::NUMBER_OF_CORES > 1 {
+            // taskYIELD_ANY_CORE_IF_USING_PREEMPTION( pxNewTCB ): the new task
+            // may displace this core's task or another core's.
+            if self.running && C::USE_PREEMPTION {
+                self.yield_for_task(task, priority);
+                if self.pending_here() {
+                    self.port_yield();
+                }
+            }
+            return Ok(());
+        }
         // taskYIELD_IF_USING_PREEMPTION(), outside the section.
         if self.running && C::USE_PREEMPTION && self.current_priority() < priority {
             self.port_yield();
@@ -1559,6 +1707,9 @@ where
     /// # Errors
     /// As [`Kernel::create_task`].
     pub fn start_scheduler(&mut self) -> Result<StartHandles> {
+        if C::NUMBER_OF_CORES > 1 {
+            return self.start_scheduler_smp();
+        }
         let idle = self.create_task("IDLE", 0)?;
         // `xTimerCreateTimerTask` opens with `prvCheckForValidListAndQueue`,
         // which makes the command queue only if no `xTimerCreate` has made
@@ -1572,7 +1723,7 @@ where
         self.port.scheduler_started();
         // `vPortStartFirstTask` runs the first task through the same
         // first-start path as every other.
-        let current = self.current;
+        let current = self.cur();
         self.note_first_start(current);
         self.trace_task(current, |task, name| Event::TaskSwitchedIn { task, name });
         let tick = self.tick;
@@ -1580,21 +1731,339 @@ where
         self.trace.event(tick, Event::StartingScheduler);
         Ok(StartHandles {
             idle,
+            passive_idle: TaskHandle::NULL,
             timer,
             timer_queue,
         })
+    }
+
+    /// `vTaskStartScheduler` with `configNUMBER_OF_CORES > 1`.
+    ///
+    /// `prvCreateIdleTasks` makes one idle task per core -- `IDLE0` runs
+    /// `prvIdleTask`, the rest `prvPassiveIdleTask` -- and makes each the
+    /// CURRENT task of its core, which is why SMP task creation never
+    /// touches `current`: before the scheduler starts no core is assigned,
+    /// and after it every core is running something. The first switch on
+    /// each core then picks the highest ready task.
+    #[cold]
+    #[inline(never)]
+    fn start_scheduler_smp(&mut self) -> Result<StartHandles> {
+        let cores = Self::cores();
+        for core in 0..cores {
+            let name = if core == 0 { "IDLE0" } else { "IDLE1" };
+            let idle = self.create_task(name, Self::IDLE_PRIORITY)?;
+            if let Some(slot) = self.idle.get_mut(core) {
+                *slot = idle;
+            }
+            self.set_current_of(core, idle, Self::IDLE_PRIORITY);
+        }
+        self.check_for_valid_list_and_queue()?;
+        let timer_queue = self.timer_queue;
+        let timer = self.create_task("Tmr Svc", C::TIMER_TASK_PRIORITY)?;
+        self.next_unblock_time = Self::MAX_DELAY;
+        self.running = true;
+        self.tick = C::INITIAL_TICK_COUNT;
+        self.port.scheduler_started();
+        for core in 0..cores {
+            let idle = self.current_of(core);
+            self.note_first_start(idle);
+        }
+        let current = self.cur();
+        self.trace_task(current, |task, name| Event::TaskSwitchedIn { task, name });
+        let tick = self.tick;
+        self.note_exits();
+        self.trace.event(tick, Event::StartingScheduler);
+        Ok(StartHandles {
+            idle: self.idle_of(0),
+            passive_idle: if cores > 1 {
+                self.idle_of(1)
+            } else {
+                TaskHandle::NULL
+            },
+            timer,
+            timer_queue,
+        })
+    }
+
+    // ------------------------------------------------------------------- SMP --
+
+    /// `configNUMBER_OF_CORES`, clamped to what this kernel can hold.
+    #[inline(always)]
+    const fn cores() -> usize {
+        let n = C::NUMBER_OF_CORES as usize;
+        if n < 1 {
+            1
+        } else if n > MAX_CORES {
+            MAX_CORES
+        } else {
+            n
+        }
+    }
+
+    /// `pxCurrentTCBs[ core ]`, or null for a core out of range.
+    #[inline(always)]
+    fn current_of(&self, core: usize) -> TaskHandle {
+        self.current.get(core).copied().unwrap_or(TaskHandle::NULL)
+    }
+
+    /// The cached running priority of `core`.
+    #[inline(always)]
+    fn priority_on(&self, core: usize) -> u8 {
+        self.current_priority.get(core).copied().unwrap_or(0)
+    }
+
+    /// Make `task` (of `priority`) the running task of `core`.
+    fn set_current_of(&mut self, core: usize, task: TaskHandle, priority: u8) {
+        if let Some(slot) = self.current.get_mut(core) {
+            *slot = task;
+        }
+        if let Some(slot) = self.current_priority.get_mut(core) {
+            *slot = priority;
+        }
+    }
+
+    fn idle_of(&self, core: usize) -> TaskHandle {
+        self.idle.get(core).copied().unwrap_or(TaskHandle::NULL)
+    }
+
+    fn pending_on(&self, core: usize) -> bool {
+        self.yield_pending.get(core).copied().unwrap_or(false)
+    }
+
+    fn set_pending_on(&mut self, core: usize, value: bool) {
+        if let Some(slot) = self.yield_pending.get_mut(core) {
+            *slot = value;
+        }
+    }
+
+    fn requested_on(&self, core: usize) -> bool {
+        self.yield_requested.get(core).copied().unwrap_or(false)
+    }
+
+    fn set_requested_on(&mut self, core: usize, value: bool) {
+        if let Some(slot) = self.yield_requested.get_mut(core) {
+            *slot = value;
+        }
+    }
+
+    /// `taskTASK_IS_RUNNING( pxTCB )`: the core `task` is running on, if any,
+    /// NOT counting a core that has been asked to yield it.
+    fn running_core(&self, task: TaskHandle) -> Option<usize> {
+        (0..Self::cores()).find(|&c| self.current_of(c) == task && !self.requested_on(c))
+    }
+
+    /// `xTaskRunState != taskTASK_NOT_RUNNING`: whether ANY core holds `task`,
+    /// including one asked to yield it -- which is what selection must skip.
+    fn held_by_any_core(&self, task: TaskHandle) -> bool {
+        (0..Self::cores()).any(|c| self.current_of(c) == task)
+    }
+
+    /// Whether `task` is one of the idle tasks (`taskATTRIBUTE_IS_IDLE`).
+    fn is_idle_task(&self, task: TaskHandle) -> bool {
+        (0..Self::cores()).any(|c| self.idle_of(c) == task)
+    }
+
+    /// `prvYieldCore( xCoreID )`.
+    ///
+    /// The calling core only records the yield -- it is inside a critical
+    /// section and acts on it on the way out. Another core is asked once:
+    /// its bit goes into [`Kernel::take_core_yields`] for the port to raise,
+    /// and its task is marked `taskTASK_SCHEDULED_TO_YIELD` so a second
+    /// request does not interrupt it twice.
+    fn yield_core(&mut self, core: usize) {
+        if core >= Self::cores() {
+            return;
+        }
+        if core == self.core() {
+            self.set_pending_on(core, true);
+        } else if !self.requested_on(core) {
+            self.core_yields |= 1u8.checked_shl(core as u32).unwrap_or(0);
+            self.set_requested_on(core, true);
+        }
+    }
+
+    /// `prvYieldForTask( pxTCB )`, for `configRUN_MULTIPLE_PRIORITIES == 1`
+    /// and no core affinity.
+    ///
+    /// `task` has just become ready. Find the core running the LOWEST
+    /// priority task that `task` outranks -- a running idle task counts as
+    /// one below priority 0, so a real priority-0 task displaces an idle
+    /// one -- and yield it. Ties go to the HIGHER core number, because the
+    /// C walks upwards with `<=`. A core already owing a yield, or already
+    /// asked for one, is not a candidate.
+    #[cold]
+    #[inline(never)]
+    fn yield_for_task(&mut self, task: TaskHandle, priority: u8) {
+        if self.running_core(task).is_some() {
+            return;
+        }
+        let mut lowest = i16::from(priority).saturating_sub(1);
+        let mut lowest_core = None;
+        for core in 0..Self::cores() {
+            let running = self.current_of(core);
+            let mut p = i16::from(self.priority_on(core));
+            if self.is_idle_task(running) {
+                p = p.saturating_sub(1);
+            }
+            if !self.requested_on(core) && !self.pending_on(core) && p <= lowest {
+                lowest = p;
+                lowest_core = Some(core);
+            }
+        }
+        if let Some(core) = lowest_core {
+            self.yield_core(core);
+        }
+    }
+
+    /// The OTHER cores this kernel has asked to yield since the last call,
+    /// one bit per core, cleared by the read.
+    ///
+    /// A port calls this on its way out of the kernel lock and raises the
+    /// inter-processor interrupt of each core named. Always zero on one core.
+    pub fn take_core_yields(&mut self) -> u8 {
+        core::mem::take(&mut self.core_yields)
+    }
+
+    /// `prvSelectHighestPriorityTask( xCoreID )` for
+    /// `configRUN_MULTIPLE_PRIORITIES == 1` and no core affinity.
+    ///
+    /// Answers whether a task was scheduled. Read from the pinned `tasks.c`
+    /// (V11.3.1), not remembered:
+    ///
+    /// 1. The core's current task, if it is still in its ready list, goes to
+    ///    the END of that list first -- so a task that yields is not picked
+    ///    again ahead of tasks that have waited longer.
+    /// 2. From `uxTopReadyPriority` down, each ready list is walked from its
+    ///    HEAD (not the round-robin cursor): the first task no core holds is
+    ///    swapped in; this core's own current task may be kept; a task held
+    ///    by another core is skipped.
+    /// 3. `uxTopReadyPriority` comes down only past levels that are EMPTY.
+    #[cold]
+    #[inline(never)]
+    fn select_for_core(&mut self, core: usize) -> bool {
+        let current = self.current_of(core);
+        let current_list = Self::ready_list(self.priority_on(core));
+        if self
+            .lists
+            .container(Self::state_item(current))
+            .unwrap_or(None)
+            == Some(current_list)
+        {
+            let _ = self.lists.remove(Self::state_item(current));
+            let _ = self
+                .lists
+                .insert_end(current_list, Self::state_item(current));
+        }
+        let mut priority = self.top_ready_priority;
+        let mut decrement_top = true;
+        loop {
+            let list = Self::ready_list(priority);
+            if !self.lists.is_empty_of(list) {
+                decrement_top = false;
+                let mut at = self.lists.head(list).unwrap_or(None);
+                while let Some(item) = at {
+                    if let Ok(task) = self.task_of_state_item(item) {
+                        if !self.held_by_any_core(task) {
+                            self.set_requested_on(core, false);
+                            self.set_current_of(core, task, priority);
+                            return true;
+                        }
+                        if task == self.current_of(core) {
+                            self.set_requested_on(core, false);
+                            return true;
+                        }
+                    }
+                    at = self.lists.next(item).unwrap_or(None);
+                }
+            }
+            if decrement_top {
+                self.top_ready_priority = self.top_ready_priority.saturating_sub(1);
+            }
+            if priority == 0 {
+                return false;
+            }
+            priority = priority.saturating_sub(1);
+        }
+    }
+
+    /// `xTaskIncrementTick`'s SMP time slicing: EVERY core whose running
+    /// priority has a second ready task owes a yield (`xYieldPendings`).
+    ///
+    /// Out of line, like every SMP body: rustc's MIR inliner weighs a
+    /// function before monomorphisation folds `C::NUMBER_OF_CORES`, so an
+    /// SMP loop written inline in `increment_tick` changes how a ONE-core
+    /// build inlines the tick even though it never runs there.
+    #[cold]
+    #[inline(never)]
+    fn tick_time_slice_smp(&mut self) {
+        if C::USE_PREEMPTION && C::USE_TIME_SLICING {
+            for core in 0..Self::cores() {
+                let list = Self::ready_list(self.priority_on(core));
+                if self.lists.len(list).unwrap_or(0) > 1 {
+                    self.set_pending_on(core, true);
+                }
+            }
+        }
+    }
+
+    /// `xTaskIncrementTick`'s SMP preemption: this core switches on the way
+    /// out (answered `true`); every other core that owes a yield is
+    /// interrupted (`prvYieldCore`).
+    #[cold]
+    #[inline(never)]
+    fn tick_yields_smp(&mut self) -> bool {
+        let mut here = false;
+        if C::USE_PREEMPTION {
+            let me = self.core();
+            for core in 0..Self::cores() {
+                if self.pending_on(core) {
+                    if core == me {
+                        here = true;
+                    } else {
+                        self.yield_core(core);
+                    }
+                }
+            }
+        }
+        here
+    }
+
+    /// `vTaskSwitchContext( xCoreID )`, for the calling core.
+    #[cold]
+    #[inline(never)]
+    fn switch_context_smp(&mut self) {
+        let core = self.core();
+        if self.suspended_depth != 0 {
+            self.set_pending_on(core, true);
+            return;
+        }
+        self.set_pending_on(core, false);
+        let outgoing = self.current_of(core);
+        self.trace_task(outgoing, |task, name| Event::TaskSwitchedOut { task, name });
+        if !self.select_for_core(core) {
+            self.note_stall(Stall::NoReadyTask);
+            return;
+        }
+        let incoming = self.current_of(core);
+        if incoming.index() != outgoing.index() {
+            self.hand_over(incoming);
+        }
+        self.trace_task(incoming, |task, name| Event::TaskSwitchedIn { task, name });
     }
 
     // -------------------------------------------------------- the switch --
 
     /// `vTaskSwitchContext`.
     pub fn switch_context(&mut self) {
+        if C::NUMBER_OF_CORES > 1 {
+            return self.switch_context_smp();
+        }
         if self.suspended_depth != 0 {
-            self.yield_pending = true;
+            self.set_pending_here(true);
             return;
         }
-        self.yield_pending = false;
-        let current = self.current;
+        self.set_pending_here(false);
+        let current = self.cur();
         self.trace_task(current, |task, name| Event::TaskSwitchedOut { task, name });
         // taskSELECT_HIGHEST_PRIORITY_TASK
         //
@@ -1697,8 +2166,8 @@ where
             // the cold half would then re-read the very byte this line reads
             // — so on this shape both are skipped and the owed body is
             // entered directly.
-            let index = self.current.index() as usize;
-            // B1, the shape win 7 established: `self.current` is read RAW here -- no
+            let index = self.cur().index() as usize;
+            // B1, the shape win 7 established: `self.cur()` is read RAW here -- no
             // bound-checking accessor between the field and the use -- and `index` then
             // feeds `owes_anything.get(index)`. Contrast `remove_from_event_list`, where
             // the same proof measured EXACTLY +0 because its handle comes back from
@@ -1722,8 +2191,8 @@ where
     #[inline(never)]
     fn resume_pending_cold(&mut self) -> bool {
         self.settle_unwind();
-        let index = self.current.index() as usize;
-        // B1, the shape win 7 established: `self.current` is read RAW here -- no
+        let index = self.cur().index() as usize;
+        // B1, the shape win 7 established: `self.cur()` is read RAW here -- no
         // bound-checking accessor between the field and the use -- and `index` then
         // feeds `owes_anything.get(index)`. Contrast `remove_from_event_list`, where
         // the same proof measured EXACTLY +0 because its handle comes back from
@@ -1953,7 +2422,7 @@ where
         if !T::EMITS {
             return;
         }
-        if self.current == caller {
+        if self.cur() == caller {
             let tick = self.tick;
             self.note_exits();
             match owed {
@@ -2096,7 +2565,7 @@ where
     /// [`Kernel::settle_unwind`] collects the tally once the frame has
     /// finished. A task being switched in for the first time has a fresh
     /// stack and owes nothing.
-    /// Takes only the INCOMING handle. The outgoing one is `self.current`, which
+    /// Takes only the INCOMING handle. The outgoing one is `self.cur()`, which
     /// this reads for itself -- `set_current_at` has not run yet, so the field
     /// still names the task being left. Passing it in made `switch_context` load
     /// BOTH words of the handle at the top of the function, and the generation
@@ -2115,7 +2584,7 @@ where
         // once per switch to settle a tally of zero. The const folds the whole
         // thing away on silicon and leaves the sim untouched.
         if !P::COMMITS_SWITCH && self.unwinding.is_null() {
-            self.unwinding = self.current;
+            self.unwinding = self.cur();
             self.port.begin_unwind();
         }
         let index = incoming.index() as usize;
@@ -2195,7 +2664,9 @@ where
             // task, this can only set what is already set, and asking
             // costs a TCB resolve for the running priority plus a list
             // read. Setting a `true` to `true` is not worth either.
-            if C::USE_PREEMPTION
+            if C::NUMBER_OF_CORES > 1 {
+                self.tick_time_slice_smp();
+            } else if C::USE_PREEMPTION
                 && C::USE_TIME_SLICING
                 && !switch_required
                 && self
@@ -2214,7 +2685,9 @@ where
             if self.pended_ticks == 0 {
                 self.run_tick_hook();
             }
-            if C::USE_PREEMPTION && self.yield_pending {
+            if C::NUMBER_OF_CORES > 1 {
+                switch_required |= self.tick_yields_smp();
+            } else if C::USE_PREEMPTION && self.pending_here() {
                 switch_required = true;
             }
         } else {
@@ -2252,7 +2725,7 @@ where
         if index >= C::NOTIFICATION_ARRAY_ENTRIES {
             return Err(Error::InvalidArgument);
         }
-        let caller = self.current;
+        let caller = self.cur();
         let state = self.notify_state_of(caller, index);
         if state != NotifyState::Received && ticks > 0 && !self.notify_blocked(caller) {
             self.suspend_all();
@@ -2283,7 +2756,7 @@ where
             }
             let already_yielded = self.resume_all();
             if should_block && !already_yielded {
-                if self.current == caller {
+                if self.cur() == caller {
                     self.port_yield();
                 } else {
                     self.owe_yield(caller);
@@ -2354,7 +2827,7 @@ where
         if index >= C::NOTIFICATION_ARRAY_ENTRIES {
             return Err(Error::InvalidArgument);
         }
-        let caller = self.current;
+        let caller = self.cur();
         if self.notified_value_of(caller, index) == 0 && ticks > 0 && !self.notify_blocked(caller) {
             self.suspend_all();
             self.enter_critical();
@@ -2382,7 +2855,7 @@ where
             }
             let already_yielded = self.resume_all();
             if should_block && !already_yielded {
-                if self.current == caller {
+                if self.cur() == caller {
                     self.port_yield();
                 } else {
                     self.owe_yield(caller);
@@ -2637,7 +3110,7 @@ where
                     // switch, on the way out of `xTaskIncrementTick`. That
                     // is why the tick hook runs before the yield-pending
                     // test and not after it.
-                    self.yield_pending = true;
+                    self.set_pending_here(true);
                 } else {
                     // taskYIELD_ANY_CORE_IF_USING_PREEMPTION, inside the
                     // section.
@@ -2656,7 +3129,7 @@ where
         if index >= C::NOTIFICATION_ARRAY_ENTRIES {
             return Err(Error::InvalidArgument);
         }
-        let target = task.unwrap_or(self.current);
+        let target = task.unwrap_or(self.cur());
         self.enter_critical();
         let cleared = self.notify_state_of(target, index) == NotifyState::Received;
         if cleared {
@@ -2688,7 +3161,7 @@ where
         if index >= C::NOTIFICATION_ARRAY_ENTRIES {
             return Err(Error::InvalidArgument);
         }
-        let target = task.unwrap_or(self.current);
+        let target = task.unwrap_or(self.cur());
         self.enter_critical();
         let value = self
             .tcbs
@@ -2712,7 +3185,7 @@ where
         if index >= C::NOTIFICATION_ARRAY_ENTRIES {
             return Err(Error::InvalidArgument);
         }
-        let target = task.unwrap_or(self.current);
+        let target = task.unwrap_or(self.cur());
         self.enter_critical();
         let before = match self.tcbs.resolve_mut(target) {
             Ok(tcb) => match tcb.notified.get_mut(index) {
@@ -2898,7 +3371,7 @@ where
     /// asked for — because a task is walking an event list, or because the
     /// scheduler is suspended — and must happen on the way out instead.
     pub(crate) fn missed_yield(&mut self) {
-        self.yield_pending = true;
+        self.set_pending_here(true);
     }
 
     /// `vApplicationTickHook()`, when `configUSE_TICK_HOOK` is 1.
@@ -2978,14 +3451,21 @@ where
             //
             // Both of these cost a TCB resolve -- a generation check, a
             // bounds check and an `Option` -- and this loop runs once per
-            // task the tick wakes. `self.current` cannot move while the
+            // task the tick wakes. `self.cur()` cannot move while the
             // drain is running (nothing here switches), so the running
             // priority is a loop invariant that was being re-derived on
             // every lap. And once a switch is already required, asking again
             // can only set a `true` to `true`, which is not worth the
             // resolve it costs -- the same reasoning `increment_tick`
             // already applies one level up.
-            if C::USE_PREEMPTION && !switch_required {
+            if C::NUMBER_OF_CORES > 1 {
+                // SMP: the tick's yield decision is made per core at the end
+                // of `increment_tick`, from `xYieldPendings`.
+                if C::USE_PREEMPTION {
+                    let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
+                    self.yield_for_task(task, woken);
+                }
+            } else if C::USE_PREEMPTION && !switch_required {
                 let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
                 if woken > running {
                     switch_required = true;
@@ -3062,12 +3542,12 @@ where
     /// # Errors
     /// A list error surfaces as itself.
     pub fn delay(&mut self, ticks: u64) -> Result<()> {
-        let caller = self.current;
+        let caller = self.cur();
         let mut already_yielded = false;
         if ticks > 0 {
             self.suspend_all();
             {
-                let current = self.current;
+                let current = self.cur();
                 self.trace_task(current, |task, name| Event::TaskDelay { task, name, ticks });
                 self.add_current_task_to_delayed_list(ticks, false)?;
             }
@@ -3077,7 +3557,7 @@ where
         // tick switched us out somewhere above, in which case this line is
         // on a stack that is not running, and runs when the task does.
         if !already_yielded {
-            if self.current == caller {
+            if self.cur() == caller {
                 self.port_yield();
             } else {
                 self.owe_yield(caller);
@@ -3133,7 +3613,7 @@ where
         // it, so it lands where `xTaskResumeAll` puts it.
         let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
         if woken > self.current_priority() {
-            self.yield_pending = true;
+            self.set_pending_here(true);
         }
         let _ = self.resume_all();
         Ok(true)
@@ -3164,12 +3644,12 @@ where
         );
         let now = self.tick & Self::MAX_DELAY;
         let ticks = ticks & Self::MAX_DELAY;
-        let current = self.current;
+        let current = self.cur();
         // B1, and this function is where it pays most: by its own note below it
         // is the single largest consumer of the blocking workload, and it
         // derives FOUR bound-checked accesses from an index it read out of
         // memory -- `delay_aborted`, then `state_item` feeding `lists.remove`
-        // and one of three inserts. `self.current` is a live task on every path
+        // and one of three inserts. `self.cur()` is a live task on every path
         // that reaches here, but it is a FIELD, so nothing carries that across
         // the calls above.
         if current.index() as usize >= TASKS {
@@ -3263,7 +3743,7 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn suspend(&mut self, task: Option<TaskHandle>) -> Result<()> {
-        let caller = self.current;
+        let caller = self.cur();
         let target = task.unwrap_or(caller);
         self.enter_critical();
         {
@@ -3319,7 +3799,7 @@ where
         if target == caller {
             if self.running {
                 // portYIELD_WITHIN_API(), outside the section.
-                if self.current == caller {
+                if self.cur() == caller {
                     self.port_yield();
                 } else {
                     self.owe_yield(caller);
@@ -3336,7 +3816,7 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn resume(&mut self, task: TaskHandle) -> Result<()> {
-        if task == self.current || task.is_null() {
+        if task == self.cur() || task.is_null() {
             return Ok(());
         }
         if !self.tcbs.contains(task) {
@@ -3400,7 +3880,7 @@ where
     /// [`Error::Gone`] for a stale handle.
     pub fn task_delete(&mut self, task: Option<TaskHandle>) -> Result<()> {
         // `prvGetTCBFromHandle`: NULL is the calling task.
-        let target = task.unwrap_or(self.current);
+        let target = task.unwrap_or(self.cur());
         self.tcbs.resolve(target)?;
 
         self.enter_critical();
@@ -3426,7 +3906,7 @@ where
         // `xSchedulerRunning != pdFALSE && taskTASK_IS_RUNNING_OR_SCHEDULED_
         // _TO_YIELD( pxTCB )`, which at `configNUMBER_OF_CORES 1` is exactly
         // `pxTCB == pxCurrentTCB`.
-        let defer = self.running && target == self.current;
+        let defer = self.running && target == self.cur();
         if defer {
             // `vListInsertEnd( &xTasksWaitingTermination, ... )` and
             // `++uxDeletedTasksWaitingCleanUp`. The count is NOT decremented
@@ -3520,7 +4000,7 @@ where
     /// [`Error::Gone`] for a stale handle.
     pub fn set_priority(&mut self, task: Option<TaskHandle>, new_priority: u8) -> Result<()> {
         let new_priority = new_priority.min(C::MAX_PRIORITIES.saturating_sub(1));
-        let target = task.unwrap_or(self.current);
+        let target = task.unwrap_or(self.cur());
         let mut yield_required = false;
         self.enter_critical();
         {
@@ -3536,10 +4016,10 @@ where
             let base = self.tcbs.resolve(target)?.base_priority;
             if base != new_priority {
                 if new_priority > base {
-                    if target != self.current && new_priority > self.current_priority() {
+                    if target != self.cur() && new_priority > self.current_priority() {
                         yield_required = true;
                     }
-                } else if target == self.current {
+                } else if target == self.cur() {
                     yield_required = true;
                 }
                 let used_on_entry = self.tcbs.resolve(target)?.priority;
@@ -3619,7 +4099,7 @@ where
             moved_any = true;
             let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
             if woken > self.current_priority() {
-                self.yield_pending = true;
+                self.set_pending_here(true);
             }
         }
         if moved_any {
@@ -3648,7 +4128,7 @@ where
         let mut pended = self.pended_ticks;
         while pended > 0 {
             if self.increment_tick() {
-                self.yield_pending = true;
+                self.set_pending_here(true);
             }
             pended = pended.saturating_sub(1);
         }
@@ -3692,7 +4172,7 @@ where
                 if self.pended_ticks > 0 {
                     self.unwind_pended_ticks();
                 }
-                if self.yield_pending {
+                if self.pending_here() {
                     if C::USE_PREEMPTION {
                         already_yielded = true;
                     }
@@ -3952,7 +4432,7 @@ where
         value: u64,
         ticks: u64,
     ) -> Result<()> {
-        let item = Self::event_item(self.current);
+        let item = Self::event_item(self.cur());
         self.lists.set_value(item, value)?;
         self.lists.insert_end(list, item)?;
         self.add_current_task_to_delayed_list(ticks, true)
@@ -3978,7 +4458,7 @@ where
         let _ = self.lists.remove(Self::state_item(task));
         self.add_task_to_ready_list(task)?;
         if self.tcbs.resolve(task)?.priority > self.current_priority() {
-            self.yield_pending = true;
+            self.set_pending_here(true);
         }
         Ok(())
     }
@@ -4038,7 +4518,7 @@ where
     // attribute's doing.
     #[inline]
     pub(crate) fn place_on_event_list(&mut self, list: ListId, ticks: u64) -> Result<()> {
-        let current = self.current;
+        let current = self.cur();
         // B1, and the bound is the whole point: `event_item` is
         // `TASKS.saturating_add(index)`, which tells LLVM only that the result
         // fits a `u16` -- so `insert_keeping_value` still emits its own check
@@ -4046,7 +4526,7 @@ where
         // `cmov` besides. Proving the index here instead makes the sum provably
         // below `2 * TASKS`, and both of those fold.
         //
-        // It has to be proved HERE rather than relied on: `self.current` is a
+        // It has to be proved HERE rather than relied on: `self.cur()` is a
         // live task on every path that reaches this function, but the calls in
         // between take `&mut self`, so LLVM cannot carry that across them.
         if current.index() as usize >= TASKS {
@@ -4064,7 +4544,7 @@ where
     /// Take the trailing `portYIELD()` now, or owe it if a tick already
     /// switched us out of this call.
     pub(crate) fn yield_or_owe(&mut self, caller: TaskHandle) {
-        if self.current == caller {
+        if self.cur() == caller {
             self.port_yield();
         } else {
             self.owe_yield(caller);
@@ -4210,7 +4690,7 @@ where
     /// # Errors
     /// A list error surfaces as itself.
     pub fn delay_until(&mut self, previous_wake: &mut u64, period: u64) -> Result<bool> {
-        let caller = self.current;
+        let caller = self.cur();
         let mut should_delay = false;
         self.suspend_all();
         {
@@ -4286,8 +4766,16 @@ where
             self.lists.insert_end(Self::pending_ready_list(), item)?;
         }
         let woken = self.tcbs.resolve(task)?.priority;
+        if C::NUMBER_OF_CORES > 1 {
+            // `prvYieldForTask`, and the answer is whether THIS core now owes
+            // a yield -- the C's `xYieldPendings[ portGET_CORE_ID() ]`.
+            if C::USE_PREEMPTION {
+                self.yield_for_task(task, woken);
+            }
+            return Ok(self.pending_here());
+        }
         if woken > self.current_priority() {
-            self.yield_pending = true;
+            self.set_pending_here(true);
             return Ok(true);
         }
         Ok(false)
@@ -4930,10 +5418,10 @@ mod tests {
     #[test]
     fn a_missed_yield_is_remembered_rather_than_dropped() {
         let mut k = running();
-        k.yield_pending = false;
+        k.yield_pending = [false; super::MAX_CORES];
         k.missed_yield();
         assert!(
-            k.yield_pending,
+            k.yield_pending[0],
             "the yield survives until something can act on it"
         );
     }

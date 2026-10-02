@@ -53,7 +53,17 @@ pub mod system;
 pub mod timer;
 pub mod typed;
 
-pub use kernel::{Kernel, Stall, StartHandles, TaskState};
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod smp_tests;
+
+pub use kernel::{Kernel, MAX_CORES, Stall, StartHandles, TaskState};
 // The macro-generated `build` names this bound, so it has to be
 // reachable from `$crate` at the call site.
 pub use name::{NAME_CAPACITY, Name};

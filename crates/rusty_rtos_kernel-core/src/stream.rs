@@ -159,7 +159,7 @@ where
         trigger: usize,
         is_message: bool,
     ) -> Result<StreamBufferHandle> {
-        let caller = self.current;
+        let caller = self.cur();
         if size == 0 || trigger > size {
             return Err(Error::InvalidArgument);
         }
@@ -515,7 +515,7 @@ where
         data: &[u8],
         ticks: u64,
     ) -> Result<Wait<usize>> {
-        let caller = self.current;
+        let caller = self.cur();
         // ONLY the fields this body reads. It was `*self.buffers.resolve(..)`
         // -- the whole nine-field descriptor, about thirty-two bytes on rv32 --
         // to reach three of them. `notify_index` is read at four
@@ -586,7 +586,7 @@ where
             if !self.take_stream_timed(caller) {
                 self.enter_critical();
                 self.exit_critical();
-                if self.current != caller {
+                if self.cur() != caller {
                     self.set_stream_timed(caller);
                     return Ok(Blocked);
                 }
@@ -603,7 +603,7 @@ where
             // away. The C's thread stops inside the exit and everything
             // below it runs when the task is resumed — with the sample it
             // already took, and without paying for the section twice.
-            if self.current != caller {
+            if self.cur() != caller {
                 self.set_stream_resume(caller, space);
                 return Ok(Blocked);
             }
@@ -724,7 +724,7 @@ where
     ) -> Result<Option<usize>> {
         self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
         let available = self.buffers.resolve(buffer)?.bytes_in_buffer();
-        if self.current != caller {
+        if self.cur() != caller {
             // Merging these two into one accessor that resolves the TCB once
             // measured **0 B** on 2026-09-25: `&mut self` is `noalias`, so LLVM
             // had already shared the resolve across both setters. `list.rs`'s
@@ -765,7 +765,7 @@ where
         out: &mut [u8],
         ticks: u64,
     ) -> Result<Wait<usize>> {
-        let caller = self.current;
+        let caller = self.cur();
         // ONLY the fields this body reads. It was `*self.buffers.resolve(..)`
         // -- the whole nine-field descriptor, about thirty-two bytes on rv32 --
         // to reach two of them. `notify_index` is read at four
@@ -830,7 +830,7 @@ where
             // away. The C's thread stops inside the exit and everything
             // below it runs when the task is resumed — with the sample it
             // already took, and without paying for the section twice.
-            if self.current != caller {
+            if self.cur() != caller {
                 self.set_stream_resume(caller, available);
                 return Ok(Blocked);
             }

@@ -1004,7 +1004,7 @@ where
         ticks: u64,
         position: Position,
     ) -> Result<Wait<()>> {
-        let caller = self.current;
+        let caller = self.cur();
         // Resuming below the sampling exit, as the C's thread does. See
         // `Kernel::take_queue_resume`: the prologue has already run, and
         // repeating it would spend a second critical-section exit that the
@@ -1088,7 +1088,7 @@ where
         // That exit can release a tick, and a tick can switch this task
         // away. The C's thread stops INSIDE the exit, so everything below
         // runs when the task is scheduled again -- and names that task.
-        if self.current != caller {
+        if self.cur() != caller {
             self.set_queue_resume(caller, QueueResume::BelowSample);
             return Ok(Blocked);
         }
@@ -1307,7 +1307,7 @@ where
     /// the regression is the wrappers growing, not any one call site.
     #[inline(always)]
     fn queue_take(&mut self, queue: QueueHandle, ticks: u64, peek: bool) -> Result<Wait<u64>> {
-        let caller = self.current;
+        let caller = self.cur();
         // Resuming below the sampling exit, as `queue_send_generic` does.
         // The snapshot is re-read rather than carried: nothing below uses
         // anything of it that a concurrent access could change, and the
@@ -1425,7 +1425,7 @@ where
         // That exit can release a tick, and a tick can switch this task
         // away. The C's thread stops INSIDE the exit, so everything below
         // runs when the task is scheduled again -- and names that task.
-        if self.current != caller {
+        if self.cur() != caller {
             self.set_queue_resume(caller, QueueResume::BelowSample);
             return Ok(Blocked);
         }
@@ -1467,7 +1467,7 @@ where
             // scheduled. Without this, `prvIsQueueEmpty`'s section is spent
             // in the wrong window -- one exit, and IntQueue's 100,000-tick
             // run diverges at tick 16,260.
-            if self.current != caller {
+            if self.cur() != caller {
                 self.set_queue_resume(caller, QueueResume::BelowTimedOutResume);
                 return Ok(Blocked);
             }
@@ -1487,10 +1487,10 @@ where
     /// `xQueueReceive` below the `xTaskResumeAll` of its timed-out branch.
     /// `caller` is read here rather than passed, for the reason given on
     /// [`Kernel::queue_take_blocking`]: both call sites have already
-    /// established that it is `self.current`.
+    /// established that it is `self.cur()`.
     #[cold]
     fn queue_take_timed_out(&mut self, queue: QueueHandle, peek: bool) -> Result<Wait<u64>> {
-        let caller = self.current;
+        let caller = self.cur();
         // `kind` is read HERE rather than handed down from the caller,
         // because it is the one field of the descriptor that cannot change
         // after `new_queue` sets it -- so resolving it late reads the same
@@ -1626,7 +1626,7 @@ where
     /// # Errors
     /// [`Error::Empty`] on timeout; [`Error::Gone`] for a stale handle.
     pub fn mutex_take_recursive(&mut self, mutex: QueueHandle, ticks: u64) -> Result<Wait<()>> {
-        let caller = self.current;
+        let caller = self.cur();
         // One resolve reads the holder and counts the re-entry.
         // `resolve_mut` runs the same four checks and answers the same
         // errors, so asking twice only asked twice.
@@ -1652,7 +1652,7 @@ where
     /// # Errors
     /// [`Error::NotActive`] when the caller does not hold the mutex.
     pub fn mutex_give_recursive(&mut self, mutex: QueueHandle) -> Result<()> {
-        let caller = self.current;
+        let caller = self.cur();
         // One resolve, as in the take above.
         let remaining = {
             let q = self.queues.resolve_mut(mutex)?;
@@ -1824,7 +1824,7 @@ where
             .unwrap_or(false);
         if empty {
             // vTaskPlaceOnEventListRestricted
-            let current = self.current;
+            let current = self.cur();
             let event = Self::event_item(current);
             self.lists
                 .insert_end(Self::queue_receive_list(queue), event)?;
