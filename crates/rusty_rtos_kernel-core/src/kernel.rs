@@ -1973,8 +1973,11 @@ where
     ///    swapped in; this core's own current task may be kept; a task held
     ///    by another core is skipped.
     /// 3. `uxTopReadyPriority` comes down only past levels that are EMPTY.
-    #[cold]
-    #[inline(never)]
+    ///
+    /// In line: its one caller is [`Kernel::switch_context_smp`], itself the
+    /// out-of-line SMP body, so this costs no flash and saves a call, a
+    /// return and two sets of saved registers on every switch.
+    #[inline(always)]
     fn select_for_core(&mut self, core: usize) -> bool {
         let current = self.current_of(core);
         let current_list = Self::ready_list(self.priority_on(core));
