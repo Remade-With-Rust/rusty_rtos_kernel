@@ -1864,11 +1864,6 @@ where
         (0..Self::cores()).any(|c| self.current_of(c) == task)
     }
 
-    /// Whether `task` is one of the idle tasks (`taskATTRIBUTE_IS_IDLE`).
-    fn is_idle_task(&self, task: TaskHandle) -> bool {
-        (0..Self::cores()).any(|c| self.idle_of(c) == task)
-    }
-
     /// `prvYieldCore( xCoreID )`.
     ///
     /// The calling core only records the yield -- it is inside a critical
@@ -1983,17 +1978,12 @@ where
     fn select_for_core(&mut self, core: usize) -> bool {
         let current = self.current_of(core);
         let current_list = Self::ready_list(self.priority_on(core));
-        if self
+        // `if listIS_CONTAINED_WITHIN(...) { uxListRemove; vListInsertEnd }`,
+        // as one list operation that does nothing when the task is not in its
+        // ready list.
+        let _ = self
             .lists
-            .container(Self::state_item(current))
-            .unwrap_or(None)
-            == Some(current_list)
-        {
-            let _ = self.lists.remove(Self::state_item(current));
-            let _ = self
-                .lists
-                .insert_end(current_list, Self::state_item(current));
-        }
+            .move_to_end(current_list, Self::state_item(current));
         // Which state items the cores hold, by item rather than by handle: a
         // ready list holds only live tasks and a slot holds one live task at a
         // time, so the item IS the task, and the walk can skip a held one
