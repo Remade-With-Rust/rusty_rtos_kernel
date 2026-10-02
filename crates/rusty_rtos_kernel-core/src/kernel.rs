@@ -2039,16 +2039,23 @@ where
                 // per-step container and bounds checks `head`/`next` make. The
                 // first item no other core holds wins: a free task (swapped
                 // in) or this core's own (kept).
-                let tcbs = &self.tcbs;
-                let pick = self.lists.iter(list).find_map(|item| {
+                //
+                // A `for` with a `break`, not `find_map`: handing the pick
+                // back through the closure's nested `Option` cost one register
+                // copy of the chosen slot on every switch that swaps a task
+                // in (`mov %r11d,%r12d`, 53,176 times in semtest).
+                let mut pick = None;
+                for item in self.lists.iter(list) {
                     if !held.contains(&item) {
-                        tcbs.handle_at(item).map(Some)
+                        if let Some(task) = self.tcbs.handle_at(item) {
+                            pick = Some(Some(task));
+                            break;
+                        }
                     } else if item == mine {
-                        Some(None)
-                    } else {
-                        None
+                        pick = Some(None);
+                        break;
                     }
-                });
+                }
                 match pick {
                     Some(Some(task)) => {
                         self.set_requested_on(core, false);
