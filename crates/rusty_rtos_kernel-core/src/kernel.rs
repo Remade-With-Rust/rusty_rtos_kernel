@@ -347,6 +347,10 @@ pub struct StartHandles {
 /// `TaskHandle` and two bytes and no instruction: `self.current[0]` is the
 /// same load the scalar field was.
 pub const MAX_CORES: usize = 2;
+// [`Kernel::core`] MASKS a core id with `MAX_CORES - 1`. Out here rather
+// than in that body: a `const` block inside an `#[inline(always)]` accessor
+// is MIR the one-core build weighs at every call site.
+const _: () = assert!(MAX_CORES.is_power_of_two());
 
 /// The scheduler.
 ///
@@ -1101,8 +1105,14 @@ where
             // clamp compiled to a compare and a `setne` at every kernel entry
             // where the mask is one `and`. An id outside the contract lands
             // on SOME core's slot either way, never outside the arrays.
-            const { assert!(MAX_CORES.is_power_of_two()) };
-            usize::from(self.port.core_id()) & (MAX_CORES - 1)
+            //
+            // The `.min` is for the ONE-core build, and is folded away here
+            // (the masked id is already in range). Without it this body is
+            // lighter MIR than the clamp was, and rustc's MIR inliner -- which
+            // weighs it before `C::NUMBER_OF_CORES` folds -- inlined the
+            // one-core kernel differently: +63,896 Ir on `bench/kernel-ir`'s
+            // kernel rows (step, suspend, delay) for a branch that never runs.
+            (usize::from(self.port.core_id()) & (MAX_CORES - 1)).min(MAX_CORES - 1)
         }
     }
 
