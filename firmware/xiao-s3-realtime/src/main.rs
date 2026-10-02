@@ -132,9 +132,8 @@ type K = Kernel<
 >;
 
 struct KernelCell(UnsafeCell<Option<K>>);
-// SAFETY: every access goes through `with_kernel`, which masks interrupts, or
-// through an interrupt handler; the three handlers here share one interrupt
-// level, so none can preempt another, and there is one core.
+// SAFETY: every access is inside `with_kernel` or `with_kernel_in_isr`,
+// both of which hold the interrupt mask for the whole borrow, on one core.
 #[allow(unsafe_code)]
 unsafe impl Sync for KernelCell {}
 static KERNEL: KernelCell = KernelCell(UnsafeCell::new(None));
@@ -150,13 +149,18 @@ fn with_kernel<R>(f: impl FnOnce(&mut K) -> R) -> Option<R> {
     })
 }
 
-/// As `with_kernel`, from inside an interrupt, which already has exclusivity.
+/// As `with_kernel`, from inside an interrupt -- and it MASKS, too.
+///
+/// It used to borrow the kernel bare, on the theory that "an interrupt
+/// already has exclusivity". That holds only while every handler that
+/// touches the kernel shares one level. `xiao-s3-nested` (2026-10-01) showed
+/// what happens once a higher level calls in: 493 entries inside a kernel
+/// section, 304 out-of-order values and a corrupted queue. Masking here
+/// costs a few cycles and makes the claim unconditional; the critical
+/// section RESTORES the handler's own level on exit rather than dropping to
+/// zero.
 fn with_kernel_in_isr<R>(f: impl FnOnce(&mut K) -> R) -> Option<R> {
-    // SAFETY: a handler cannot overlap a critical section on one core, and the
-    // handlers here share one level, so none preempts another.
-    #[allow(unsafe_code)]
-    let slot = unsafe { &mut *KERNEL.0.get() };
-    slot.as_mut().map(f)
+    with_kernel(f)
 }
 
 // ------------------------------------------------------- stacks and switching --

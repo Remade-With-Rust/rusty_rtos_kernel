@@ -302,6 +302,13 @@ Every build carries `decompose` (about 96 cycles of stamps), and the kernel fix 
 All three together: interrupt -> task **-28 % (notify), -25 % (queue), -24 % (semaphore)** at p50,
 the p99 from 8.26 to 4.66 us, and the worst case from 62.7 to 15.9 us.
 
+**2026-10-01, later: `with_kernel_in_isr` now masks.** It borrowed the kernel bare, which is
+sound only while every handler that enters the kernel shares one level; `xiao-s3-nested` showed
+the queue corruption once a higher level calls in. It now takes the same critical section as
+`with_kernel` (`rsil 5`, restoring the handler's own level). Re-run, all nine checks PASS:
+notify p50 **4.53** us (unchanged), queue **5.86** (+0.13, about 31 cycles), semaphore **5.60**
+(unchanged), control p99.9 **30.53** us. The mask costs at most one row's 31 cycles.
+
 Against the predictions:
 
 1. **switch-in-trap: -295 cycles, predicted ~-360.** The second trap is gone (E>F 345 -> 4). But
