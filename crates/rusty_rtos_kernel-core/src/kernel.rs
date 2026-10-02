@@ -2020,14 +2020,29 @@ where
         // time, so the item IS the task, and the walk can skip a held one
         // without resolving it through the arena. Only the task chosen is
         // resolved. A core holding nothing names an item no list can contain.
-        let held: [ItemId; MAX_CORES] = core::array::from_fn(|c| {
-            let task = self.current_of(c);
-            if c < Self::cores() && !task.is_null() {
-                Self::state_item(task)
-            } else {
-                ItemId::MAX
-            }
-        });
+        //
+        // Once the scheduler runs, no core's current task is null: the idle
+        // tasks take every core before `running` is set, and only a pick ever
+        // replaces one. So the null test -- a compare and a select per core,
+        // on every switch -- is for a switch made before the start.
+        let held: [ItemId; MAX_CORES] = if self.running {
+            core::array::from_fn(|c| {
+                if c < Self::cores() {
+                    Self::state_item(self.current_of(c))
+                } else {
+                    ItemId::MAX
+                }
+            })
+        } else {
+            core::array::from_fn(|c| {
+                let task = self.current_of(c);
+                if c < Self::cores() && !task.is_null() {
+                    Self::state_item(task)
+                } else {
+                    ItemId::MAX
+                }
+            })
+        };
         let mine = held.get(core).copied().unwrap_or(ItemId::MAX);
         let mut priority = self.top_ready_priority;
         let mut decrement_top = true;
