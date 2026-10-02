@@ -1981,6 +1981,20 @@ where
                 .lists
                 .insert_end(current_list, Self::state_item(current));
         }
+        // Which state items the cores hold, by item rather than by handle: a
+        // ready list holds only live tasks and a slot holds one live task at a
+        // time, so the item IS the task, and the walk can skip a held one
+        // without resolving it through the arena. Only the task chosen is
+        // resolved. A core holding nothing names an item no list can contain.
+        let held: [ItemId; MAX_CORES] = core::array::from_fn(|c| {
+            let task = self.current_of(c);
+            if c < Self::cores() && !task.is_null() {
+                Self::state_item(task)
+            } else {
+                ItemId::MAX
+            }
+        });
+        let mine = held.get(core).copied().unwrap_or(ItemId::MAX);
         let mut priority = self.top_ready_priority;
         let mut decrement_top = true;
         loop {
@@ -1989,16 +2003,15 @@ where
                 decrement_top = false;
                 let mut at = self.lists.head(list).unwrap_or(None);
                 while let Some(item) = at {
-                    if let Ok(task) = self.task_of_state_item(item) {
-                        if !self.held_by_any_core(task) {
+                    if !held.contains(&item) {
+                        if let Ok(task) = self.task_of_state_item(item) {
                             self.set_requested_on(core, false);
                             self.set_current_of(core, task, priority);
                             return true;
                         }
-                        if task == self.current_of(core) {
-                            self.set_requested_on(core, false);
-                            return true;
-                        }
+                    } else if item == mine {
+                        self.set_requested_on(core, false);
+                        return true;
                     }
                     at = self.lists.next(item).unwrap_or(None);
                 }
