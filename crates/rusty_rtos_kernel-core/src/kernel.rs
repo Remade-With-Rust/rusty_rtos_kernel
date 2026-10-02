@@ -1962,10 +1962,14 @@ where
     /// answer whether THIS core now owes a yield.
     ///
     /// Every one-core "did the woken task outrank the running one?" test has
-    /// this as its SMP arm. Out of line for the MIR-inliner reason the SMP
-    /// tick bodies are.
-    #[cold]
-    #[inline(never)]
+    /// this as its SMP arm.
+    ///
+    /// In line: the body is one call (`yield_for_task`, out of line itself)
+    /// and a flag read, so out of line it was a call to make a call. The
+    /// MIR-inliner risk that keeps the SMP tick bodies out of line was
+    /// measured here and is absent: `bench/kernel-ir`'s one-core kernel rows
+    /// are unchanged.
+    #[inline(always)]
     fn smp_readied(&mut self, task: TaskHandle, priority: u8) -> bool {
         if C::USE_PREEMPTION {
             self.yield_for_task(task, priority);
