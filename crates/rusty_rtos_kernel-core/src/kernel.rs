@@ -1905,13 +1905,26 @@ where
         }
         let mut lowest = i16::from(priority).saturating_sub(1);
         let mut lowest_core = None;
+        // The idle tasks' slots, once: an idle task can run on either core.
+        // A null idle (before the scheduler starts) names no slot.
+        let idle: [u32; MAX_CORES] = core::array::from_fn(|c| {
+            let task = self.idle_of(c);
+            if c < Self::cores() && !task.is_null() { task.index() } else { u32::MAX }
+        });
         for core in 0..Self::cores() {
-            let running = self.current_of(core);
+            // The two flags first: a core that already owes or was asked for
+            // a yield is no candidate, and they cost a load each where the
+            // idle test below is a walk over the idle tasks.
+            if self.requested_on(core) || self.pending_on(core) {
+                continue;
+            }
+            let running = self.current_of(core).index();
             let mut p = i16::from(self.priority_on(core));
-            if self.is_idle_task(running) {
+            // By slot index: each slot holds one live task.
+            if idle.contains(&running) {
                 p = p.saturating_sub(1);
             }
-            if !self.requested_on(core) && !self.pending_on(core) && p <= lowest {
+            if p <= lowest {
                 lowest = p;
                 lowest_core = Some(core);
             }
