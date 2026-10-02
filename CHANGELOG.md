@@ -3,9 +3,17 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
-## Unreleased
+## 0.3.0 — 2026-10-02
+
+**Breaking** (0.x minor): `Kernel::current` is no longer `const fn`, and
+`StartHandles` has a new public field. SMP is a **preview**: see the README.
 
 ### Added
+- **SMP, slices S1, S1b, S2a** (`configNUMBER_OF_CORES = 2`, `docs/plans/smp.md`).
+  The scheduler with two cores, read from the pinned `tasks.c`, and the other-core
+  delete, suspend, priority-set, resume and wake paths. A 20,000-step two-core
+  differential against the C kernel (`tests/smp_differential.rs`) is identical
+  on every line. S1 in detail:
 - **SMP, slice S1** (`configNUMBER_OF_CORES = 2`, `docs/plans/smp.md`):
   per-core `current` and `xYieldPendings`, one idle task per core,
   `prvSelectHighestPriorityTask`, `prvYieldForTask`, `prvYieldCore`, and
