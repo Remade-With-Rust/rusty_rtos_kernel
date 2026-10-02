@@ -3898,7 +3898,13 @@ where
             // `vTaskSuspend`: the core running `target` switches away -- this
             // one now, another by `prvYieldCore`.
             if self.running {
-                match self.running_core(target) {
+                // By slot index, as `yield_for_task`: `target` was found
+                // live above, and so is every core's current task once the
+                // scheduler runs.
+                let slot = target.index();
+                let core = (0..Self::cores())
+                    .find(|&c| self.current_of(c).index() == slot && !self.requested_on(c));
+                match core {
                     Some(core) if core == self.core() => self.port_yield(),
                     Some(core) => self.yield_core(core),
                     None => {}
