@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 rusty_rtos_kernel-core = { path = "../../crates/rusty_rtos_kernel-core", default-features = false }
 rusty_rtos_core = { path = "../../../rusty_rtos_core/crates/rusty_rtos_core", default-features = false }
 rusty_rtos_port-core = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-core", default-features = false }
+rusty_rtos_port-xtensa = { path = "../../../rusty_rtos_port/crates/rusty_rtos_port-xtensa", default-features = false, optional = true }
 
 # `ccount`, the Xtensa cycle counter. This is the whole reason this cell can
 # say anything the QEMU cells cannot: one cycle of resolution against
@@ -28,6 +29,10 @@ esp-backtrace = { version = "=0.20.0", features = [
     "panic-handler",
     "println",
 ] }
+
+[features]
+# The kernel on the shipped Xtensa port instead of the sim port.
+xtensa-port = ["dep:rusty_rtos_port-xtensa"]
 
 [profile.release]
 opt-level = 3

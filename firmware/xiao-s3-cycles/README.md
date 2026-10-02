@@ -1,5 +1,21 @@
 # `xiao-s3-cycles` — K3's cycle rows, on silicon
 
+> **Re-measured 2026-10-01, and now WITH a C arm on the same part**
+> ([`../xiao-s3-cycles-c`](../xiao-s3-cycles-c/README.md)). The kernel has
+> moved since the numbers below: on the sim port this cell now reads
+> **tick 35/35, switch 102, ISR-API wake 293**. With `--features xtensa-port`
+> (the port Kairos ships on this part) it reads **36/35, 96, 310**. Against
+> the same rows for FreeRTOS on the same XIAO:
+>
+> | cycles | Kairos (XtensaPort) | FreeRTOS V10.5.1 (IDF) | FreeRTOS V11.1.0 (upstream) |
+> |---|---:|---:|---:|
+> | tick | **36** | 69 | 69 |
+> | switch | 96 | **90** | 98 |
+> | ISR-API wake | **310** | 431 | 399 |
+>
+> Read the C cell's caveats first: optimisation is not identical (fat LTO
+> against `-O2`), and the IDF kernel takes spinlocks even on one core.
+
 ```
 clock   Xtensa ccount, 1 cycle of resolution at 240 MHz
 method  median of 512, bracket tax measured and subtracted

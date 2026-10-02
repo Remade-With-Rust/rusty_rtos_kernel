@@ -1,0 +1,3 @@
+# Arm B: Amazon's upstream FreeRTOS (the IDF's FREERTOS_SMP option), still one
+# core -- the closer relative of the V11.3.1 Kairos is transcribed from.
+CONFIG_FREERTOS_SMP=y

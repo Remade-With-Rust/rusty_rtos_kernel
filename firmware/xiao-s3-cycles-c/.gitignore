@@ -1,0 +1,6 @@
+build/
+build-smp/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/

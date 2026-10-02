@@ -63,7 +63,14 @@ use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::NoTrace;
 use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_kernel_core::{list_slots_for, lists_for, Kernel};
-use rusty_rtos_port_core::sim::SimPort;
+#[cfg(not(feature = "xtensa-port"))]
+use rusty_rtos_port_core::sim::SimPort as CellPort;
+/// `--features xtensa-port`: the kernel on the port it SHIPS with on this
+/// part -- real `rsil` critical sections, switches committed by `Software0`
+/// -- instead of the stackless sim port. The C arm (`../xiao-s3-cycles-c`)
+/// pays FreeRTOS's real critical sections, so this is the like-for-like row.
+#[cfg(feature = "xtensa-port")]
+use rusty_rtos_port_xtensa::XtensaPort as CellPort;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -94,7 +101,7 @@ const GROUPS: usize = 1;
 
 type K = Kernel<
     CycleConfig,
-    SimPort,
+    CellPort,
     NoTrace,
     NoTickHook,
     TASKS,
@@ -170,7 +177,7 @@ fn main() -> ! {
     println!();
 
     // ------------------------------------------------------------ a tick --
-    let mut kernel = match K::new(SimPort::new(), NoTrace) {
+    let mut kernel = match K::new(CellPort::new(), NoTrace) {
         Ok(k) => k,
         Err(_) => {
             println!("RESULT: FAIL -- the kernel geometry was refused");
