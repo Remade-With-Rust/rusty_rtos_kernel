@@ -4296,8 +4296,10 @@ where
         self.resume_all_inline()
     }
 
-    /// The body of [`Kernel::resume_all`], in line for the hot callers.
-    #[inline(always)]
+    /// The body of [`Kernel::resume_all`], in line for the hot callers
+    /// (one shared body under the `small` feature).
+    #[cfg_attr(not(feature = "small"), inline(always))]
+    #[cfg_attr(feature = "small", inline(never))]
     pub(crate) fn resume_all_inline(&mut self) -> bool {
         let mut already_yielded = false;
         self.enter_critical();
@@ -4727,6 +4729,11 @@ where
             let _ = self.lists.remove(item);
             self.set_task_priority(holder, waiter_priority)?;
             self.add_task_to_ready_list(holder)?;
+            // SMP: "The priority of the task is raised. Yield for this task
+            // if it is not running." (`xTaskPriorityInherit`)
+            if C::NUMBER_OF_CORES > 1 && C::USE_PREEMPTION && self.running_core(holder).is_none() {
+                self.yield_for_task(holder, waiter_priority);
+            }
         } else {
             self.set_task_priority(holder, waiter_priority)?;
         }
@@ -4776,6 +4783,16 @@ where
         self.lists
             .set_value(Self::event_item(holder), event_value)?;
         self.add_task_to_ready_list(holder)?;
+        // SMP: "The priority of the task is dropped. Yield the core on which
+        // the task is running." (`xTaskPriorityDisinherit`) Found by the
+        // two-core corpus: without it a give that disinherits AND wakes a
+        // waiter sends the waiter to the other core, where the C runs it on
+        // the giver's.
+        if C::NUMBER_OF_CORES > 1 {
+            if let Some(core) = self.running_core(holder) {
+                self.yield_core(core);
+            }
+        }
         Ok(true)
     }
 
@@ -4818,6 +4835,12 @@ where
         if self.lists.container(item)? == Some(Self::ready_list(priority)) {
             let _ = self.lists.remove(item);
             self.add_task_to_ready_list(holder)?;
+            // SMP: as `priority_disinherit` (`vTaskPriorityDisinheritAfterTimeout`).
+            if C::NUMBER_OF_CORES > 1 {
+                if let Some(core) = self.running_core(holder) {
+                    self.yield_core(core);
+                }
+            }
         }
         Ok(())
     }

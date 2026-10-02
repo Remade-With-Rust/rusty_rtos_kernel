@@ -400,7 +400,7 @@ Two are worth knowing before you adopt it:
 
 **Tier** critical-path · **Audited** 2026-10-01 (deep) · **v1.0.0 gates** 15/16 · [Full checklist](docs/plans/use-protection-please.md)
 
-`██████████████████░░` **91%** &nbsp;·&nbsp; 30 Completed · 0 Scheduled · 3 Incomplete · 22 N/A
+`██████████████████░░` **94%** &nbsp;·&nbsp; 31 Completed · 0 Scheduled · 2 Incomplete · 22 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
@@ -410,14 +410,14 @@ Two are worth knowing before you adopt it:
 | 3 — Code level | 7 | 0 | 0 | 0 |
 | 4 — Static analysis | 1 | 0 | 0 | 0 |
 | 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
-| 6 — Fuzzing and properties | 2 | 0 | 2 | 0 |
+| 6 — Fuzzing and properties | 3 | 0 | 1 | 0 |
 | 7 — Formal verification | 0 | 0 | 0 | 1 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 0 | 0 | 0 | 3 |
 | 11 — CI/CD, release, and operations | 4 | 0 | 1 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **30** | **0** | **3** | **22** |
+| **Total** | **31** | **0** | **2** | **22** |
 
 **Architect** — [Tim Almond](https://github.com/Ttimmahlax) — accountable for this unit's security design; rendered
 <!-- HARDENING-TABLE:END -->
