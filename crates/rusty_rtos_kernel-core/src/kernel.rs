@@ -4116,7 +4116,11 @@ where
     /// happen until this has run.
     pub fn check_tasks_waiting_termination(&mut self) {
         if C::NUMBER_OF_CORES > 1 {
-            self.reap_smp();
+            // Nothing deleted is the answer on almost every idle pass: say so
+            // here rather than in a call to the out-of-line body.
+            if !self.awaiting_reap.is_null() || !self.awaiting_reap_smp.is_null() {
+                self.reap_smp();
+            }
             return;
         }
         let task = self.awaiting_reap;
