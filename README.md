@@ -92,6 +92,31 @@ the length walked 1..=22 on the host and 1..=26 on every 32-bit target. It was
 not trace text: the scenario sent different data, and no counter could see it
 because the number of sends never changed. Both emulators are now 25 of 25.
 
+## SMP (two cores) -- preview
+
+Set `Config::NUMBER_OF_CORES = 2` and the kernel schedules two cores, read
+from the pinned FreeRTOS V11.3.1 `tasks.c` with `configRUN_MULTIPLE_PRIORITIES
+= 1` and no core affinity (`docs/plans/smp.md`):
+
+- **Against the C, step for step.** `tests/smp_differential.rs` replays a
+  20,000-step random script -- create, delete, suspend, resume, priority-set,
+  delay, semaphores, tick and yield, each from a chosen core -- that the C
+  kernel built with two cores ran first (`oracle/smp/`). Every line is
+  identical, and the test has been seen to fail on a one-character change.
+- **On silicon.** One kernel schedules both cores of an ESP32-S3
+  (`rusty_rtos_port/firmware/xiao-s3-smp`): two spins in parallel, and 2,000
+  cross-core hand-offs.
+- **Free on one core.** A one-core build stays conformance-identical, and
+  instruction-count neutral on every `bench/*-ir`.
+
+**Not yet proven:**
+- blocking waits in the two-core differential;
+- the threaded SMP demo corpus (S2b);
+- core affinity, and `configRUN_MULTIPLE_PRIORITIES = 0` (the C's default).
+
+A port drains cross-core yields with `Kernel::take_core_yields()` and raises
+its inter-processor interrupt; the kernel stays `forbid(unsafe)`.
+
 ## Tickless idle
 
 Three functions, each the C's, and all inert unless
