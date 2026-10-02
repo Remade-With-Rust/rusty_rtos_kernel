@@ -1583,6 +1583,11 @@ where
                 return Err(Error::Full);
             }
         };
+        // A slot an idle task once held must not carry its mark into the
+        // task that reuses it. SMP only: nothing else reads the bit.
+        if C::NUMBER_OF_CORES > 1 {
+            self.set_flag(handle.index() as usize, Self::F_IDLE, false);
+        }
         // The event item sorts by `configMAX_PRIORITIES - uxPriority`, so a
         // higher-priority task waits nearer the head of an event list.
         let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(priority));
@@ -1777,6 +1782,7 @@ where
             if let Some(slot) = self.idle.get_mut(core) {
                 *slot = idle;
             }
+            self.set_flag(idle.index() as usize, Self::F_IDLE, true);
             self.set_current_of(core, idle, Self::IDLE_PRIORITY);
         }
         self.check_for_valid_list_and_queue()?;
@@ -1916,23 +1922,20 @@ where
         }
         let mut lowest = i16::from(priority).saturating_sub(1);
         let mut lowest_core = None;
-        // The idle tasks' slots, once: an idle task can run on either core.
-        // A null idle (before the scheduler starts) names no slot.
-        let idle: [u32; MAX_CORES] = core::array::from_fn(|c| {
-            let task = self.idle_of(c);
-            if c < Self::cores() && !task.is_null() { task.index() } else { u32::MAX }
-        });
         for core in 0..Self::cores() {
             // The two flags first: a core that already owes or was asked for
-            // a yield is no candidate, and they cost a load each where the
-            // idle test below is a walk over the idle tasks.
+            // a yield is no candidate.
             if self.requested_on(core) || self.pending_on(core) {
                 continue;
             }
             let running = self.current_of(core).index();
             let mut p = i16::from(self.priority_on(core));
-            // By slot index: each slot holds one live task.
-            if idle.contains(&running) {
+            // `taskATTRIBUTE_IS_IDLE`, as the C keeps it: one bit of the
+            // running task's own flags, where comparing against the idle
+            // tasks' handles rebuilt their slots on every call. Before the
+            // scheduler starts no task carries the bit, so a core's null
+            // current (slot 0) answers "not idle", as the handle test did.
+            if self.flag(running as usize, Self::F_IDLE, false) {
                 p = p.saturating_sub(1);
             }
             if p <= lowest {
@@ -2565,6 +2568,9 @@ where
     const F_YIELD: u8 = 1 << 1;
     /// `wait_set`: a blocking call's `WaitFrame` is live in the TCB.
     const F_WAIT: u8 = 1 << 2;
+    /// `taskATTRIBUTE_IS_IDLE`, SMP only: set on each core's idle task by
+    /// `start_scheduler_smp`, cleared whenever a slot gets a new task.
+    const F_IDLE: u8 = 1 << 3;
 
     /// Read one per-task flag.
     ///
