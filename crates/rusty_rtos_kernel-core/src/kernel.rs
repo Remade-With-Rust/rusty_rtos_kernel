@@ -2014,19 +2014,31 @@ where
             let list = Self::ready_list(priority);
             if !self.lists.is_empty_of(list) {
                 decrement_top = false;
-                let mut at = self.lists.head(list).unwrap_or(None);
-                while let Some(item) = at {
+                // The list's own iterator follows the links with none of the
+                // per-step container and bounds checks `head`/`next` make. The
+                // first item no other core holds wins: a free task (swapped
+                // in) or this core's own (kept).
+                let tcbs = &self.tcbs;
+                let pick = self.lists.iter(list).find_map(|item| {
                     if !held.contains(&item) {
-                        if let Ok(task) = self.task_of_state_item(item) {
-                            self.set_requested_on(core, false);
-                            self.set_current_of(core, task, priority);
-                            return true;
-                        }
+                        tcbs.handle_at(item).map(Some)
                     } else if item == mine {
+                        Some(None)
+                    } else {
+                        None
+                    }
+                });
+                match pick {
+                    Some(Some(task)) => {
+                        self.set_requested_on(core, false);
+                        self.set_current_of(core, task, priority);
+                        return true;
+                    }
+                    Some(None) => {
                         self.set_requested_on(core, false);
                         return true;
                     }
-                    at = self.lists.next(item).unwrap_or(None);
+                    None => {}
                 }
             }
             if decrement_top {
