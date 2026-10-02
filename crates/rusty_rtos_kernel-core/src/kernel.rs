@@ -1917,7 +1917,16 @@ where
     #[cold]
     #[inline(never)]
     fn yield_for_task(&mut self, task: TaskHandle, priority: u8) {
-        if self.running_core(task).is_some() {
+        // `taskTASK_IS_RUNNING`, by slot index. Before the scheduler starts
+        // every core's current task is null (slot 0), so no core can be
+        // running `task` and the test is skipped; after it, a core's current
+        // task and the task just readied are both live, and a slot holds one
+        // live task at a time -- so the index IS the handle.
+        let slot = task.index();
+        if self.running
+            && (0..Self::cores())
+                .any(|c| self.current_of(c).index() == slot && !self.requested_on(c))
+        {
             return;
         }
         let mut lowest = i16::from(priority).saturating_sub(1);
