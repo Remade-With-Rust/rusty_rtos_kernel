@@ -4081,7 +4081,13 @@ where
     /// # Errors
     /// [`Error::Gone`] for a stale handle.
     pub fn resume(&mut self, task: TaskHandle) -> Result<()> {
-        if task == self.cur() || task.is_null() {
+        // One core: not the running task. Two cores: only not NULL -- the C
+        // enters the section for any task, the running one included, because
+        // SMP asks inside it whether the task is suspended. That section's
+        // exit is a yield point, so resuming a running task can take a yield
+        // an ISR left pending (the API differential, fresh seed 0x3c6ef74a,
+        // two cores, step 22597).
+        if task.is_null() || (C::NUMBER_OF_CORES == 1 && task == self.cur()) {
             return Ok(());
         }
         if !self.tcbs.contains(task) {
@@ -4288,6 +4294,17 @@ where
         // must agree about what a fresh task owes, and a gate that cannot
         // catch either one being dropped because the other still covers it.
         if let Some(f) = self.started.get_mut(task.index() as usize) {
+            *f = false;
+        }
+        // `ucDelayAborted`, which is NOT owed-call state and which nothing
+        // clears on a switch-in: in the C it is a TCB field, freed with the
+        // TCB. A task aborted out of an event list and deleted before its call
+        // consumed the flag left it set for the next task on this index, whose
+        // first blocking call then timed out at once -- `xTaskCheckForTimeOut`
+        // reads the flag BEFORE the task is placed, and placing is what
+        // clears it (the API differential, fresh seed 0x3c6ef74a, two cores,
+        // step 25739: a new task's peek returned empty instead of blocking).
+        if let Some(f) = self.delay_aborted.get_mut(task.index() as usize) {
             *f = false;
         }
     }
@@ -5065,7 +5082,15 @@ where
             let tcb = self.tcbs.resolve(holder)?;
             (tcb.priority, tcb.base_priority, tcb.mutexes_held)
         };
-        if priority == base || held != 1 {
+        // NOT `priority == base` as well, which this also tested: a holder
+        // still at its base priority can be RAISED here. A waiter whose
+        // priority was set above the holder's AFTER it blocked passed nothing
+        // on (`vTaskPrioritySet` does not re-inherit), and when another
+        // waiter times out the C sets the holder to the highest waiter left
+        // -- 0 to 3 in the API differential (fresh seed 0x9e377d99, one core,
+        // step 14559). The C tests `uxPriority != uxPriorityToUse` and the
+        // one-mutex rule, nothing else.
+        if held != 1 {
             return Ok(());
         }
         let target = if highest_waiting > base {

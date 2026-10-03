@@ -277,6 +277,13 @@ fn fold(data: &[u8]) -> i64 {
     data.len() as i64 * 100_000 + data.iter().map(|b| i64::from(*b)).sum::<i64>()
 }
 
+/// FNV-1a/64, as `oracle/api/pin.py` digests an observation.
+fn fnv1a64(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 fn state_char(s: TaskState) -> char {
     match s {
         TaskState::Running => 'X',
@@ -1210,7 +1217,13 @@ macro_rules! replay {
                 // Compared HERE, step by step: the first divergence is the
                 // finding, and anything after it is a consequence -- a later
                 // step may not even be makeable on a kernel that has drifted.
-                if got != want {
+                // A pin (`oracle/api/pin.py`) holds the C's observation as its
+                // FNV-1a/64 digest; a trace holds the text.
+                let same = match want.strip_prefix('#') {
+                    Some(digest) => format!("{:016x}", fnv1a64(got.as_bytes())) == digest,
+                    None => got == want,
+                };
+                if !same {
                     let from = seen.len().saturating_sub(4);
                     panic!(
                         "{label}: divergence at step line {}\n  C:      {line}\n  Kairos: {step} | {got}\n  preceding (C):\n    {}",
@@ -1362,4 +1375,65 @@ fn two_cores_answer_every_step_as_the_c_kernel_does() {
     exercised(TRACE_2);
     let n = replay_two(&TRACE_2.replace("\r\n", "\n"), "two cores");
     assert_eq!(n, 28_001, "every step replayed");
+}
+
+/// Seeds that once found a defect (plan decision D2: a failing fresh seed
+/// becomes a pin), cut just past what they found and kept as digests:
+/// `oracle/api/pins/`. Each names its seed, so its C trace can be made again.
+#[test]
+fn pinned_seeds_answer_every_step_as_the_c_kernel_does() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../oracle/api/pins");
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("oracle/api/pins")
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    let mut seen = 0;
+    for path in entries {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let pin = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        let steps = pin.lines().count();
+        let n = if name.starts_with("api1-") {
+            replay_one(&pin, &name)
+        } else if name.starts_with("api2-") {
+            replay_two(&pin, &name)
+        } else {
+            continue;
+        };
+        assert_eq!(n + 1, steps, "{name}: every step replayed");
+        seen += 1;
+    }
+    assert!(seen >= 2, "the pins are missing from {dir}");
+}
+
+/// Fresh seeds (plan decision D2): every `api1-<seed>.trace` and
+/// `api2-<seed>.trace` in `oracle/api/fresh/`, which `oracle/api/fresh.sh`
+/// writes and git ignores. A failing seed is a finding -- and a new pin.
+#[test]
+#[ignore = "needs traces from oracle/api/fresh.sh"]
+fn fresh_seeds_answer_every_step_as_the_c_kernel_does() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../oracle/api/fresh");
+    let mut seen = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("oracle/api/fresh: run oracle/api/fresh.sh first")
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let trace = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        if name.starts_with("api1-") {
+            replay_one(&trace, &name);
+        } else if name.starts_with("api2-") {
+            replay_two(&trace, &name);
+        } else {
+            continue;
+        }
+        seen += 1;
+    }
+    assert!(seen > 0, "no traces in {dir}");
 }
