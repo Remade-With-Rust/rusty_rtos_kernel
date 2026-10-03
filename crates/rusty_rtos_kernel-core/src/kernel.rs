@@ -3680,7 +3680,11 @@ where
     /// that reads the kernel's own copy of itself therefore sees the value
     /// from before this call.
     fn run_tick_hook(&mut self) {
-        if !C::USE_TICK_HOOK {
+        // A hook that says it has nothing to do is not copied at all: the
+        // copy out and back is the hook's full size every tick, 448 bytes
+        // each way for the demo's `TickIsr`, which most scenarios install as
+        // `None`.
+        if !C::USE_TICK_HOOK || !self.tick_hook.wants_tick() {
             return;
         }
         let hook = self.tick_hook;
