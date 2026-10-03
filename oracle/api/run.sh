@@ -30,4 +30,18 @@ for cores in 1 2; do
         "$here/api$cores" "$SEED" 0 "$sweep" > "$here/sweeps/api$cores-$sweep.trace"
         echo "wrote $(wc -l < "$here/sweeps/api$cores-$sweep.trace") lines to sweeps/api$cores-$sweep.trace"
     done
+    # The 32-bit twin (plan P5): every target is 32-bit and this host is not,
+    # and the width is observable -- a message buffer's length prefix is a
+    # size_t. Kept as a digest pin; `cargo test --target i686-pc-windows-msvc`
+    # replays it, and a host of the other width skips it.
+    cc -m32 -O1 -g -Wall -Wno-unused-parameter -DCORES=$cores \
+        -I "$here" -I "$kernel/include" \
+        "$kernel/tasks.c" "$kernel/list.c" "$kernel/queue.c" "$kernel/timers.c" \
+        "$kernel/event_groups.c" "$kernel/stream_buffer.c" \
+        "$kernel/portable/MemMang/heap_3.c" \
+        "$here/port.c" "$here/driver.c" -o "$here/api$cores-m32"
+    "$here/api$cores-m32" "$SEED" "$STEPS" > "$here/api$cores-w32.trace"
+    python3 "$here/pin.py" "$here/api$cores-w32.trace" "$here/pins/api$cores-w32-$SEED.pin"
+    rm -f "$here/api$cores-w32.trace"
+    echo "pinned the 32-bit twin: pins/api$cores-w32-$SEED.pin"
 done

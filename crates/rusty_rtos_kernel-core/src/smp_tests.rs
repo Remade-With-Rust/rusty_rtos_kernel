@@ -266,6 +266,42 @@ fn the_tick_yields_every_core_whose_priority_has_a_second_ready_task() {
     assert_eq!(k.take_core_yields(), 0b10, "core 1 slices too");
 }
 
+/// Two cores with time slicing OFF.
+struct NoSlicingConfig;
+
+impl Config for NoSlicingConfig {
+    type Tick = Bits32;
+    const TICK_RATE_HZ: u32 = 100;
+    const MAX_PRIORITIES: u8 = 5;
+    const MINIMAL_STACK_SIZE: usize = 1;
+    const MAX_TASK_NAME_LEN: usize = 8;
+    const TIMER_TASK_PRIORITY: u8 = 1;
+    const TIMER_TASK_STACK_DEPTH: usize = 1;
+    const TIMER_QUEUE_LENGTH: usize = 1;
+    const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+    const NUMBER_OF_CORES: u8 = 2;
+    const USE_TIME_SLICING: bool = false;
+}
+
+/// The same three tasks with time slicing off: the tick slices nothing
+/// (plan P5: `configUSE_PREEMPTION && configUSE_TIME_SLICING` survived as
+/// `||`, because every two-core oracle runs with both on).
+#[test]
+fn without_time_slicing_the_tick_yields_no_core() {
+    let mut k = kernel::<NoSlicingConfig>();
+    let a = k.create_task("a", 3).expect("a");
+    let b = k.create_task("b", 3).expect("b");
+    k.create_task("c", 3).expect("c");
+    k.start_scheduler().expect("start");
+    switch(&mut k, 0);
+    switch(&mut k, 1);
+    assert_eq!((k.current_on(0), k.current_on(1)), (a, b));
+    let _ = k.take_core_yields();
+    k.port().on(0);
+    assert!(!k.increment_tick(), "core 0 does not slice");
+    assert_eq!(k.take_core_yields(), 0, "nor does core 1");
+}
+
 #[test]
 fn a_yielding_task_goes_behind_the_tasks_that_waited() {
     let mut k = kernel::<SmpConfig>();
@@ -404,6 +440,30 @@ fn two_deferred_deletions_are_both_reaped() {
     k.check_tasks_waiting_termination();
     assert!(k.priority_of(Some(a)).is_err());
     assert!(k.priority_of(Some(b)).is_err());
+}
+
+/// The second reap slot is reaped on its own: core 1 lets go of `b` first,
+/// which empties the FIRST slot while `a` still waits in the second for
+/// core 0 (plan P5: the second slot's own test survived every oracle).
+#[test]
+fn the_second_reap_slot_is_reaped_after_the_first_empties() {
+    let (mut k, _, [a, b, _c]) = two_running();
+    k.port().on(0);
+    k.task_delete(Some(b)).expect("b");
+    k.task_delete(None).expect("a deletes itself");
+    switch(&mut k, 1);
+    k.check_tasks_waiting_termination();
+    assert!(
+        k.priority_of(Some(b)).is_err(),
+        "b, in the first slot, reaped"
+    );
+    assert!(k.priority_of(Some(a)).is_ok(), "a is still core 0's");
+    switch(&mut k, 0);
+    k.check_tasks_waiting_termination();
+    assert!(
+        k.priority_of(Some(a)).is_err(),
+        "a, alone in the second slot, reaped"
+    );
 }
 
 #[test]

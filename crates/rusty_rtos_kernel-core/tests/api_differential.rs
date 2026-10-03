@@ -67,9 +67,12 @@ impl<const CORES: u8, const TICK0: u64> Config for Cfg<CORES, TICK0> {
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 1;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
-    /// `sizeof( size_t )` on the host the oracle runs on: the C's default
-    /// `configMESSAGE_BUFFER_LENGTH_TYPE`.
-    const MESSAGE_LENGTH_BYTES: usize = 8;
+    /// `sizeof( size_t )` on the oracle the trace came from: the C's default
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE`. Eight for the committed 64-bit
+    /// traces, four for `run.sh`'s `-m32` twin -- and a trace only replays
+    /// on a host of its own width (`same_width`), so the host's `usize` is
+    /// the oracle's `size_t`.
+    const MESSAGE_LENGTH_BYTES: usize = core::mem::size_of::<usize>();
     const NUMBER_OF_CORES: u8 = CORES;
     const USE_TIME_SLICING: bool = true;
     /// `configUSE_TICKLESS_IDLE 1`: compiled in for `vTaskStepTick`.
@@ -1413,6 +1416,9 @@ fn exercised(trace: &str) {
 
 #[test]
 fn one_core_answers_every_step_as_the_c_kernel_does() {
+    if !same_width(TRACE_1) {
+        return;
+    }
     exercised(TRACE_1);
     let n = replay(&TRACE_1.replace("\r\n", "\n"), "one core");
     assert_eq!(n, 28_001, "every step replayed");
@@ -1420,9 +1426,25 @@ fn one_core_answers_every_step_as_the_c_kernel_does() {
 
 #[test]
 fn two_cores_answer_every_step_as_the_c_kernel_does() {
+    if !same_width(TRACE_2) {
+        return;
+    }
     exercised(TRACE_2);
     let n = replay(&TRACE_2.replace("\r\n", "\n"), "two cores");
     assert_eq!(n, 28_001, "every step replayed");
+}
+
+/// Whether a trace was made at this host's pointer width.
+///
+/// The width is observable -- a message buffer's length prefix is a
+/// `size_t` -- so a 64-bit C trace cannot judge a 32-bit replay or the
+/// other way round. The committed traces are the 64-bit C's; `run.sh`
+/// also pins a `-m32` twin (`width=32` in its header), which
+/// `cargo test --target i686-pc-windows-msvc` replays. Every target is
+/// 32-bit, so that run is the one at the targets' width (plan P5).
+fn same_width(trace: &str) -> bool {
+    let header = trace.lines().next().unwrap_or("");
+    header.split_whitespace().any(|w| w == "width=32") == cfg!(target_pointer_width = "32")
 }
 
 /// Seeds that once found a defect (plan decision D2: a failing fresh seed
@@ -1447,7 +1469,10 @@ fn pinned_seeds_answer_every_step_as_the_c_kernel_does() {
             .unwrap()
             .replace("\r\n", "\n");
         let steps = pin.lines().count();
-        if !(name.starts_with("api1-") || name.starts_with("api2-")) || !name.starts_with(&only) {
+        if !(name.starts_with("api1-") || name.starts_with("api2-"))
+            || !name.starts_with(&only)
+            || !same_width(&pin)
+        {
             continue;
         }
         let n = replay(&pin, &name);

@@ -1538,4 +1538,55 @@ mod tests {
             "and the second is refused at once: an interrupt cannot wait"
         );
     }
+
+    /// The from-ISR entry refuses what the C `configASSERT`s
+    /// (`xTimerGenericCommandFromISR`): a task-level command, and a change
+    /// of period to zero. Refused means traced, answered false, and nothing
+    /// queued for the daemon (plan P5: `||` -> `&&` survived every oracle,
+    /// which never makes the call the C cannot answer).
+    #[test]
+    fn the_isr_entry_refuses_a_task_command_and_a_zero_period() {
+        use rusty_rtos_core::isr::Woken;
+        let mut k = started();
+        let t = k.timer_create("t", 10, false, 0, 0).expect("a timer");
+        for (command, value) in [
+            (super::Command::Start, 0),
+            (super::Command::ChangePeriodFromIsr, 0),
+        ] {
+            assert_eq!(
+                k.timer_command_from_isr(t, command, value),
+                Ok((false, Woken::NO)),
+                "{command:?} {value} must be refused"
+            );
+            assert_eq!(
+                k.process_one_timer_command(0),
+                Ok(Wait::Ready(false)),
+                "{command:?} {value} reached the daemon's queue"
+            );
+        }
+        // And a good one still goes through.
+        assert_eq!(
+            k.timer_command_from_isr(t, super::Command::ChangePeriodFromIsr, 5),
+            Ok((true, Woken::NO))
+        );
+    }
+
+    /// `Split64` is storage: `new` then `get` is the identity, a high word
+    /// included. On a 64-bit host it is one `u64` and this is trivial; at
+    /// the targets' width (`--target i686-pc-windows-msvc`) it is two words,
+    /// and a value past 2^32 is the only thing that tells the halves apart
+    /// (plan P5: `<<` -> `>>` lived, because every stored tick fits 32 bits).
+    #[test]
+    fn a_split_value_comes_back_whole() {
+        for value in [
+            0,
+            1,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x0123_4567_89AB_CDEF,
+            u64::MAX,
+        ] {
+            assert_eq!(super::Split64::new(value).get(), value, "{value:#x}");
+        }
+    }
 }

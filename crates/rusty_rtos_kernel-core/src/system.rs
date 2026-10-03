@@ -386,6 +386,9 @@ pub(crate) mod tests {
         pub slept: core::cell::Cell<u64>,
         /// Times it was asked at all.
         pub sleeps: core::cell::Cell<u64>,
+        /// Outermost critical-section exits: a refusal to sleep must not
+        /// take a section the C does not.
+        pub exits: core::cell::Cell<u64>,
     }
 
     impl Port for SleepyPort {
@@ -396,6 +399,9 @@ pub(crate) mod tests {
         }
         fn exit_critical(&self) {
             self.nesting.set(self.nesting.get().saturating_sub(1));
+            if self.nesting.get() == 0 {
+                self.exits.set(self.exits.get().saturating_add(1));
+            }
         }
         fn set_interrupt_mask_from_isr(&self) -> u32 {
             0
@@ -1401,5 +1407,117 @@ pub(crate) mod tests {
         assert!(matches!(system.data.send(&mut k, 99, 0), Sent::Full(99)));
         assert!(matches!(system.marks.send(&mut k, 9, 0), Sent::Full(9)));
         assert_eq!(demo::SLOTS, 13);
+    }
+
+    // ---- plan P5: the tickless thresholds -----------------------------------
+    //
+    // `prvGetExpectedIdleTime`'s three "answer zero" arms and the
+    // `configEXPECTED_IDLE_TIME_BEFORE_SLEEP` boundary: the survey's mutants
+    // there lived, because every tickless test above sleeps through a window
+    // far wider than the threshold with nothing else ready.
+
+    /// [`TicklessConfig`] made cooperative: the only build in which a task
+    /// above the idle priority can be ready while the idle task runs.
+    pub struct TicklessCooperativeConfig;
+
+    impl Config for TicklessCooperativeConfig {
+        type Tick = Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        const USE_TIME_SLICING: bool = false;
+        const USE_TICKLESS_IDLE: bool = true;
+        const USE_PREEMPTION: bool = false;
+    }
+
+    /// Room for idle, the daemon and three tasks of our own.
+    type Tk<Cfg> = crate::Kernel<
+        Cfg,
+        SleepyPort,
+        NoTrace,
+        NoTickHook,
+        5,
+        { crate::list_slots_for(5, 0, crate::lists_for(4, 1, 0)) },
+        { crate::lists_for(4, 1, 0) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+    >;
+
+    /// Started, the daemon parked, with the given tasks of our own.
+    fn tickless<Cfg: Config>(tasks: &[(&str, u8)]) -> Tk<Cfg> {
+        let mut k = Tk::<Cfg>::new(SleepyPort::default(), NoTrace).expect("geometry");
+        for &(name, priority) in tasks {
+            k.create_task(name, priority).expect("a task");
+        }
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        k
+    }
+
+    /// `if( xExpectedIdleTime >= configEXPECTED_IDLE_TIME_BEFORE_SLEEP )`:
+    /// a window of exactly the threshold sleeps.
+    #[test]
+    fn an_idle_window_of_exactly_the_threshold_sleeps() {
+        let mut k = tickless::<TicklessConfig>(&[("worker", 1)]);
+        k.delay(TicklessConfig::EXPECTED_IDLE_TIME_BEFORE_SLEEP)
+            .expect("delay");
+        k.idle_suppress_ticks();
+        assert_eq!(k.port().sleeps.get(), 1);
+    }
+
+    /// One tick short of it does not -- and the refusal is made before
+    /// `vTaskSuspendAll`, so it takes no critical section either.
+    #[test]
+    fn an_idle_window_below_the_threshold_neither_sleeps_nor_takes_a_section() {
+        let mut k = tickless::<TicklessConfig>(&[("worker", 1)]);
+        k.delay(TicklessConfig::EXPECTED_IDLE_TIME_BEFORE_SLEEP - 1)
+            .expect("delay");
+        let exits = k.port().exits.get();
+        k.idle_suppress_ticks();
+        assert_eq!(k.port().sleeps.get(), 0);
+        assert_eq!(
+            k.port().exits.get(),
+            exits,
+            "the refusal took a critical section"
+        );
+    }
+
+    /// Another task at the idle priority is ready, so the next tick must be
+    /// processed to share the slice: no sleep, however wide the window.
+    #[test]
+    fn another_idle_priority_task_ready_means_no_sleep() {
+        let mut k = tickless::<TicklessConfig>(&[("worker", 1), ("slacker", 0)]);
+        k.delay(20).expect("the worker delays");
+        k.idle_suppress_ticks();
+        assert_eq!(k.port().sleeps.get(), 0);
+    }
+
+    /// Cooperative only: a task above the idle priority was woken but the
+    /// idle task keeps the CPU, and it must not sleep with that task ready.
+    #[test]
+    fn a_ready_task_above_the_idle_priority_means_no_sleep() {
+        let mut k = tickless::<TicklessCooperativeConfig>(&[("early", 1), ("late", 1)]);
+        k.delay(50).expect("the first task delays long");
+        k.delay(3).expect("the second delays short");
+        for _ in 0..3_u32 {
+            k.tick_from_isr();
+        }
+        assert_eq!(
+            k.name_of(k.current()).expect("a name").as_str(),
+            "IDLE",
+            "cooperative: the woken task does not preempt"
+        );
+        k.idle_suppress_ticks();
+        assert_eq!(k.port().sleeps.get(), 0);
     }
 }

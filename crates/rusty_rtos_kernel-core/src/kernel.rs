@@ -738,6 +738,10 @@ where
             // disagrees with its own config is refused rather than silently
             // sized to whichever one the type happened to carry.
             || TIMER_CMDS != C::TIMER_QUEUE_LENGTH
+            // `configMESSAGE_BUFFER_LENGTH_TYPE`: one to eight bytes. Wider
+            // than eight cannot hold a length any target can send.
+            || C::MESSAGE_LENGTH_BYTES == 0
+            || C::MESSAGE_LENGTH_BYTES > 8
         {
             return Err(Error::InvalidArgument);
         }
@@ -5917,6 +5921,315 @@ mod tests {
         assert!(
             k.yield_pending[0],
             "the yield survives until something can act on it"
+        );
+    }
+
+    // ---- plan P5: what the mutation survey found no oracle judging --------
+
+    /// One core is one core: `cores()` must not round a configured 1 up.
+    #[test]
+    fn a_one_core_configuration_has_one_core() {
+        assert_eq!(K::cores(), 1);
+    }
+
+    /// `state_of` answers Running for the running task on one core, called
+    /// directly -- `task_state_get` answers it first, so no oracle reached
+    /// this spelling's own shortcut.
+    #[test]
+    fn state_of_the_running_task_is_running_on_one_core() {
+        let k = running();
+        assert_eq!(k.state_of(k.current()), Ok(super::TaskState::Running));
+    }
+
+    /// `vTaskResume( NULL )` is a no-op, not a stale-handle error.
+    #[test]
+    fn resuming_null_is_a_no_op() {
+        let mut k = running();
+        assert_eq!(k.resume(rusty_rtos_core::handle::TaskHandle::NULL), Ok(()));
+    }
+
+    /// `xSchedulerRunning`, both ways round.
+    #[test]
+    fn the_scheduler_is_running_only_once_started() {
+        let k = kernel();
+        assert!(!k.is_running());
+        assert!(running().is_running());
+    }
+
+    /// A stall is counted every time and its FIRST reason kept.
+    #[test]
+    fn a_stall_counts_and_keeps_its_first_reason() {
+        let mut k = kernel();
+        assert_eq!((k.stalls(), k.first_stall()), (0, super::Stall::None));
+        k.switch_context();
+        assert_eq!(
+            (k.stalls(), k.first_stall()),
+            (1, super::Stall::NoReadyTask)
+        );
+        k.switch_context();
+        assert_eq!(
+            (k.stalls(), k.first_stall()),
+            (2, super::Stall::NoReadyTask)
+        );
+    }
+
+    /// `xPendedTicks`: ticks taken while the scheduler is suspended.
+    #[test]
+    fn ticks_under_suspension_are_pended_and_counted() {
+        let mut k = running();
+        k.suspend_all();
+        k.tick_from_isr();
+        k.tick_from_isr();
+        assert_eq!(k.pended_ticks(), 2);
+        let _ = k.resume_all();
+        assert_eq!(k.pended_ticks(), 0);
+    }
+
+    /// [`TestConfig`], started at the last tick before the wrap.
+    struct LastTickConfig;
+    impl Config for LastTickConfig {
+        type Tick = rusty_rtos_core::tick::Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const INITIAL_TICK_COUNT: u64 = 0xFFFF_FFFF;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        const USE_TIME_SLICING: bool = false;
+    }
+
+    type KLast = crate::Kernel<
+        LastTickConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(LastTickConfig::MAX_PRIORITIES, 1, 0)) },
+        { crate::lists_for(LastTickConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        { <LastTickConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    fn at_the_last_tick() -> KLast {
+        let mut k =
+            KLast::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        k.create_task("t", 1).expect("a task");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        assert_eq!(k.tick_count(), 0xFFFF_FFFF);
+        k
+    }
+
+    /// `xNumOfOverflows` counts the wrap, and only the wrap.
+    #[test]
+    fn the_wrap_is_counted_once() {
+        let mut k = at_the_last_tick();
+        assert_eq!(k.overflows(), 0);
+        k.tick_from_isr();
+        assert_eq!((k.tick_count(), k.overflows()), (0, 1));
+    }
+
+    /// With nothing delayed the next unblock time is the maximum, so at the
+    /// last tick there is no room to step: `step_tick` must neither pend a
+    /// tick nor move the clock (the C would `configASSERT`; Kairos clamps
+    /// the jump to zero, and a zero jump is nothing).
+    #[test]
+    fn a_step_with_no_room_does_nothing() {
+        let mut k = at_the_last_tick();
+        k.step_tick(1);
+        assert_eq!((k.tick_count(), k.pended_ticks()), (0xFFFF_FFFF, 0));
+    }
+
+    /// A port that counts its outermost critical-section exits, and a sink
+    /// that keeps the count the kernel noted before each event.
+    #[derive(Default)]
+    struct ExitsPort {
+        nesting: core::cell::Cell<u32>,
+        exits: core::cell::Cell<u64>,
+    }
+    impl rusty_rtos_core::port::Port for ExitsPort {
+        fn yield_now(&self) {}
+        fn yield_from_isr(&self, _woken: rusty_rtos_core::isr::Woken) {}
+        fn enter_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_add(1));
+        }
+        fn exit_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_sub(1));
+            if self.nesting.get() == 0 {
+                self.exits.set(self.exits.get().saturating_add(1));
+            }
+        }
+        fn set_interrupt_mask_from_isr(&self) -> u32 {
+            0
+        }
+        fn clear_interrupt_mask_from_isr(&self, _saved: u32) {}
+        fn in_isr(&self) -> bool {
+            false
+        }
+        fn set_in_tick_entry(&self, _yes: bool) {}
+        fn exits(&self) -> u64 {
+            self.exits.get()
+        }
+    }
+    #[derive(Default)]
+    struct ExitsTrace {
+        noted: u64,
+        seen: std::vec::Vec<u64>,
+    }
+    impl rusty_rtos_core::trace::Trace for ExitsTrace {
+        fn note_exits(&mut self, exits: u64) {
+            self.noted = exits;
+        }
+        fn event(&mut self, _tick: u64, _event: rusty_rtos_core::trace::Event<'_>) {
+            self.seen.push(self.noted);
+        }
+    }
+
+    /// The kernel hands an emitting sink the port's exit count before each
+    /// event (the sim's clock column) -- and the count moves.
+    #[test]
+    fn an_emitting_sink_is_told_the_exit_count() {
+        type KE = crate::Kernel<
+            TestConfig,
+            ExitsPort,
+            ExitsTrace,
+            NoTickHook,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+        >;
+        let mut k = KE::new(ExitsPort::default(), ExitsTrace::default()).expect("geometry");
+        k.create_task("a", 1).expect("a");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park");
+        k.delay(3).expect("delay");
+        let seen = &k.trace().seen;
+        assert!(
+            seen.iter().any(|&e| e > 0),
+            "no event carried an exit count: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w.first() <= w.get(1)),
+            "the clock went backwards: {seen:?}"
+        );
+    }
+
+    /// The footprint lines add up to what they claim, and to nearly all of
+    /// the kernel: the remainder is the scalar tail and padding.
+    #[test]
+    fn the_footprint_lines_account_for_the_kernel() {
+        use core::mem::size_of;
+        assert_eq!(
+            K::FOOTPRINT_FREE_LISTS,
+            2 * size_of::<usize>(),
+            "BUFFERS = 0 and QUEUES = 1: one (base, length) pair"
+        );
+        assert_eq!(
+            K::FOOTPRINT_PER_TASK_SIDE,
+            4 * (1 + 3 + size_of::<super::OwedTrace>() + 4),
+            "four tasks: a byte, three flags, an owed line and a word each"
+        );
+        let parts = [
+            K::FOOTPRINT_TCBS,
+            K::FOOTPRINT_QUEUES,
+            K::FOOTPRINT_LISTS,
+            K::FOOTPRINT_SLOTS,
+            K::FOOTPRINT_BUFFERS,
+            K::FOOTPRINT_TIMERS,
+            K::FOOTPRINT_GROUPS,
+            K::FOOTPRINT_TIMER_MESSAGES,
+            K::FOOTPRINT_BYTES,
+            K::FOOTPRINT_FREE_LISTS,
+            K::FOOTPRINT_PER_TASK_SIDE,
+        ];
+        assert_eq!(K::FOOTPRINT_ACCOUNTED, parts.iter().sum::<usize>());
+        // Both at compile time: the remainder is the scalar tail and padding,
+        // and a line that stopped adding up would leave far more than that.
+        const {
+            assert!(K::FOOTPRINT_ACCOUNTED <= K::FOOTPRINT);
+            assert!(K::FOOTPRINT - K::FOOTPRINT_ACCOUNTED < 512);
+        };
+    }
+
+    /// The configuration a geometry test varies: [`TestConfig`] with the
+    /// task-name limit as a parameter.
+    struct NameConfig<const N: usize>;
+    impl<const N: usize> Config for NameConfig<N> {
+        type Tick = rusty_rtos_core::tick::Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = N;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+    }
+
+    type KN<const N: usize> = crate::Kernel<
+        NameConfig<N>,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(4, 1, 0)) },
+        { crate::lists_for(4, 1, 0) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+    >;
+
+    /// A task name may use the whole name buffer, and not one byte more.
+    #[test]
+    fn a_task_name_limit_is_refused_only_past_the_buffer() {
+        assert!(KN::<{ crate::NAME_CAPACITY }>::new(TestPort::default(), NoTrace).is_ok());
+        assert_eq!(
+            KN::<{ crate::NAME_CAPACITY + 1 }>::new(TestPort::default(), NoTrace).err(),
+            Some(rusty_rtos_core::error::Error::InvalidArgument)
+        );
+    }
+
+    /// The timer mailbox's declared length must be the configuration's.
+    #[test]
+    fn a_mailbox_that_disagrees_with_its_config_is_refused() {
+        type KM = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH + 1 },
+        >;
+        assert_eq!(
+            KM::new(TestPort::default(), NoTrace).err(),
+            Some(rusty_rtos_core::error::Error::InvalidArgument)
         );
     }
 }

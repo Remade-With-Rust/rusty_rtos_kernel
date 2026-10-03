@@ -1043,9 +1043,22 @@ where
                 // `length.to_le_bytes()`, not `(length as u64).to_le_bytes()`:
                 // the widening wrote eight bytes on a target whose `size_t` is
                 // four, and the top half was never sent.
-                let raw = length.to_le_bytes();
-                let prefix = raw.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&raw);
-                next_head = Self::write_bytes_into(bytes, base, ring, prefix, next_head);
+                next_head = if Self::MESSAGE_LENGTH_BYTES <= core::mem::size_of::<usize>() {
+                    let raw = length.to_le_bytes();
+                    let prefix = raw.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&raw);
+                    Self::write_bytes_into(bytes, base, ring, prefix, next_head)
+                } else {
+                    // A length type wider than `size_t` -- a configuration
+                    // the C allows -- is written zero-extended, every byte
+                    // of it. Writing only `usize`'s bytes here, while the
+                    // space arithmetic counted the whole prefix, left the
+                    // next message misread on a 32-bit target (plan P5, the
+                    // API differential's `-m32` twin). The branch is on
+                    // constants, so a prefix that fits `usize` pays nothing.
+                    let raw = (length as u64).to_le_bytes();
+                    let prefix = raw.get(..Self::MESSAGE_LENGTH_BYTES).unwrap_or(&raw);
+                    Self::write_bytes_into(bytes, base, ring, prefix, next_head)
+                };
             } else {
                 length = 0;
             }
@@ -1218,6 +1231,20 @@ where
         ring: usize,
         tail: usize,
     ) -> (usize, usize) {
+        if Self::MESSAGE_LENGTH_BYTES > core::mem::size_of::<usize>() {
+            // The wide prefix `write_message` writes zero-extended: read all
+            // of it, so the ring advances past it, and keep the value -- a
+            // length this kernel wrote, so it fits `usize`.
+            let mut wide = [0_u8; 8];
+            let next = match wide.get_mut(..Self::MESSAGE_LENGTH_BYTES) {
+                Some(slot) => Self::read_bytes_from(bytes, base, ring, slot, tail),
+                None => tail,
+            };
+            return (
+                usize::try_from(u64::from_le_bytes(wide)).unwrap_or(usize::MAX),
+                next,
+            );
+        }
         let mut raw = [0_u8; core::mem::size_of::<usize>()];
         // Delegated. This held its OWN two-copy ring walk plus a byte-at-a-time
         // fallback -- a third hand-rolled version of the same walk -- and the
@@ -1670,5 +1697,149 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(&out[..4], b"ping");
         assert_eq!(k.stream_buffer_is_empty(b), Ok(true));
+    }
+
+    /// Four buffers over a 64-byte arena: room to fill it exactly, punch a
+    /// hole and refill it -- which the geometry above (two buffers) cannot.
+    type K4 = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        4,
+        64,
+        0,
+        0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    fn arena() -> K4 {
+        K4::new(TestPort::default(), NoTrace).expect("the declared geometry adds up")
+    }
+
+    /// The byte arena is Kairos storage -- the C mallocs -- so no compared
+    /// run judges it, and no run filled it: its exact-fill, exact-fit and
+    /// split boundaries all survived plan P5's mutants. A buffer of `n`
+    /// takes `n + 1` bytes (the spare byte), so two of 31 fill 64 exactly.
+    #[test]
+    fn the_byte_arena_fills_exactly_and_a_hole_refits_exactly() {
+        use rusty_rtos_core::error::Error;
+        let mut k = arena();
+        let a = k.stream_buffer_create(31, 1).expect("the first half");
+        let _b = k
+            .stream_buffer_create(31, 1)
+            .expect("the second half fills the arena to its last byte");
+        assert_eq!(
+            k.stream_buffer_create(1, 1),
+            Err(Error::Full),
+            "and nothing more fits"
+        );
+
+        k.stream_buffer_delete(a).expect("delete");
+        k.stream_buffer_create(31, 1)
+            .expect("the same size refits the hole exactly");
+        assert_eq!(k.stream_buffer_create(1, 1), Err(Error::Full));
+    }
+
+    /// A smaller buffer splits a hole and the remainder stays usable; two
+    /// freed neighbours coalesce, whichever of them is freed first.
+    #[test]
+    fn a_split_hole_keeps_its_remainder_and_freed_neighbours_coalesce() {
+        use rusty_rtos_core::error::Error;
+        let mut k = arena();
+        let a = k.stream_buffer_create(31, 1).expect("a");
+        let _b = k.stream_buffer_create(31, 1).expect("b: full");
+        k.stream_buffer_delete(a).expect("delete a");
+
+        // The lower neighbour freed first, then the upper.
+        let c = k.stream_buffer_create(15, 1).expect("half the hole");
+        let d = k.stream_buffer_create(15, 1).expect("the remainder of it");
+        assert_eq!(k.stream_buffer_create(1, 1), Err(Error::Full));
+        k.stream_buffer_delete(c).expect("delete c");
+        k.stream_buffer_delete(d).expect("delete d");
+        let e = k
+            .stream_buffer_create(31, 1)
+            .expect("the halves coalesced, lower freed first");
+
+        // The upper neighbour freed first, then the lower.
+        k.stream_buffer_delete(e).expect("delete e");
+        let c = k.stream_buffer_create(15, 1).expect("c again");
+        let d = k.stream_buffer_create(15, 1).expect("d again");
+        k.stream_buffer_delete(d).expect("delete d");
+        k.stream_buffer_delete(c).expect("delete c");
+        k.stream_buffer_create(31, 1)
+            .expect("the halves coalesced, upper freed first");
+    }
+
+    /// `xStreamBufferCreate` refuses a zero size, and a trigger above the
+    /// size, each on its own (plan P5: `||` -> `&&` survived).
+    #[test]
+    fn a_zero_size_or_a_trigger_above_the_size_is_refused() {
+        use rusty_rtos_core::error::Error;
+        let mut k = kernel();
+        assert_eq!(k.stream_buffer_create(0, 0), Err(Error::InvalidArgument));
+        assert_eq!(k.stream_buffer_create(4, 5), Err(Error::InvalidArgument));
+        assert!(k.stream_buffer_create(4, 4).is_ok());
+    }
+
+    /// [`TestConfig`] with an eight-byte message length: a
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE` wider than a 32-bit target's
+    /// `size_t`, which the C allows.
+    struct WidePrefixConfig;
+    impl Config for WidePrefixConfig {
+        type Tick = rusty_rtos_core::tick::Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        const MESSAGE_LENGTH_BYTES: usize = 8;
+    }
+
+    /// A message survives a round trip under a prefix wider than `usize`.
+    /// On a 32-bit target this was broken (plan P5, found by the API
+    /// differential's `-m32` twin): the send wrote four bytes of prefix and
+    /// counted eight, so the receive took the message's first byte and
+    /// nothing more. Run it at the targets' width with
+    /// `cargo test --target i686-pc-windows-msvc`; on a 64-bit host the
+    /// prefix fits `usize` and this is the ordinary path.
+    #[test]
+    fn a_message_round_trips_under_a_prefix_wider_than_usize() {
+        type KW = crate::Kernel<
+            WidePrefixConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(4, 1, 0)) },
+            { crate::lists_for(4, 1, 0) },
+            1,
+            1,
+            2,
+            64,
+            0,
+            0,
+            1,
+        >;
+        let mut k = KW::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let b = k.message_buffer_create(32).expect("a message buffer");
+        k.stream_buffer_send(b, b"hello", 0).expect("send");
+        assert_eq!(
+            k.stream_buffer_bytes_available(b),
+            Ok(13),
+            "eight of prefix, five of message"
+        );
+        assert_eq!(k.stream_buffer_next_message_length(b), Ok(5));
+        let mut out = [0_u8; 16];
+        assert_eq!(k.stream_buffer_receive(b, &mut out, 0), Ok(Wait::Ready(5)));
+        assert_eq!(out.get(..5), Some(&b"hello"[..]));
     }
 }

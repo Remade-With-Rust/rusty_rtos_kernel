@@ -384,6 +384,7 @@ fn every_typed_wrapper_is_the_c_twinned_sequence_it_claims() {
     let s = p.step("send, full", &[HasRoom(qh), Send(qh, 0, 0)], |k| {
         q.send(k, 12, 0)
     });
+    assert!(!s.is_ok(), "a refused send is not pdPASS");
     assert_eq!(s.into_value(), Some(12));
 
     let r = p.step("receive, ready", &[Receive(qh, 0)], |k| q.receive(k, 0));

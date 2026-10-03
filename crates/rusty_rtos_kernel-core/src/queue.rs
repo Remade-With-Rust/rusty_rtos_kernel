@@ -2008,3 +2008,201 @@ where
         self.semaphore_give(mutex).map(|_| ())
     }
 }
+
+/// Plan P5: what the mutation survey found no oracle judging in this file --
+/// the slot arena (Kairos storage; the C mallocs), the queue LOCK (which
+/// only an interrupt landing while a task holds the queue can reach, and
+/// the oracles deliver interrupts between calls), and a receive or peek
+/// made on a semaphore through the queue API.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use rusty_rtos_core::config::Config;
+    use rusty_rtos_core::error::Error;
+    use rusty_rtos_core::handle::{QueueHandle, TaskHandle};
+    use rusty_rtos_core::hooks::NoTickHook;
+
+    use super::{UNLOCKED, Wait};
+    use crate::TaskState;
+    use crate::system::tests::{NoTrace, TestConfig, TestPort};
+
+    /// Room for the timer daemon's queue, a set and three queues, over
+    /// thirty-two slots.
+    type K = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 5, 0)) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 5, 0) },
+        5,
+        32,
+        0,
+        0,
+        0,
+        0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    /// Eight slots and nothing else, to fill.
+    type K8 = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 3, 0)) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 3, 0) },
+        3,
+        8,
+        0,
+        0,
+        0,
+        0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    /// A started kernel in which `rx` (priority 2) is blocked receiving on
+    /// an empty queue of sixteen, and `tx` (priority 1) runs.
+    fn with_receiver() -> (K, QueueHandle, TaskHandle) {
+        let mut k = K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let q = k.queue_create(16).expect("a queue");
+        let rx = k.create_task("rx", 2).expect("rx");
+        k.create_task("tx", 1).expect("tx");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        assert_eq!(k.current(), rx);
+        assert_eq!(k.queue_receive(q, 10), Ok(Wait::Blocked));
+        (k, q, rx)
+    }
+
+    fn tx_lock(k: &K, q: QueueHandle) -> i8 {
+        k.queues.resolve(q).expect("the queue").tx_lock
+    }
+
+    /// `prvLockQueue` holds an interrupt's wake back until `prvUnlockQueue`:
+    /// the interrupt only counts what it did. Two sends, because the first
+    /// alone cannot tell the count from the `queueUNLOCKED` sentinel.
+    #[test]
+    fn an_interrupt_send_to_a_locked_queue_waits_for_the_unlock() {
+        let (mut k, q, rx) = with_receiver();
+        k.lock_queue(q);
+        let _ = k.queue_send_from_isr(q, 7).expect("send");
+        let _ = k.queue_send_from_isr(q, 8).expect("send");
+        assert_eq!(
+            k.task_state_get(rx),
+            Ok(TaskState::Blocked),
+            "the lock held the wake back"
+        );
+        assert_eq!(tx_lock(&k, q), 2, "and counted both sends");
+        k.unlock_queue(q).expect("unlock");
+        assert_eq!(
+            k.task_state_get(rx),
+            Ok(TaskState::Ready),
+            "the unlock woke it"
+        );
+        assert_eq!(tx_lock(&k, q), UNLOCKED);
+    }
+
+    /// `prvIncrementQueueTxLock` / `RxLock` stop at the task count: there
+    /// is no point waking more tasks than exist.
+    #[test]
+    fn the_lock_counts_stop_at_the_task_count() {
+        let (mut k, q, _) = with_receiver();
+        let tasks = k.task_count();
+        k.lock_queue(q);
+        for i in 0..tasks.saturating_add(3) {
+            let _ = k.queue_send_from_isr(q, i as u64).expect("send");
+        }
+        assert_eq!(tx_lock(&k, q) as usize, tasks, "the send count is capped");
+        k.unlock_queue(q).expect("unlock");
+
+        k.lock_queue(q);
+        for _ in 0..tasks.saturating_add(3) {
+            let _ = k.queue_receive_from_isr(q).expect("receive");
+        }
+        let rx_lock = k.queues.resolve(q).expect("the queue").rx_lock;
+        assert_eq!(rx_lock as usize, tasks, "and so is the receive count");
+        k.unlock_queue(q).expect("unlock");
+    }
+
+    /// A send an interrupt made while the queue was locked is announced to
+    /// its set by the unlock, not lost (`prvUnlockQueue`'s
+    /// `prvNotifyQueueSetContainer`).
+    #[test]
+    fn an_unlock_announces_to_the_set_what_the_lock_held_back() {
+        let mut k = K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let set = k.queue_create_set(4).expect("a set");
+        let q = k.queue_create(4).expect("a member");
+        assert_eq!(k.queue_add_to_set(q, set), Ok(true));
+        k.create_task("t", 1).expect("t");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+
+        k.lock_queue(q);
+        let _ = k.queue_send_from_isr(q, 5).expect("send");
+        assert_eq!(
+            k.queue_select_from_set(set, 0),
+            Ok(Wait::Ready(None)),
+            "nothing announced while the lock holds"
+        );
+        k.unlock_queue(q).expect("unlock");
+        assert_eq!(
+            k.queue_select_from_set(set, 0),
+            Ok(Wait::Ready(Some(q))),
+            "the unlock announced the member"
+        );
+    }
+
+    /// The slot arena refits a freed queue's slots exactly, so a
+    /// create/delete loop of one length never runs out.
+    #[test]
+    fn the_slot_arena_refits_a_hole_of_the_same_length() {
+        let mut k = K8::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let a = k.queue_create(4).expect("a");
+        let _b = k.queue_create(4).expect("b fills the slots");
+        assert_eq!(k.queue_create(1), Err(Error::Full));
+        k.queue_delete(a).expect("delete");
+        k.queue_create(4).expect("the hole refits exactly");
+        assert_eq!(k.queue_create(1), Err(Error::Full));
+    }
+
+    /// `xQueueReceive` on a semaphore takes it and `xQueuePeek` does not:
+    /// a semaphore carries no data, so the count is the item.
+    #[test]
+    fn receive_takes_a_semaphore_and_peek_leaves_it() {
+        let (mut k, _, _) = with_receiver();
+        let s = k.semaphore_create_binary().expect("a semaphore");
+        k.semaphore_give(s).expect("give");
+        assert_eq!(k.queue_peek(s, 0), Ok(Wait::Ready(0)));
+        assert_eq!(k.semaphore_count(s), Ok(1), "a peek leaves it");
+        assert_eq!(k.queue_receive(s, 0), Ok(Wait::Ready(0)));
+        assert_eq!(k.semaphore_count(s), Ok(0), "a receive takes it");
+    }
+
+    /// `xTaskResumeAll` yields for a task the pending-ready list hands back
+    /// only when it outranks the running one: an interrupt that wakes a
+    /// LOWER-priority waiter under suspension costs no yield.
+    #[test]
+    fn resuming_with_a_lower_priority_task_pending_does_not_yield() {
+        let mut k = K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let sem = k.semaphore_create_binary().expect("a semaphore");
+        let lo = k.create_task("lo", 1).expect("lo");
+        let hi = k.create_task("hi", 2).expect("hi");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        assert_eq!(k.current(), hi);
+        k.delay(2).expect("hi steps aside");
+        assert_eq!(k.current(), lo);
+        assert_eq!(k.semaphore_take(sem, 100), Ok(Wait::Blocked));
+        k.tick_from_isr();
+        k.tick_from_isr();
+        assert_eq!(k.current(), hi, "hi is back");
+
+        k.suspend_all();
+        let _ = k.semaphore_give_from_isr(sem).expect("give");
+        assert!(!k.resume_all(), "lo does not outrank hi: no yield");
+        assert_eq!(k.current(), hi);
+    }
+}

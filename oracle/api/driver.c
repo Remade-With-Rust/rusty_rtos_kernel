@@ -35,6 +35,7 @@
  *
  * Usage: driver <seed> <steps>
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,7 +142,7 @@ static void timer_cb( TimerHandle_t t )
 /* A select's result: 0 for none, else (the member's slot + 1) * 100 plus the
  * value its receive took -- the select and the receive it licenses are one
  * step, as the C documents them. */
-static long select_and_take( QueueSetMemberHandle_t m,
+static int64_t select_and_take( QueueSetMemberHandle_t m,
                              int from_isr )
 {
     uint32_t v = 0;
@@ -163,7 +164,7 @@ static long select_and_take( QueueSetMemberHandle_t m,
     ok = from_isr ? xQueueReceiveFromISR( m, &v, &woken ) : xQueueReceive( m, &v, 0 );
     ( void ) woken; /* a sender it wakes is left a PENDING yield, as an ISR
                      * with no woken pointer leaves one */
-    return ( long ) ( q + 1 ) * 100 + ( ok ? ( long ) v : 0 );
+    return ( int64_t ) ( q + 1 ) * 100 + ( ok ? ( int64_t ) v : 0 );
 }
 
 static void pended_fn( void * p1,
@@ -175,7 +176,7 @@ static void pended_fn( void * p1,
 }
 
 /* A task's timer command: 0 start, 1 stop, 2 reset, 3 change period. */
-static long timer_cmd( int t,
+static int64_t timer_cmd( int t,
                        uint32_t cmd,
                        uint32_t value,
                        TickType_t ticks )
@@ -191,7 +192,7 @@ static long timer_cmd( int t,
 
 /* Send `len` bytes counting up from `start` -- the replay builds the same
  * bytes from the same two numbers. */
-static long buffer_send( int b,
+static int64_t buffer_send( int b,
                          unsigned len,
                          unsigned start,
                          TickType_t ticks )
@@ -203,25 +204,25 @@ static long buffer_send( int b,
         data[ i ] = ( uint8_t ) ( start + i );
     }
 
-    return ( long ) xStreamBufferSend( buffer[ b ], data, len, ticks );
+    return ( int64_t ) xStreamBufferSend( buffer[ b ], data, len, ticks );
 }
 
 /* A receive's result: how many bytes, times 100000, plus their sum -- a
  * wrong byte shows as surely as a wrong count. */
-static long fold( size_t n,
+static int64_t fold( size_t n,
                   const uint8_t * data )
 {
-    long sum = 0;
+    int64_t sum = 0;
 
     for( size_t i = 0; i < n; i++ )
     {
         sum += data[ i ];
     }
 
-    return ( long ) n * 100000 + sum;
+    return ( int64_t ) n * 100000 + sum;
 }
 
-static long buffer_recv( int b,
+static int64_t buffer_recv( int b,
                          unsigned max,
                          TickType_t ticks )
 {
@@ -266,7 +267,7 @@ static char * coro_stack[ SLOTS + 1 ];
 static struct call coro_call[ SLOTS ];
 static int pending[ SLOTS ];
 static int coro_done[ SLOTS ];
-static long coro_result[ SLOTS ];
+static int64_t coro_result[ SLOTS ];
 static int in_coro = -1;
 static int coro_start_slot;
 
@@ -287,21 +288,21 @@ static void on_yield( void )
 
 /* xTaskNotifyWait's result: its pdTRUE / pdFALSE, plus TWICE the value it
  * received -- one number, and a value of 0 with success still reads 1. */
-static long notify_wait( uint32_t entry,
+static int64_t notify_wait( uint32_t entry,
                          uint32_t exit,
                          TickType_t ticks )
 {
     uint32_t nv = 0;
     BaseType_t ok = xTaskNotifyWait( entry, exit, &nv, ticks );
 
-    return ( long ) ok + 2 * ( long ) nv;
+    return ( int64_t ) ok + 2 * ( int64_t ) nv;
 }
 
 /* A receive or peek's result: the value, or 0 for "nothing". */
-static long got( BaseType_t ok,
+static int64_t got( BaseType_t ok,
                  const uint32_t * v )
 {
-    return ok ? ( long ) *v : 0;
+    return ok ? ( int64_t ) *v : 0;
 }
 
 static void coro_main( void )
@@ -345,7 +346,7 @@ static void coro_main( void )
             break;
 
         case CALL_NTAKE:
-            coro_result[ s ] = ( long ) ulTaskNotifyTake( c->a, c->ticks );
+            coro_result[ s ] = ( int64_t ) ulTaskNotifyTake( c->a, c->ticks );
             break;
 
         case CALL_NWAIT:
@@ -353,11 +354,11 @@ static void coro_main( void )
             break;
 
         case CALL_GWAIT:
-            coro_result[ s ] = ( long ) xEventGroupWaitBits( group[ c->q ], c->a, c->b & 1, ( c->b >> 1 ) & 1, c->ticks );
+            coro_result[ s ] = ( int64_t ) xEventGroupWaitBits( group[ c->q ], c->a, c->b & 1, ( c->b >> 1 ) & 1, c->ticks );
             break;
 
         case CALL_GSYNC:
-            coro_result[ s ] = ( long ) xEventGroupSync( group[ c->q ], c->value, c->a, c->ticks );
+            coro_result[ s ] = ( int64_t ) xEventGroupSync( group[ c->q ], c->value, c->a, c->ticks );
             break;
 
         case CALL_BSEND:
@@ -387,7 +388,7 @@ static void coro_main( void )
 
 /* Run slot s's coroutine until it completes or blocks again: the call's
  * result, or -2 for "blocked". */
-static long run_coro( int s )
+static int64_t run_coro( int s )
 {
     in_coro = s;
     fake_blocking = 0;
@@ -412,7 +413,7 @@ static void daemon_main( void )
 /* Run the timer daemon until it blocks again: the callbacks and pended
  * functions it ran. It is never preempted -- it has the top priority -- so
  * the only yield that leaves it is the one after it blocks. */
-static long run_daemon( void )
+static int64_t run_daemon( void )
 {
     unsigned long before = daemon_work;
 
@@ -437,10 +438,10 @@ static long run_daemon( void )
         group_pend_out[ g ] = 0;
     }
 
-    return ( long ) ( daemon_work - before );
+    return ( int64_t ) ( daemon_work - before );
 }
 
-static long start_call( int s,
+static int64_t start_call( int s,
                         struct call c )
 {
     if( coro_stack[ s ] == NULL )
@@ -553,7 +554,7 @@ static char state_char( eTaskState s )
 static void line( unsigned step,
                   int core,
                   const char * op,
-                  long r,
+                  int64_t r,
                   unsigned mask )
 {
     for( int c = 0; c < configNUMBER_OF_CORES; c++ )
@@ -565,7 +566,7 @@ static void line( unsigned step,
     }
 
     fake_core = 0;
-    printf( "%u c%d %s | r=%ld y=%u cur=", step, core, op, r, mask );
+    printf( "%u c%d %s | r=%lld y=%u cur=", step, core, op, ( long long ) r, mask );
 
     for( int c = 0; c < configNUMBER_OF_CORES; c++ )
     {
@@ -628,7 +629,7 @@ static void line( unsigned step,
     /* A debugging aid, off unless asked for: KAIROS_API_DEBUG=<step> writes
      * every pending call (task slot, kind, object) to stderr at that step. */
     {
-        static long debug_at = -2;
+        static int64_t debug_at = -2;
 
         if( debug_at == -2 )
         {
@@ -636,7 +637,7 @@ static void line( unsigned step,
             debug_at = e ? strtol( e, NULL, 0 ) : -1;
         }
 
-        if( ( long ) step == debug_at )
+        if( ( int64_t ) step == debug_at )
         {
             for( int i = 0; i < SLOTS; i++ )
             {
@@ -727,7 +728,7 @@ static TickType_t block_ticks( unsigned arg )
 
 /* Make a call from task slot `s` that may block: through a coroutine if it
  * has ticks, directly if not. */
-static long call_from_task( int s,
+static int64_t call_from_task( int s,
                             struct call c )
 {
     if( c.ticks > 0 )
@@ -748,10 +749,10 @@ static long call_from_task( int s,
         case CALL_MTAKE:  return xSemaphoreTake( mutex, 0 );
         case CALL_RTAKE:  return xSemaphoreTakeRecursive( rmutex, 0 );
         case CALL_CTAKE:  return xSemaphoreTake( csem, 0 );
-        case CALL_NTAKE:  return ( long ) ulTaskNotifyTake( c.a, 0 );
+        case CALL_NTAKE:  return ( int64_t ) ulTaskNotifyTake( c.a, 0 );
         case CALL_NWAIT:  return notify_wait( c.a, c.b, 0 );
-        case CALL_GWAIT:  return ( long ) xEventGroupWaitBits( group[ c.q ], c.a, c.b & 1, ( c.b >> 1 ) & 1, 0 );
-        case CALL_GSYNC:  return ( long ) xEventGroupSync( group[ c.q ], c.value, c.a, 0 );
+        case CALL_GWAIT:  return ( int64_t ) xEventGroupWaitBits( group[ c.q ], c.a, c.b & 1, ( c.b >> 1 ) & 1, 0 );
+        case CALL_GSYNC:  return ( int64_t ) xEventGroupSync( group[ c.q ], c.value, c.a, 0 );
         case CALL_BSEND:  return buffer_send( c.q, c.a, c.value, 0 );
         case CALL_BRECV:  return buffer_recv( c.q, c.a, 0 );
         case CALL_TCMD:   return timer_cmd( c.q, c.a, c.value, 0 );
@@ -774,7 +775,7 @@ static void isr_exit( BaseType_t woken )
 }
 
 /* The queue family. Writes the op text; returns the result. */
-static long queue_op( int cur_slot,
+static int64_t queue_op( int cur_slot,
                       unsigned slot,
                       unsigned arg,
                       char * op,
@@ -785,7 +786,7 @@ static long queue_op( int cur_slot,
     uint32_t value = 10 + ( arg >> 16 ) % 90;
     uint32_t v = 0;
     BaseType_t woken = pdFALSE;
-    long r = 0;
+    int64_t r = 0;
 
     if( queue[ q ] == NULL )
     {
@@ -933,7 +934,7 @@ static long queue_op( int cur_slot,
  * counting semaphore. A mutex is given only by its holder: from anyone else
  * the C's disinherit asserts, which is undefined behaviour to ask for. The
  * recursive give from a non-holder is defined (pdFAIL) and is asked for. */
-static long mutex_op( int cur_slot,
+static int64_t mutex_op( int cur_slot,
                       unsigned arg,
                       char * op,
                       size_t n )
@@ -942,7 +943,7 @@ static long mutex_op( int cur_slot,
     TickType_t ticks = block_ticks( arg );
     TaskHandle_t cur = ( cur_slot >= 0 ) ? app[ cur_slot ] : NULL;
     BaseType_t woken = pdFALSE;
-    long r;
+    int64_t r;
 
     if( ( which != 7 ) && ( cur_slot < 0 ) )
     {
@@ -1028,7 +1029,7 @@ static long mutex_op( int cur_slot,
  * is 1). Actions are printed as the C enum's numbers: 0 eNoAction, 1
  * eSetBits, 2 eIncrement, 3 eSetValueWithOverwrite, 4
  * eSetValueWithoutOverwrite. Values stay small so increments stay legible. */
-static long notify_op( int cur_slot,
+static int64_t notify_op( int cur_slot,
                        unsigned slot,
                        unsigned arg,
                        char * op,
@@ -1041,7 +1042,7 @@ static long notify_op( int cur_slot,
     TickType_t ticks = block_ticks( arg );
     BaseType_t woken = pdFALSE;
     uint32_t prev = 0;
-    long r;
+    int64_t r;
 
     if( which <= 4 )
     {
@@ -1072,7 +1073,7 @@ static long notify_op( int cur_slot,
         case 1:
             r = xTaskNotifyAndQuery( t, value, action, &prev );
             snprintf( op, n, "ntfq %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
-            return r + 2 * ( long ) prev;
+            return r + 2 * ( int64_t ) prev;
 
         case 2:
             isr_enter();
@@ -1086,7 +1087,7 @@ static long notify_op( int cur_slot,
             r = xTaskNotifyAndQueryFromISR( t, value, action, &prev, &woken );
             isr_exit( woken );
             snprintf( op, n, "ntfq_isr %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
-            return r + 2 * ( long ) prev;
+            return r + 2 * ( int64_t ) prev;
 
         case 4:
             isr_enter();
@@ -1131,7 +1132,7 @@ static long notify_op( int cur_slot,
                 return 0;
             }
 
-            r = ( long ) ulTaskNotifyValueClear( t, value );
+            r = ( int64_t ) ulTaskNotifyValueClear( t, value );
             snprintf( op, n, "nvalue_clear %u %lu", slot, ( unsigned long ) value );
             return r;
     }
@@ -1141,7 +1142,7 @@ static long notify_op( int cur_slot,
  * daemon (`xTimerPendFunctionCallFromISR`), so they also fail when its
  * one-slot queue is full. Bits stay in the low four; a wait mask is never
  * zero (the C asserts it). */
-static long group_op( int cur_slot,
+static int64_t group_op( int cur_slot,
                       unsigned slot,
                       unsigned arg,
                       char * op,
@@ -1152,7 +1153,7 @@ static long group_op( int cur_slot,
     EventBits_t bits = ( arg >> 12 ) % 16;
     EventBits_t mask = 1 + ( arg >> 16 ) % 15;
     TickType_t ticks = block_ticks( arg );
-    long r;
+    int64_t r;
 
     if( group[ g ] == NULL )
     {
@@ -1178,18 +1179,18 @@ static long group_op( int cur_slot,
 
         case 1:
         case 2:
-            r = ( long ) xEventGroupSetBits( group[ g ], bits );
+            r = ( int64_t ) xEventGroupSetBits( group[ g ], bits );
             snprintf( op, n, "gset %d %lu", g, ( unsigned long ) bits );
             return r;
 
         case 3:
-            r = ( long ) xEventGroupClearBits( group[ g ], bits );
+            r = ( int64_t ) xEventGroupClearBits( group[ g ], bits );
             snprintf( op, n, "gclear %d %lu", g, ( unsigned long ) bits );
             return r;
 
         case 4:
             isr_enter();
-            r = ( long ) xEventGroupGetBitsFromISR( group[ g ] );
+            r = ( int64_t ) xEventGroupGetBitsFromISR( group[ g ] );
             isr_exit( pdFALSE );
             snprintf( op, n, "gget_isr %d", g );
             return r;
@@ -1249,7 +1250,7 @@ static long group_op( int cur_slot,
  * by name, suspend the scheduler around a tick or a give, an empty critical
  * section (on two cores every task-level exit is a yield point), and the
  * tick count both ways. */
-static long sched_op( int cur_slot,
+static int64_t sched_op( int cur_slot,
                       unsigned slot,
                       unsigned arg,
                       char * op,
@@ -1258,7 +1259,7 @@ static long sched_op( int cur_slot,
     unsigned which = ( arg >> 8 ) % 10;
     TaskHandle_t t = app[ slot ];
     BaseType_t woken = pdFALSE;
-    long r = 0;
+    int64_t r = 0;
 
     switch( which )
     {
@@ -1287,7 +1288,7 @@ static long sched_op( int cur_slot,
             BaseType_t ok = xTaskDelayUntil( &prev, inc );
             wake[ cur_slot ] = prev;
             snprintf( op, n, "dlyuntil %lu", ( unsigned long ) inc );
-            return ( long ) ok + 2 * ( long ) prev;
+            return ( int64_t ) ok + 2 * ( int64_t ) prev;
         }
 
         case 2:
@@ -1304,7 +1305,7 @@ static long sched_op( int cur_slot,
         case 3:
         {
             unsigned sub = ( arg >> 12 ) % 3;
-            long a;
+            int64_t a;
 
             vTaskSuspendAll();
 
@@ -1344,19 +1345,19 @@ static long sched_op( int cur_slot,
             return 0;
 
         case 5:
-            r = ( long ) xTaskGetTickCount();
+            r = ( int64_t ) xTaskGetTickCount();
             snprintf( op, n, "tickcount" );
             return r;
 
         case 6:
             isr_enter();
-            r = ( long ) xTaskGetTickCountFromISR();
+            r = ( int64_t ) xTaskGetTickCountFromISR();
             isr_exit( pdFALSE );
             snprintf( op, n, "tickcount_isr" );
             return r;
 
         case 7:
-            r = ( long ) uxQueueSpacesAvailable( sem );
+            r = ( int64_t ) uxQueueSpacesAvailable( sem );
             snprintf( op, n, "semspaces" );
             return r;
 
@@ -1372,7 +1373,7 @@ static long sched_op( int cur_slot,
             {
                 vTaskSuspendAll();
                 vTaskStepTick( 1 );
-                r = 1 + 2 * ( long ) xTaskResumeAll();
+                r = 1 + 2 * ( int64_t ) xTaskResumeAll();
             }
 
             snprintf( op, n, "steptick" );
@@ -1387,14 +1388,14 @@ static long sched_op( int cur_slot,
                 return 0;
             }
 
-            r = ( long ) eTaskGetState( dead );
+            r = ( int64_t ) eTaskGetState( dead );
             snprintf( op, n, "deadstate" );
             return r;
     }
 }
 
 /* The queue-set family. See SET_LEN for what a member may not do. */
-static long set_op( int cur_slot,
+static int64_t set_op( int cur_slot,
                     unsigned slot,
                     unsigned arg,
                     char * op,
@@ -1404,7 +1405,7 @@ static long set_op( int cur_slot,
     unsigned which = ( arg >> 8 ) % 6;
     TickType_t ticks = block_ticks( arg >> 12 );
     BaseType_t woken = pdFALSE;
-    long r;
+    int64_t r;
 
     switch( which )
     {
@@ -1464,7 +1465,7 @@ static long set_op( int cur_slot,
                 return 0;
             }
 
-            r = ( long ) uxQueueSpacesAvailable( queue[ q ] );
+            r = ( int64_t ) uxQueueSpacesAvailable( queue[ q ] );
             snprintf( op, n, "qspaces %d", q );
             return r;
     }
@@ -1489,7 +1490,7 @@ static int timer_has_sender( int t )
  * forgets the handle at once: the daemon frees the timer, so nothing may
  * name it afterwards. Expiry is read only while active -- a timer never
  * started has an item value nothing ever wrote. */
-static long timer_op( int cur_slot,
+static int64_t timer_op( int cur_slot,
                       unsigned slot,
                       unsigned arg,
                       char * op,
@@ -1501,7 +1502,7 @@ static long timer_op( int cur_slot,
     uint32_t value = ( arg >> 12 ) % 10;
     TickType_t ticks = block_ticks( arg >> 20 );
     BaseType_t woken = pdFALSE;
-    long r;
+    int64_t r;
 
     if( ( which == 15 ) || ( which == 16 ) )
     {
@@ -1600,8 +1601,8 @@ static long timer_op( int cur_slot,
             return r;
 
         case 11:
-            r = ( long ) xTimerGetPeriod( tmr[ t ] ) + 100 * ( long ) uxTimerGetReloadMode( tmr[ t ] ) +
-                1000 * ( long ) ( uintptr_t ) pvTimerGetTimerID( tmr[ t ] );
+            r = ( int64_t ) xTimerGetPeriod( tmr[ t ] ) + 100 * ( int64_t ) uxTimerGetReloadMode( tmr[ t ] ) +
+                1000 * ( int64_t ) ( uintptr_t ) pvTimerGetTimerID( tmr[ t ] );
             snprintf( op, n, "tinfo %d", t );
             return r;
 
@@ -1624,7 +1625,7 @@ static long timer_op( int cur_slot,
                 return 0;
             }
 
-            r = ( long ) xTimerGetExpiryTime( tmr[ t ] );
+            r = ( int64_t ) xTimerGetExpiryTime( tmr[ t ] );
             snprintf( op, n, "texpiry %d", t );
             return r;
     }
@@ -1633,7 +1634,7 @@ static long timer_op( int cur_slot,
 /* The buffer family: buffer 0 a stream buffer (12 bytes, trigger level
  * 1..3), buffer 1 a message buffer (20 bytes; each message also costs
  * sizeof( size_t ) of length prefix -- eight here). */
-static long buffer_op( int cur_slot,
+static int64_t buffer_op( int cur_slot,
                        unsigned slot,
                        unsigned arg,
                        char * op,
@@ -1647,7 +1648,7 @@ static long buffer_op( int cur_slot,
     unsigned start = ( arg >> 16 ) & 0xff;
     TickType_t ticks = block_ticks( arg );
     BaseType_t woken = pdFALSE;
-    long r;
+    int64_t r;
 
     if( buffer[ b ] == NULL )
     {
@@ -1730,7 +1731,7 @@ static long buffer_op( int cur_slot,
             }
 
             isr_enter();
-            r = ( long ) xStreamBufferSendFromISR( buffer[ b ], data, len, &woken );
+            r = ( int64_t ) xStreamBufferSendFromISR( buffer[ b ], data, len, &woken );
             isr_exit( woken );
             snprintf( op, n, "bsend_isr %d %u %u", b, len, start );
             return r;
@@ -1756,7 +1757,7 @@ static long buffer_op( int cur_slot,
         }
 
         case 7:
-            r = ( long ) xStreamBufferSpacesAvailable( buffer[ b ] );
+            r = ( int64_t ) xStreamBufferSpacesAvailable( buffer[ b ] );
             snprintf( op, n, "bspace %d", b );
             return r;
 
@@ -1766,7 +1767,7 @@ static long buffer_op( int cur_slot,
             return r;
 
         case 9:
-            r = ( long ) xStreamBufferNextMessageLengthBytes( buffer[ b ] );
+            r = ( int64_t ) xStreamBufferNextMessageLengthBytes( buffer[ b ] );
             snprintf( op, n, "bnext %d", b );
             return r;
 
@@ -1953,11 +1954,15 @@ int main( int argc,
 
     /* The setup above is the same on both sides and is not a step; the
      * header says what it chose, and line 0 where it left the kernel. */
-    printf( "seed=0x%08lx cores=%d steps=%u tick0=0x%08lx init=%lu,%lu,%lu,%lu%s%s\n",
+    /* `width=32` only on a 32-bit build (run.sh's -m32 twin), so every 64-bit
+     * trace and pin keeps its header. The width is observable: a message
+     * buffer's length prefix is a size_t. */
+    printf( "seed=0x%08lx cores=%d steps=%u tick0=0x%08lx init=%lu,%lu,%lu,%lu%s%s%s\n",
             ( unsigned long ) seed, configNUMBER_OF_CORES, steps, ( unsigned long ) configINITIAL_TICK_COUNT,
             ( unsigned long ) init[ 0 ], ( unsigned long ) init[ 1 ],
             ( unsigned long ) init[ 2 ], ( unsigned long ) init[ 3 ],
-            sweep ? " sweep=" : "", sweep ? argv[ 3 ] : "" );
+            sweep ? " sweep=" : "", sweep ? argv[ 3 ] : "",
+            ( sizeof( void * ) == 4 ) ? " width=32" : "" );
     line( 0, 0, "start", 0, 0 );
 
     for( unsigned step = 1; sweep ? 1 : ( step <= steps ); step++ )
@@ -1988,7 +1993,7 @@ int main( int argc,
             arg = next();
         }
 
-        long r = 0;
+        int64_t r = 0;
         TaskHandle_t t = app[ slot ];
 
         fake_core = core;

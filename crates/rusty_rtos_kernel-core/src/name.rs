@@ -316,4 +316,22 @@ mod tests {
         let n = Name::new(&long, usize::MAX);
         assert_eq!(n.len(), NAME_CAPACITY);
     }
+
+    /// `is_empty` is `len == 0` both ways round -- a name with characters is
+    /// not empty (plan P5: `is_empty -> true` survived every oracle, because
+    /// nothing asked a non-empty name).
+    #[test]
+    fn a_name_with_characters_is_not_empty() {
+        assert!(!Name::new("IDLE", 12).is_empty());
+        assert!(Name::new("", 12).is_empty());
+    }
+
+    /// Both formatters print the name -- `Display` bare, `Debug` quoted, as
+    /// a `str` would (plan P5: both survived replaced by `Ok(())`).
+    #[test]
+    fn display_and_debug_print_the_name() {
+        let n = Name::new("Tmr Svc", 12);
+        assert_eq!(std::format!("{n}"), "Tmr Svc");
+        assert_eq!(std::format!("{n:?}"), "\"Tmr Svc\"");
+    }
 }
