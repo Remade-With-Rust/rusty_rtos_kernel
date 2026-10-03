@@ -1054,19 +1054,23 @@ where
                 return Ok(Ready(()));
             }
             let receivers = Self::queue_receive_list(queue);
-            let woke_higher = if !self.lists.is_empty_of(receivers) {
+            // The C's `if( waiters ) { ... } else if( xYieldRequired )`: the
+            // emptiness is answered ONCE, BEFORE a waiter is removed. With
+            // waiters, only "the woken task outranks me" yields; the
+            // disinherit's yield request is consulted only when there were
+            // none. This used to re-read the list AFTER the removal, so
+            // removing the only waiter made the list empty and a give that
+            // disinherited AND woke a lower-priority task yielded where the
+            // C does not (one core; on two the disinherit yields the core
+            // itself). Found by the API differential, P1.3, step 4105.
+            let had_receivers = !self.lists.is_empty_of(receivers);
+            let woke_higher = if had_receivers {
                 self.remove_from_event_list(receivers)?
             } else {
                 false
             };
             // queueYIELD_IF_USING_PREEMPTION(), inside the section.
-            // `yield_required` first: it is false on every send that is
-            // not a mutex give, and it is a local, so on the common path
-            // the list is not read a second time at all. Both operands are
-            // pure, so the order is free to choose. (The read cannot be
-            // hoisted above the removal above it -- removing the last
-            // waiter is exactly what changes the answer.)
-            if woke_higher || (yield_required && self.lists.is_empty_of(receivers)) {
+            if woke_higher || (yield_required && !had_receivers) {
                 self.port_yield();
             }
             self.exit_critical();

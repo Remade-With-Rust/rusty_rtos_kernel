@@ -115,8 +115,9 @@ impl Port for DiffPort {
 }
 
 const TASKS: usize = 20;
-/// The semaphore, three app queues and the timer's command queue, with room.
-const QUEUES: usize = 8;
+/// The semaphore, three app queues, the mutex, the recursive mutex, the
+/// counting semaphore and the timer's command queue, with room.
+const QUEUES: usize = 12;
 /// Queue item storage: three queues of up to three, and the timer's.
 const ITEMS: usize = 16;
 const SLOTS: usize = 10;
@@ -131,6 +132,9 @@ enum Call {
     QSendFront { q: usize, value: u64, ticks: u64 },
     QRecv { q: usize, ticks: u64 },
     QPeek { q: usize, ticks: u64 },
+    MTake(u64),
+    RTake(u64),
+    CTake(u64),
 }
 
 /// A wait's result as the C driver prints it: `ok` for a call that passed,
@@ -182,6 +186,9 @@ macro_rules! replay {
                 pending: [Option<Call>; SLOTS],
                 sem: QueueHandle,
                 queues: [Option<QueueHandle>; QSLOTS],
+                mutex: QueueHandle,
+                rmutex: QueueHandle,
+                csem: QueueHandle,
             }
 
             impl D {
@@ -229,6 +236,11 @@ macro_rules! replay {
                         Call::QPeek { q: i, ticks } => {
                             waited(self.k.queue_peek(q(i), ticks), |v| v as i64)
                         }
+                        Call::MTake(ticks) => waited(self.k.semaphore_take(self.mutex, ticks), |()| 1),
+                        Call::RTake(ticks) => {
+                            waited(self.k.mutex_take_recursive(self.rmutex, ticks), |()| 1)
+                        }
+                        Call::CTake(ticks) => waited(self.k.semaphore_take(self.csem, ticks), |()| 1),
                     };
                     self.pending[slot] = (r == 2).then_some(call);
                     r
@@ -275,6 +287,10 @@ macro_rules! replay {
                             s.push('.');
                         }
                     }
+                    let m = self.k.mutex_holder(self.mutex).unwrap_or(TaskHandle::NULL);
+                    let rm = self.k.mutex_holder(self.rmutex).unwrap_or(TaskHandle::NULL);
+                    let c = self.k.semaphore_count(self.csem).unwrap_or(99);
+                    let _ = write!(s, " M={} R={} C={c}", self.name(m), self.name(rm));
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -299,13 +315,20 @@ macro_rules! replay {
             );
 
             let mut k = K::new(DiffPort::default(), NoTrace).expect("geometry");
+            // In the C's order: semaphore, mutex, recursive mutex, counting.
             let sem = k.semaphore_create_binary().expect("semaphore");
+            let mutex = k.mutex_create().expect("mutex");
+            let rmutex = k.mutex_create_recursive().expect("recursive mutex");
+            let csem = k.semaphore_create_counting(3, 1).expect("counting semaphore");
             let mut d = D {
                 k,
                 app: [None; SLOTS],
                 pending: [None; SLOTS],
                 sem,
                 queues: [None; QSLOTS],
+                mutex,
+                rmutex,
+                csem,
             };
             for (i, p) in init.iter().enumerate() {
                 d.app[i] = Some(d.k.create_task(&format!("t{i}"), *p).expect("initial task"));
@@ -448,6 +471,25 @@ macro_rules! replay {
                         let h = d.queues[num(0) as usize].unwrap();
                         r = i64::from(d.k.queue_is_full_from_isr(h).unwrap_or(false));
                     }
+                    "mtake" | "rtake" | "ctake" => {
+                        let s = cur_slot.expect("a take from an app task");
+                        let call = match op {
+                            "mtake" => Call::MTake(num(0)),
+                            "rtake" => Call::RTake(num(0)),
+                            _ => Call::CTake(num(0)),
+                        };
+                        r = d.call(s, call);
+                    }
+                    "mgive" => r = waited(d.k.semaphore_give(d.mutex), |()| 1),
+                    "rgive" => r = i64::from(d.k.mutex_give_recursive(d.rmutex).is_ok()),
+                    "cgive" => r = waited(d.k.semaphore_give(d.csem), |()| 1),
+                    "cgive_isr" => match d.k.semaphore_give_from_isr(d.csem) {
+                        Ok(woken) => {
+                            r = 1;
+                            d.k.port().yield_from_isr(woken);
+                        }
+                        Err(_) => r = 0,
+                    },
                     "tick" => {
                         r = i64::from(d.k.increment_tick());
                         if r != 0 {
@@ -512,6 +554,13 @@ fn exercised(trace: &str) {
         ("qrecv_isr", 100),
         ("qpeek_isr", 50),
         ("qfull_isr", 50),
+        ("mtake", 150),
+        ("mgive", 40),
+        ("rtake", 100),
+        ("rgive", 100),
+        ("ctake", 100),
+        ("cgive", 100),
+        ("cgive_isr", 100),
         ("tick", 500),
         ("cont", 200),
     ] {

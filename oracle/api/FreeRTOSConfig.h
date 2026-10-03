@@ -49,6 +49,7 @@
 #define INCLUDE_vTaskDelay                      1
 #define INCLUDE_eTaskGetState                   1
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
+#define INCLUDE_xQueueGetMutexHolder            1
 #define INCLUDE_xTimerGetTimerDaemonTaskHandle  1
 
 void vAssertCalled( const char * file, int line );

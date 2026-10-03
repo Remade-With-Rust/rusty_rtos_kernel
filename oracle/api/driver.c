@@ -62,6 +62,9 @@ static TaskHandle_t app[ SLOTS ];
 static unsigned created;
 static SemaphoreHandle_t sem;
 static QueueHandle_t queue[ QSLOTS ];
+static SemaphoreHandle_t mutex;  /* a mutex: priority inheritance */
+static SemaphoreHandle_t rmutex; /* a recursive mutex */
+static SemaphoreHandle_t csem;   /* a counting semaphore, max 3, from 1 */
 static unsigned queue_len[ QSLOTS ];
 
 static void body( void * p )
@@ -78,7 +81,12 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE };
+
+static int is_queue_call( enum call_kind k )
+{
+    return ( k == CALL_QSEND ) || ( k == CALL_QSENDF ) || ( k == CALL_QRECV ) || ( k == CALL_QPEEK );
+}
 
 struct call
 {
@@ -144,6 +152,18 @@ static void coro_main( void )
         case CALL_QPEEK:
             coro_result[ s ] = got( xQueuePeek( queue[ c->q ], &v, c->ticks ), &v );
             break;
+
+        case CALL_MTAKE:
+            coro_result[ s ] = xSemaphoreTake( mutex, c->ticks );
+            break;
+
+        case CALL_RTAKE:
+            coro_result[ s ] = xSemaphoreTakeRecursive( rmutex, c->ticks );
+            break;
+
+        case CALL_CTAKE:
+            coro_result[ s ] = xSemaphoreTake( csem, c->ticks );
+            break;
     }
 
     coro_done[ s ] = 1;
@@ -194,7 +214,7 @@ static int queue_has_waiter( int q )
 {
     for( int i = 0; i < SLOTS; i++ )
     {
-        if( pending[ i ] && ( coro_call[ i ].kind != CALL_TAKE ) && ( coro_call[ i ].q == q ) )
+        if( pending[ i ] && is_queue_call( coro_call[ i ].kind ) && ( coro_call[ i ].q == q ) )
         {
             return 1;
         }
@@ -303,7 +323,16 @@ static void line( unsigned step,
         printf( q + 1 < QSLOTS ? "." : "" );
     }
 
-    printf( "\n" );
+    printf( " M=%s R=%s C=%lu\n", name_of( xSemaphoreGetMutexHolder( mutex ) ),
+            name_of( xSemaphoreGetMutexHolder( rmutex ) ),
+            ( unsigned long ) uxSemaphoreGetCount( csem ) );
+}
+
+/* Whether task t holds either mutex: such a task is not deleted (the C would
+ * leave the mutex naming a freed TCB). */
+static int holds_a_mutex( TaskHandle_t t )
+{
+    return ( xSemaphoreGetMutexHolder( mutex ) == t ) || ( xSemaphoreGetMutexHolder( rmutex ) == t );
 }
 
 /* -------------------------------------------------------- the families -- */
@@ -335,6 +364,9 @@ static long call_from_task( int s,
         case CALL_QSENDF: return xQueueSendToFront( queue[ c.q ], &c.value, 0 );
         case CALL_QRECV:  return got( xQueueReceive( queue[ c.q ], &v, 0 ), &v );
         case CALL_QPEEK:  return got( xQueuePeek( queue[ c.q ], &v, 0 ), &v );
+        case CALL_MTAKE:  return xSemaphoreTake( mutex, 0 );
+        case CALL_RTAKE:  return xSemaphoreTakeRecursive( rmutex, 0 );
+        case CALL_CTAKE:  return xSemaphoreTake( csem, 0 );
     }
 
     return 0;
@@ -492,6 +524,101 @@ static long queue_op( int cur_slot,
     }
 }
 
+/* The mutex family: a mutex (priority inheritance), a recursive mutex and a
+ * counting semaphore. A mutex is given only by its holder: from anyone else
+ * the C's disinherit asserts, which is undefined behaviour to ask for. The
+ * recursive give from a non-holder is defined (pdFAIL) and is asked for. */
+static long mutex_op( int cur_slot,
+                      unsigned arg,
+                      char * op,
+                      size_t n )
+{
+    unsigned which = ( arg >> 8 ) % 8;
+    TickType_t ticks = block_ticks( arg );
+    TaskHandle_t cur = ( cur_slot >= 0 ) ? app[ cur_slot ] : NULL;
+    BaseType_t woken = pdFALSE;
+    long r;
+
+    if( ( which != 7 ) && ( cur_slot < 0 ) )
+    {
+        /* Every arm but the ISR's is made by a task. */
+        snprintf( op, n, "noop" );
+        return 0;
+    }
+
+    switch( which )
+    {
+        case 0:
+        case 1:
+        {
+            /* Never from the holder: a task that takes a (non-recursive)
+             * mutex it already holds, and times out, trips
+             * vTaskPriorityDisinheritAfterTimeout's
+             * `configASSERT( pxTCB != pxCurrentTCB )` -- the C calls it a
+             * usage error. Found by this script's first run (step 6406).
+             * The holder GIVES instead, which is also what keeps the mutex
+             * changing hands: given only when its holder happened to be the
+             * caller, it sat held for 19,208 of 20,000 steps. */
+            if( xSemaphoreGetMutexHolder( mutex ) == cur )
+            {
+                r = xSemaphoreGive( mutex );
+                snprintf( op, n, "mgive" );
+                return r;
+            }
+
+            struct call c = { CALL_MTAKE, ticks, 0, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "mtake %lu", ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 2:
+
+            if( xSemaphoreGetMutexHolder( mutex ) != cur )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xSemaphoreGive( mutex );
+            snprintf( op, n, "mgive" );
+            return r;
+
+        case 3:
+        {
+            struct call c = { CALL_RTAKE, ticks, 0, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "rtake %lu", ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 4:
+            r = xSemaphoreGiveRecursive( rmutex );
+            snprintf( op, n, "rgive" );
+            return r;
+
+        case 5:
+        {
+            struct call c = { CALL_CTAKE, ticks, 0, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "ctake %lu", ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 6:
+            r = xSemaphoreGive( csem );
+            snprintf( op, n, "cgive" );
+            return r;
+
+        default:
+            isr_enter();
+            r = xSemaphoreGiveFromISR( csem, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "cgive_isr" );
+            return r;
+    }
+}
+
 /* ------------------------------------------------------- the script -- */
 
 int main( int argc,
@@ -505,6 +632,9 @@ int main( int argc,
     fake_yield_hook = on_yield;
 
     sem = xSemaphoreCreateBinary();
+    mutex = xSemaphoreCreateMutex();
+    rmutex = xSemaphoreCreateRecursiveMutex();
+    csem = xSemaphoreCreateCounting( 3, 1 );
     UBaseType_t init[ 4 ];
 
     for( int i = 0; i < 4; i++ )
@@ -574,7 +704,7 @@ int main( int argc,
         }
         else if( kind < 11 )
         {
-            if( t != NULL )
+            if( ( t != NULL ) && !holds_a_mutex( t ) )
             {
                 snprintf( op, sizeof op, "delete %u", slot );
                 app[ slot ] = NULL;
@@ -662,11 +792,15 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 85 )
+        else if( kind < 75 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 96 )
+        else if( kind < 87 )
+        {
+            r = mutex_op( cur_slot, arg, op, sizeof op );
+        }
+        else if( kind < 97 )
         {
             /* As every SMP port's tick handler does (RP2040's included):
              * xTaskIncrementTick inside the ISR critical section, on core 0. */
