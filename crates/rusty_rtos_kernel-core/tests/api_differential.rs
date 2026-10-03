@@ -43,7 +43,7 @@ use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::NoTrace;
-use rusty_rtos_kernel_core::kernel::TaskState;
+use rusty_rtos_kernel_core::kernel::{NotifyAction, TaskState};
 use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_kernel_core::{Kernel, list_slots_for, lists_for};
 
@@ -135,14 +135,27 @@ enum Call {
     MTake(u64),
     RTake(u64),
     CTake(u64),
+    NTake { clear: bool, ticks: u64 },
+    NWait { entry: u32, exit: u32, ticks: u64 },
+}
+
+/// The C's `eNotifyAction`, by number, as the driver prints it.
+fn action(n: u64) -> NotifyAction {
+    match n {
+        0 => NotifyAction::None,
+        1 => NotifyAction::SetBits,
+        2 => NotifyAction::Increment,
+        3 => NotifyAction::Overwrite,
+        _ => NotifyAction::NoOverwrite,
+    }
 }
 
 /// A wait's result as the C driver prints it: `ok` for a call that passed,
-/// 2 for blocked, 0 for full / empty / timed out.
+/// -2 for blocked, 0 for full / empty / timed out.
 fn waited<T>(r: Result<Wait<T>, rusty_rtos_core::error::Error>, ok: impl Fn(T) -> i64) -> i64 {
     match r {
         Ok(Wait::Ready(v)) => ok(v),
-        Ok(Wait::Blocked) => 2,
+        Ok(Wait::Blocked) => -2,
         Err(_) => 0,
     }
 }
@@ -219,7 +232,7 @@ macro_rules! replay {
                     self.k.switch_context();
                 }
                 /// Make (or make again) a parked call: 1 / 0 as the C's call
-                /// returns, 2 for "blocked, now pending".
+                /// returns, -2 for "blocked, now pending".
                 fn call(&mut self, slot: usize, call: Call) -> i64 {
                     let q = |i: usize| self.queues[i].expect("a live queue");
                     let r = match call {
@@ -241,8 +254,17 @@ macro_rules! replay {
                             waited(self.k.mutex_take_recursive(self.rmutex, ticks), |()| 1)
                         }
                         Call::CTake(ticks) => waited(self.k.semaphore_take(self.csem, ticks), |()| 1),
+                        Call::NTake { clear, ticks } => {
+                            waited(self.k.notify_take(0, clear, ticks), i64::from)
+                        }
+                        // pdTRUE / pdFALSE plus twice the value, as the C
+                        // driver folds them into one number.
+                        Call::NWait { entry, exit, ticks } => waited(
+                            self.k.notify_wait(0, entry, exit, ticks),
+                            |(ok, v)| i64::from(ok) + 2 * i64::from(v),
+                        ),
                     };
-                    self.pending[slot] = (r == 2).then_some(call);
+                    self.pending[slot] = (r == -2).then_some(call);
                     r
                 }
                 /// Take the step's yields, lowest core first, then observe
@@ -290,7 +312,19 @@ macro_rules! replay {
                     let m = self.k.mutex_holder(self.mutex).unwrap_or(TaskHandle::NULL);
                     let rm = self.k.mutex_holder(self.rmutex).unwrap_or(TaskHandle::NULL);
                     let c = self.k.semaphore_count(self.csem).unwrap_or(99);
-                    let _ = write!(s, " M={} R={} C={c}", self.name(m), self.name(rm));
+                    let _ = write!(s, " M={} R={} C={c} N=", self.name(m), self.name(rm));
+                    for i in 0..SLOTS {
+                        match self.app[i] {
+                            None => s.push('-'),
+                            Some(h) => {
+                                let v = self.k.notify_value(Some(h), 0).map_or(-1, i64::from);
+                                let _ = write!(s, "{v}");
+                            }
+                        }
+                        if i + 1 < SLOTS {
+                            s.push('.');
+                        }
+                    }
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -471,6 +505,51 @@ macro_rules! replay {
                         let h = d.queues[num(0) as usize].unwrap();
                         r = i64::from(d.k.queue_is_full_from_isr(h).unwrap_or(false));
                     }
+                    "ntf" | "ntfq" | "ntf_isr" | "ntfq_isr" => {
+                        let t = d.app[num(0) as usize].unwrap();
+                        let (a, v) = (action(num(1)), num(2) as u32);
+                        r = match op {
+                            "ntf" => i64::from(d.k.notify(t, 0, v, a).unwrap()),
+                            "ntfq" => {
+                                let (ok, prev) = d.k.notify_and_query(t, 0, v, a).unwrap();
+                                i64::from(ok) + 2 * i64::from(prev)
+                            }
+                            "ntf_isr" => {
+                                let (ok, woken) = d.k.notify_from_isr(t, 0, v, a).unwrap();
+                                d.k.port().yield_from_isr(woken);
+                                i64::from(ok)
+                            }
+                            _ => {
+                                let (ok, prev, woken) =
+                                    d.k.notify_and_query_from_isr(t, 0, v, a).unwrap();
+                                d.k.port().yield_from_isr(woken);
+                                i64::from(ok) + 2 * i64::from(prev)
+                            }
+                        };
+                    }
+                    "ngive_isr" => {
+                        // vTaskNotifyGiveFromISR: an increment, from an ISR.
+                        let t = d.app[num(0) as usize].unwrap();
+                        let (_, woken) = d.k.notify_from_isr(t, 0, 0, NotifyAction::Increment).unwrap();
+                        d.k.port().yield_from_isr(woken);
+                    }
+                    "ntake" | "nwait" => {
+                        let s = cur_slot.expect("a notification wait from an app task");
+                        let call = if op == "ntake" {
+                            Call::NTake { clear: num(0) != 0, ticks: num(1) }
+                        } else {
+                            Call::NWait { entry: num(0) as u32, exit: num(1) as u32, ticks: num(2) }
+                        };
+                        r = d.call(s, call);
+                    }
+                    "nstate_clear" => {
+                        let t = d.app[num(0) as usize];
+                        r = i64::from(d.k.notify_state_clear(t, 0).unwrap());
+                    }
+                    "nvalue_clear" => {
+                        let t = d.app[num(0) as usize];
+                        r = i64::from(d.k.notify_value_clear(t, 0, num(1) as u32).unwrap());
+                    }
                     "mtake" | "rtake" | "ctake" => {
                         let s = cur_slot.expect("a take from an app task");
                         let call = match op {
@@ -561,13 +640,22 @@ fn exercised(trace: &str) {
         ("ctake", 100),
         ("cgive", 100),
         ("cgive_isr", 100),
+        ("ntf", 60),
+        ("ntfq", 60),
+        ("ntf_isr", 60),
+        ("ntfq_isr", 60),
+        ("ngive_isr", 60),
+        ("ntake", 60),
+        ("nwait", 60),
+        ("nstate_clear", 60),
+        ("nvalue_clear", 60),
         ("tick", 500),
         ("cont", 200),
     ] {
         let n = count(&|l| op(l) == name);
         assert!(n >= floor, "only {n} `{name}` steps (floor {floor})");
     }
-    let blocked = count(&|l| l.contains(" r=2 ") && op(l) != "cont");
+    let blocked = count(&|l| l.contains(" r=-2 ") && op(l) != "cont");
     let timeouts = count(&|l| op(l) == "cont" && l.contains(" r=0 "));
     let values = count(&|l| {
         let v: i64 = l

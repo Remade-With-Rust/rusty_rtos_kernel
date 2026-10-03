@@ -1558,9 +1558,12 @@ where
                 let holder = self.queues.resolve(queue).map(|q| q.holder)?;
                 let inherited = self.priority_inherit(holder)?;
                 self.exit_critical();
-                if inherited {
-                    self.set_wait_inherited(caller);
-                }
+                // Assigned, not latched: the C's `xInheritanceOccurred` is
+                // whatever the LATEST block's inherit answered. Latching it
+                // made a timeout disinherit after a re-block that inherited
+                // nothing (API differential P1.4, two cores, step 2390: a
+                // waiter lowered to priority 0 while it waited).
+                self.set_wait_inherited(caller, inherited);
             }
             self.place_on_event_list(Self::queue_receive_list(queue), ticks_left)?;
         }

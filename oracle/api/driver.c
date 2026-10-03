@@ -18,7 +18,7 @@
  * decision shows on the step that makes it.
  *
  * Results: 1 / 0 for pass / fail (pdPASS, errQUEUE_FULL, pdFALSE), -1 for a
- * create that failed, 2 for "blocked, now pending", and a RECEIVED VALUE
+ * create that failed, -2 for "blocked, now pending" (a notification count can be 2), and a RECEIVED VALUE
  * itself for a receive or peek that got one -- values are 10..99, so they
  * never collide with the codes, and an ordering bug shows on the receive.
  *
@@ -81,7 +81,7 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT };
 
 static int is_queue_call( enum call_kind k )
 {
@@ -94,6 +94,8 @@ struct call
     TickType_t ticks;
     int q;          /* queue slot, for the queue calls */
     uint32_t value; /* what a send sends */
+    uint32_t a;     /* a notify take's clear flag, or a wait's entry mask */
+    uint32_t b;     /* a notify wait's exit mask */
 };
 
 #define CORO_STACK    ( 256 * 1024 )
@@ -116,6 +118,18 @@ static void on_yield( void )
         fake_blocking = 0;
         swapcontext( &coro[ in_coro ], &driver_ctx );
     }
+}
+
+/* xTaskNotifyWait's result: its pdTRUE / pdFALSE, plus TWICE the value it
+ * received -- one number, and a value of 0 with success still reads 1. */
+static long notify_wait( uint32_t entry,
+                         uint32_t exit,
+                         TickType_t ticks )
+{
+    uint32_t nv = 0;
+    BaseType_t ok = xTaskNotifyWait( entry, exit, &nv, ticks );
+
+    return ( long ) ok + 2 * ( long ) nv;
 }
 
 /* A receive or peek's result: the value, or 0 for "nothing". */
@@ -164,6 +178,14 @@ static void coro_main( void )
         case CALL_CTAKE:
             coro_result[ s ] = xSemaphoreTake( csem, c->ticks );
             break;
+
+        case CALL_NTAKE:
+            coro_result[ s ] = ( long ) ulTaskNotifyTake( c->a, c->ticks );
+            break;
+
+        case CALL_NWAIT:
+            coro_result[ s ] = notify_wait( c->a, c->b, c->ticks );
+            break;
     }
 
     coro_done[ s ] = 1;
@@ -171,7 +193,7 @@ static void coro_main( void )
 }
 
 /* Run slot s's coroutine until it completes or blocks again: the call's
- * result, or 2 for "blocked". */
+ * result, or -2 for "blocked". */
 static long run_coro( int s )
 {
     in_coro = s;
@@ -186,7 +208,7 @@ static long run_coro( int s )
     }
 
     pending[ s ] = 1;
-    return 2;
+    return -2;
 }
 
 static long start_call( int s,
@@ -323,9 +345,27 @@ static void line( unsigned step,
         printf( q + 1 < QSLOTS ? "." : "" );
     }
 
-    printf( " M=%s R=%s C=%lu\n", name_of( xSemaphoreGetMutexHolder( mutex ) ),
+    printf( " M=%s R=%s C=%lu N=", name_of( xSemaphoreGetMutexHolder( mutex ) ),
             name_of( xSemaphoreGetMutexHolder( rmutex ) ),
             ( unsigned long ) uxSemaphoreGetCount( csem ) );
+
+    /* Every app task's notification value: `ulTaskNotifyValueClear` with no
+     * bits to clear is the C's only read of it that changes nothing. */
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( app[ i ] == NULL )
+        {
+            printf( "-" );
+        }
+        else
+        {
+            printf( "%lu", ( unsigned long ) ulTaskNotifyValueClear( app[ i ], 0 ) );
+        }
+
+        printf( i + 1 < SLOTS ? "." : "" );
+    }
+
+    printf( "\n" );
 }
 
 /* Whether task t holds either mutex: such a task is not deleted (the C would
@@ -367,6 +407,8 @@ static long call_from_task( int s,
         case CALL_MTAKE:  return xSemaphoreTake( mutex, 0 );
         case CALL_RTAKE:  return xSemaphoreTakeRecursive( rmutex, 0 );
         case CALL_CTAKE:  return xSemaphoreTake( csem, 0 );
+        case CALL_NTAKE:  return ( long ) ulTaskNotifyTake( c.a, 0 );
+        case CALL_NWAIT:  return notify_wait( c.a, c.b, 0 );
     }
 
     return 0;
@@ -619,6 +661,119 @@ static long mutex_op( int cur_slot,
     }
 }
 
+/* The notification family, index 0 (configTASK_NOTIFICATION_ARRAY_ENTRIES
+ * is 1). Actions are printed as the C enum's numbers: 0 eNoAction, 1
+ * eSetBits, 2 eIncrement, 3 eSetValueWithOverwrite, 4
+ * eSetValueWithoutOverwrite. Values stay small so increments stay legible. */
+static long notify_op( int cur_slot,
+                       unsigned slot,
+                       unsigned arg,
+                       char * op,
+                       size_t n )
+{
+    unsigned which = ( arg >> 8 ) % 9;
+    TaskHandle_t t = app[ slot ];
+    eNotifyAction action = ( eNotifyAction ) ( ( arg >> 4 ) % 5 );
+    uint32_t value = ( arg >> 12 ) % 16;
+    TickType_t ticks = block_ticks( arg );
+    BaseType_t woken = pdFALSE;
+    uint32_t prev = 0;
+    long r;
+
+    if( which <= 4 )
+    {
+        /* Aimed at a task: there has to be one. */
+        if( t == NULL )
+        {
+            snprintf( op, n, "noop" );
+            return 0;
+        }
+    }
+    else if( which <= 6 )
+    {
+        /* Made BY a task. */
+        if( cur_slot < 0 )
+        {
+            snprintf( op, n, "noop" );
+            return 0;
+        }
+    }
+
+    switch( which )
+    {
+        case 0:
+            r = xTaskNotify( t, value, action );
+            snprintf( op, n, "ntf %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
+            return r;
+
+        case 1:
+            r = xTaskNotifyAndQuery( t, value, action, &prev );
+            snprintf( op, n, "ntfq %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
+            return r + 2 * ( long ) prev;
+
+        case 2:
+            isr_enter();
+            r = xTaskNotifyFromISR( t, value, action, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "ntf_isr %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
+            return r;
+
+        case 3:
+            isr_enter();
+            r = xTaskNotifyAndQueryFromISR( t, value, action, &prev, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "ntfq_isr %u %d %lu", slot, ( int ) action, ( unsigned long ) value );
+            return r + 2 * ( long ) prev;
+
+        case 4:
+            isr_enter();
+            vTaskNotifyGiveFromISR( t, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "ngive_isr %u", slot );
+            return 0;
+
+        case 5:
+        {
+            struct call c = { CALL_NTAKE, ticks, 0, 0, arg & 1, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "ntake %lu %lu", ( unsigned long ) c.a, ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 6:
+        {
+            struct call c = { CALL_NWAIT, ticks, 0, 0, ( arg >> 1 ) % 4, ( arg >> 3 ) % 4 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "nwait %lu %lu %lu", ( unsigned long ) c.a, ( unsigned long ) c.b, ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 7:
+
+            if( t == NULL )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xTaskNotifyStateClear( t );
+            snprintf( op, n, "nstate_clear %u", slot );
+            return r;
+
+        default:
+
+            if( t == NULL )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = ( long ) ulTaskNotifyValueClear( t, value );
+            snprintf( op, n, "nvalue_clear %u %lu", slot, ( unsigned long ) value );
+            return r;
+    }
+}
+
 /* ------------------------------------------------------- the script -- */
 
 int main( int argc,
@@ -792,15 +947,19 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 75 )
+        else if( kind < 72 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 87 )
+        else if( kind < 82 )
         {
             r = mutex_op( cur_slot, arg, op, sizeof op );
         }
-        else if( kind < 97 )
+        else if( kind < 91 )
+        {
+            r = notify_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 98 )
         {
             /* As every SMP port's tick handler does (RP2040's included):
              * xTaskIncrementTick inside the ISR critical section, on core 0. */

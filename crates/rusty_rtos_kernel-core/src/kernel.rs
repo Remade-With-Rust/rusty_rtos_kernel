@@ -4557,9 +4557,13 @@ where
             .unwrap_or(false)
     }
 
-    pub(crate) fn set_wait_inherited(&mut self, task: TaskHandle) {
+    /// `xInheritanceOccurred = xTaskPriorityInherit( ... )`: an ASSIGNMENT,
+    /// made every time the take blocks. A waiter that inherited on its first
+    /// block and not on a later one (its own priority lowered meanwhile) ends
+    /// with `false`, and its timeout then disinherits nothing.
+    pub(crate) fn set_wait_inherited(&mut self, task: TaskHandle, inherited: bool) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
-            tcb.wait.inherited = true;
+            tcb.wait.inherited = inherited;
         }
     }
 
