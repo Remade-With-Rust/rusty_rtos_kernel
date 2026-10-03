@@ -5932,6 +5932,42 @@ mod tests {
         assert_eq!(K::cores(), 1);
     }
 
+    /// More cores than this kernel holds are clamped to `MAX_CORES`, not
+    /// taken at their word: every per-core array is `MAX_CORES` long.
+    #[test]
+    fn a_configuration_past_the_kernel_s_cores_is_clamped() {
+        struct ThreeCores;
+        impl Config for ThreeCores {
+            type Tick = rusty_rtos_core::tick::Bits32;
+            const TICK_RATE_HZ: u32 = 100;
+            const MAX_PRIORITIES: u8 = 4;
+            const MINIMAL_STACK_SIZE: usize = 1;
+            const MAX_TASK_NAME_LEN: usize = 8;
+            const TIMER_TASK_PRIORITY: u8 = 3;
+            const TIMER_TASK_STACK_DEPTH: usize = 1;
+            const TIMER_QUEUE_LENGTH: usize = 1;
+            const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+            const NUMBER_OF_CORES: u8 = 3;
+        }
+        type K3 = crate::Kernel<
+            ThreeCores,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(4, 1, 0)) },
+            { crate::lists_for(4, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+        >;
+        assert_eq!(K3::cores(), super::MAX_CORES);
+    }
+
     /// `state_of` answers Running for the running task on one core, called
     /// directly -- `task_state_get` answers it first, so no oracle reached
     /// this spelling's own shortcut.
