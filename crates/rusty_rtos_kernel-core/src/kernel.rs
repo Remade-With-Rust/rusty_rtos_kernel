@@ -6053,7 +6053,7 @@ mod tests {
     #[derive(Default)]
     struct ExitsPort {
         nesting: core::cell::Cell<u32>,
-        exits: core::cell::Cell<u64>,
+        exits: std::rc::Rc<core::cell::Cell<u64>>,
     }
     impl rusty_rtos_core::port::Port for ExitsPort {
         fn yield_now(&self) {}
@@ -6082,14 +6082,16 @@ mod tests {
     #[derive(Default)]
     struct ExitsTrace {
         noted: u64,
-        seen: std::vec::Vec<u64>,
+        /// The port's own counter, read live at each event.
+        live: std::rc::Rc<core::cell::Cell<u64>>,
+        seen: std::vec::Vec<(u64, u64)>,
     }
     impl rusty_rtos_core::trace::Trace for ExitsTrace {
         fn note_exits(&mut self, exits: u64) {
             self.noted = exits;
         }
         fn event(&mut self, _tick: u64, _event: rusty_rtos_core::trace::Event<'_>) {
-            self.seen.push(self.noted);
+            self.seen.push((self.noted, self.live.get()));
         }
     }
 
@@ -6113,19 +6115,27 @@ mod tests {
             0,
             { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
         >;
-        let mut k = KE::new(ExitsPort::default(), ExitsTrace::default()).expect("geometry");
+        let port = ExitsPort::default();
+        let trace = ExitsTrace {
+            live: std::rc::Rc::clone(&port.exits),
+            ..ExitsTrace::default()
+        };
+        let mut k = KE::new(port, trace).expect("geometry");
         k.create_task("a", 1).expect("a");
         let h = k.start_scheduler().expect("start");
         k.suspend(Some(h.timer)).expect("park");
         k.delay(3).expect("delay");
+        for _ in 0..4_u32 {
+            k.tick_from_isr();
+        }
         let seen = &k.trace().seen;
         assert!(
-            seen.iter().any(|&e| e > 0),
+            seen.iter().any(|&(noted, _)| noted > 0),
             "no event carried an exit count: {seen:?}"
         );
         assert!(
-            seen.windows(2).all(|w| w.first() <= w.get(1)),
-            "the clock went backwards: {seen:?}"
+            seen.iter().all(|&(noted, live)| noted == live),
+            "an event carried a stale exit count (noted, live): {seen:?}"
         );
     }
 
@@ -6231,5 +6241,91 @@ mod tests {
             KM::new(TestPort::default(), NoTrace).err(),
             Some(rusty_rtos_core::error::Error::InvalidArgument)
         );
+    }
+
+    /// [`TestConfig`] with the message length prefix as a parameter.
+    struct PrefixConfig<const N: usize>;
+    impl<const N: usize> Config for PrefixConfig<N> {
+        type Tick = rusty_rtos_core::tick::Bits32;
+        const TICK_RATE_HZ: u32 = 100;
+        const MAX_PRIORITIES: u8 = 4;
+        const MINIMAL_STACK_SIZE: usize = 1;
+        const MAX_TASK_NAME_LEN: usize = 8;
+        const TIMER_TASK_PRIORITY: u8 = 3;
+        const TIMER_TASK_STACK_DEPTH: usize = 1;
+        const TIMER_QUEUE_LENGTH: usize = 1;
+        const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+        const MESSAGE_LENGTH_BYTES: usize = N;
+    }
+
+    type KP<const N: usize> = crate::Kernel<
+        PrefixConfig<N>,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(4, 1, 0)) },
+        { crate::lists_for(4, 1, 0) },
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+    >;
+
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE` is one to eight bytes: each
+    /// bound refused on its own, the widest accepted.
+    #[test]
+    fn a_message_length_prefix_is_one_to_eight_bytes() {
+        use rusty_rtos_core::error::Error;
+        assert_eq!(
+            KP::<0>::new(TestPort::default(), NoTrace).err(),
+            Some(Error::InvalidArgument)
+        );
+        assert_eq!(
+            KP::<9>::new(TestPort::default(), NoTrace).err(),
+            Some(Error::InvalidArgument)
+        );
+        assert!(KP::<1>::new(TestPort::default(), NoTrace).is_ok());
+        assert!(KP::<8>::new(TestPort::default(), NoTrace).is_ok());
+    }
+
+    /// The footprint sum again, on a kernel that HAS a byte arena -- with
+    /// none, its line is zero and adding it or taking it away is the same.
+    #[test]
+    fn the_footprint_lines_account_for_a_kernel_with_buffers() {
+        type KB = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            2,
+            64,
+            0,
+            0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+        >;
+        assert_eq!(KB::FOOTPRINT_BYTES, 64);
+        let parts = [
+            KB::FOOTPRINT_TCBS,
+            KB::FOOTPRINT_QUEUES,
+            KB::FOOTPRINT_LISTS,
+            KB::FOOTPRINT_SLOTS,
+            KB::FOOTPRINT_BUFFERS,
+            KB::FOOTPRINT_TIMERS,
+            KB::FOOTPRINT_GROUPS,
+            KB::FOOTPRINT_TIMER_MESSAGES,
+            KB::FOOTPRINT_BYTES,
+            KB::FOOTPRINT_FREE_LISTS,
+            KB::FOOTPRINT_PER_TASK_SIDE,
+        ];
+        assert_eq!(KB::FOOTPRINT_ACCOUNTED, parts.iter().sum::<usize>());
     }
 }

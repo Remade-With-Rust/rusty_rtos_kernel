@@ -2179,6 +2179,14 @@ mod tests {
         assert_eq!(k.semaphore_count(s), Ok(1), "a peek leaves it");
         assert_eq!(k.queue_receive(s, 0), Ok(Wait::Ready(0)));
         assert_eq!(k.semaphore_count(s), Ok(0), "a receive takes it");
+
+        // And from an interrupt -- `xSemaphoreTakeFromISR` is exactly
+        // `xQueueReceiveFromISR` on a semaphore.
+        k.semaphore_give(s).expect("give");
+        assert_eq!(k.queue_peek_from_isr(s), Ok(0));
+        assert_eq!(k.semaphore_count(s), Ok(1), "an ISR peek leaves it");
+        let _ = k.queue_receive_from_isr(s).expect("receive");
+        assert_eq!(k.semaphore_count(s), Ok(0), "an ISR receive takes it");
     }
 
     /// `xTaskResumeAll` yields for a task the pending-ready list hands back
