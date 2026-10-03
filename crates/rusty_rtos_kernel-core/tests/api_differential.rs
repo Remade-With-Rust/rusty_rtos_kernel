@@ -53,9 +53,11 @@ use rusty_rtos_kernel_core::{Kernel, list_slots_for, lists_for};
 const TRACE_1: &str = include_str!("../../../oracle/api/api1.trace");
 const TRACE_2: &str = include_str!("../../../oracle/api/api2.trace");
 
-/// `oracle/api/FreeRTOSConfig.h`, field for field, at one core.
-struct OneCore;
-impl Config for OneCore {
+/// `oracle/api/FreeRTOSConfig.h`, field for field -- built one-core and
+/// two-core from one source, and started at the tick count the trace's header
+/// names (`tick0=`; a trace without it, such as an older pin, started at 0).
+struct Cfg<const CORES: u8, const TICK0: u64>;
+impl<const CORES: u8, const TICK0: u64> Config for Cfg<CORES, TICK0> {
     type Tick = Bits32;
     const TICK_RATE_HZ: u32 = 1000;
     const MAX_PRIORITIES: u8 = 5;
@@ -68,8 +70,10 @@ impl Config for OneCore {
     /// `sizeof( size_t )` on the host the oracle runs on: the C's default
     /// `configMESSAGE_BUFFER_LENGTH_TYPE`.
     const MESSAGE_LENGTH_BYTES: usize = 8;
-    const NUMBER_OF_CORES: u8 = 1;
+    const NUMBER_OF_CORES: u8 = CORES;
     const USE_TIME_SLICING: bool = true;
+    /// `configINITIAL_TICK_COUNT`.
+    const INITIAL_TICK_COUNT: u64 = TICK0;
     /// heap_3: every free is `vTaskSuspendAll` / `xTaskResumeAll`, and that
     /// resume takes a yield left pending -- by an ISR call with no woken
     /// pointer, say.
@@ -77,29 +81,9 @@ impl Config for OneCore {
     const TOTAL_HEAP_SIZE: usize = 1024 * 1024;
 }
 
-/// The same, at two cores.
-struct TwoCores;
-impl Config for TwoCores {
-    type Tick = Bits32;
-    const TICK_RATE_HZ: u32 = 1000;
-    const MAX_PRIORITIES: u8 = 5;
-    const MINIMAL_STACK_SIZE: usize = 128;
-    const MAX_TASK_NAME_LEN: usize = 8;
-    const TIMER_TASK_PRIORITY: u8 = 2;
-    const TIMER_TASK_STACK_DEPTH: usize = 128;
-    const TIMER_QUEUE_LENGTH: usize = 1;
-    const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
-    /// `sizeof( size_t )` on the host the oracle runs on: the C's default
-    /// `configMESSAGE_BUFFER_LENGTH_TYPE`.
-    const MESSAGE_LENGTH_BYTES: usize = 8;
-    const NUMBER_OF_CORES: u8 = 2;
-    const USE_TIME_SLICING: bool = true;
-    /// heap_3: every free is `vTaskSuspendAll` / `xTaskResumeAll`, and that
-    /// resume takes a yield left pending -- by an ISR call with no woken
-    /// pointer, say.
-    const DYNAMIC_ALLOCATION: bool = true;
-    const TOTAL_HEAP_SIZE: usize = 1024 * 1024;
-}
+/// The scripts' start since the wrap went in: 600 ticks short of it, so every
+/// script crosses it about halfway.
+const WRAP: u64 = 0xFFFF_FDA8;
 
 /// The fake port's twin: a settable core, and every yield RECORDED.
 #[derive(Default)]
@@ -1238,8 +1222,27 @@ macro_rules! replay {
     };
 }
 
-replay!(replay_one, OneCore);
-replay!(replay_two, TwoCores);
+replay!(replay_one_wrap, Cfg<1, WRAP>);
+replay!(replay_two_wrap, Cfg<2, WRAP>);
+replay!(replay_one_zero, Cfg<1, 0>);
+replay!(replay_two_zero, Cfg<2, 0>);
+
+/// The replay the trace's header asks for: its core count and its first tick.
+fn replay(trace: &str, label: &str) -> usize {
+    let header = trace.lines().next().expect("a header line");
+    let field = |k: &str| header.split_whitespace().find_map(|w| w.strip_prefix(k));
+    let cores = field("cores=").expect("cores= in the header");
+    let tick0 = field("tick0=").map_or(0, |t| {
+        u64::from_str_radix(t.trim_start_matches("0x"), 16).expect("tick0= in hex")
+    });
+    match (cores, tick0) {
+        ("1", 0) => replay_one_zero(trace, label),
+        ("2", 0) => replay_two_zero(trace, label),
+        ("1", WRAP) => replay_one_wrap(trace, label),
+        ("2", WRAP) => replay_two_wrap(trace, label),
+        other => panic!("{label}: no replay is built for {other:?}"),
+    }
+}
 
 /// The script must actually exercise what it claims to, or a pass proves
 /// little. Floors, per op and per outcome, well under what the pinned
@@ -1366,14 +1369,14 @@ fn exercised(trace: &str) {
 #[test]
 fn one_core_answers_every_step_as_the_c_kernel_does() {
     exercised(TRACE_1);
-    let n = replay_one(&TRACE_1.replace("\r\n", "\n"), "one core");
+    let n = replay(&TRACE_1.replace("\r\n", "\n"), "one core");
     assert_eq!(n, 28_001, "every step replayed");
 }
 
 #[test]
 fn two_cores_answer_every_step_as_the_c_kernel_does() {
     exercised(TRACE_2);
-    let n = replay_two(&TRACE_2.replace("\r\n", "\n"), "two cores");
+    let n = replay(&TRACE_2.replace("\r\n", "\n"), "two cores");
     assert_eq!(n, 28_001, "every step replayed");
 }
 
@@ -1395,13 +1398,10 @@ fn pinned_seeds_answer_every_step_as_the_c_kernel_does() {
             .unwrap()
             .replace("\r\n", "\n");
         let steps = pin.lines().count();
-        let n = if name.starts_with("api1-") {
-            replay_one(&pin, &name)
-        } else if name.starts_with("api2-") {
-            replay_two(&pin, &name)
-        } else {
+        if !(name.starts_with("api1-") || name.starts_with("api2-")) {
             continue;
-        };
+        }
+        let n = replay(&pin, &name);
         assert_eq!(n + 1, steps, "{name}: every step replayed");
         seen += 1;
     }
@@ -1426,13 +1426,10 @@ fn fresh_seeds_answer_every_step_as_the_c_kernel_does() {
         let trace = std::fs::read_to_string(&path)
             .unwrap()
             .replace("\r\n", "\n");
-        if name.starts_with("api1-") {
-            replay_one(&trace, &name);
-        } else if name.starts_with("api2-") {
-            replay_two(&trace, &name);
-        } else {
+        if !(name.starts_with("api1-") || name.starts_with("api2-")) {
             continue;
         }
+        replay(&trace, &name);
         seen += 1;
     }
     assert!(seen > 0, "no traces in {dir}");

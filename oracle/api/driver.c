@@ -1605,7 +1605,9 @@ static long buffer_op( int cur_slot,
 {
     int b = ( int ) ( slot % BSLOTS );
     unsigned which = ( arg >> 8 ) % 13;
-    unsigned len = 1 + ( arg >> 12 ) % ( b == 0 ? 6 : 5 );
+    /* One stream send in eight is longer than the whole buffer: the send
+     * clamps it to what the buffer can ever report free. */
+    unsigned len = ( ( b == 0 ) && ( ( arg >> 20 ) % 8 == 0 ) ) ? SB_SIZE + 1 : 1 + ( arg >> 12 ) % ( b == 0 ? 6 : 5 );
     unsigned start = ( arg >> 16 ) & 0xff;
     TickType_t ticks = block_ticks( arg );
     BaseType_t woken = pdFALSE;
@@ -1741,7 +1743,7 @@ static long buffer_op( int cur_slot,
             }
 
             {
-                unsigned level = 1 + arg % 14; /* past SB_SIZE sometimes: refused */
+                unsigned level = arg % 15; /* 0 becomes 1; past SB_SIZE: refused */
                 r = xStreamBufferSetTriggerLevel( buffer[ b ], level );
                 snprintf( op, n, "btrigger %d %u", b, level );
                 return r;
@@ -1803,8 +1805,8 @@ int main( int argc,
 
     /* The setup above is the same on both sides and is not a step; the
      * header says what it chose, and line 0 where it left the kernel. */
-    printf( "seed=0x%08lx cores=%d steps=%u init=%lu,%lu,%lu,%lu\n",
-            ( unsigned long ) seed, configNUMBER_OF_CORES, steps,
+    printf( "seed=0x%08lx cores=%d steps=%u tick0=0x%08lx init=%lu,%lu,%lu,%lu\n",
+            ( unsigned long ) seed, configNUMBER_OF_CORES, steps, ( unsigned long ) configINITIAL_TICK_COUNT,
             ( unsigned long ) init[ 0 ], ( unsigned long ) init[ 1 ],
             ( unsigned long ) init[ 2 ], ( unsigned long ) init[ 3 ] );
     line( 0, 0, "start", 0, 0 );
