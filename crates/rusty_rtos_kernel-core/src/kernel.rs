@@ -2445,40 +2445,16 @@ where
     /// paying for the other's entry conditions.
     #[inline(never)]
     fn resume_pending_owed(&mut self, index: usize) -> bool {
-        let did = self.resume_pending_owed_inner(index);
-        if did {
-            // Every branch below that did work returned with the hint still
-            // standing, so the runner came straight back and spent a second
-            // entry re-deriving "nothing owed". Clearing it here covers all
-            // of them at one site.
-            self.clear_owe_if_settled(index);
-        }
-        did
-    }
-
-    /// The body of [`Kernel::resume_pending_owed`].
-    fn resume_pending_owed_inner(&mut self, index: usize) -> bool {
-        // Almost every call answers "nothing owed", and the sequence below
-        // reaches that answer in three stages -- a compare, a match over
-        // `OwedTrace`, then another compare -- each reachable only after the
-        // one before. The same three loads, but one branch instead of three.
-        // No `.copied()` on `owed_trace`: that materialises an
-        // `Option<OwedTrace>`, and `OwedTrace` is forty bytes wide because of
-        // `TimerCommandSend`'s `Name`. Matching through the reference tests
-        // the discriminant where the copy moved the whole variant to test it.
-        if self.owed_exits.get(index).copied().unwrap_or(0) == 0
-            && matches!(self.owed_trace.get(index), Some(OwedTrace::None) | None)
-            && !self.flag(index, Self::F_YIELD, false)
-        {
-            if let Some(f) = self.owes_anything.get_mut(index) {
-                *f = false;
-            }
-            return false;
-        }
         // First the stack unwinds — the sections the task had open when it
         // was switched out, and whatever its abandoned frame opened after
         // that — and only then does the statement after the yield run.
         // Reversing the two moves every tick.
+        //
+        // HERE and not in the inner body, because this is the shape of
+        // nearly every call (BlockQ: 43,104 of 43,104) and it needs three
+        // saved registers, where the inner body's `OwedTrace` match needs
+        // six and a 0x68-byte frame. In one symbol every call paid for the
+        // match's frame.
         let owed = self.owed_exits.get(index).copied().unwrap_or(0);
         if owed > 0 {
             if let Some(slot) = self.owed_exits.get_mut(index) {
@@ -2495,7 +2471,37 @@ where
                 // tail of *this* frame, which the port tallies and the next
                 // resume pays — so there is nothing to unwind by hand.
             }
+            self.clear_owe_if_settled(index);
             return true;
+        }
+        let did = self.resume_pending_owed_inner(index);
+        if did {
+            // Every branch below that did work returned with the hint still
+            // standing, so the runner came straight back and spent a second
+            // entry re-deriving "nothing owed". Clearing it here covers all
+            // of them at one site.
+            self.clear_owe_if_settled(index);
+        }
+        did
+    }
+
+    /// The body of [`Kernel::resume_pending_owed`] once no exits are owed.
+    #[inline(never)]
+    fn resume_pending_owed_inner(&mut self, index: usize) -> bool {
+        // The caller has replayed any owed exits, so `owed_exits` is zero
+        // here. Of what is left, almost every call answers "nothing owed":
+        // a match over `OwedTrace`, then a compare, the same two loads with
+        // one branch. No `.copied()` on `owed_trace`: that materialises an
+        // `Option<OwedTrace>`, and `OwedTrace` is forty bytes wide because of
+        // `TimerCommandSend`'s `Name`. Matching through the reference tests
+        // the discriminant where the copy moved the whole variant to test it.
+        if matches!(self.owed_trace.get(index), Some(OwedTrace::None) | None)
+            && !self.flag(index, Self::F_YIELD, false)
+        {
+            if let Some(f) = self.owes_anything.get_mut(index) {
+                *f = false;
+            }
+            return false;
         }
         // Then the line the abandoned frame had not reached yet.
         match self.owed_trace.get(index).copied() {
