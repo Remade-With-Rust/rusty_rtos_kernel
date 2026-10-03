@@ -115,13 +115,32 @@ impl Port for DiffPort {
 }
 
 const TASKS: usize = 20;
-const QUEUES: usize = 4;
+/// The semaphore, three app queues and the timer's command queue, with room.
+const QUEUES: usize = 8;
+/// Queue item storage: three queues of up to three, and the timer's.
+const ITEMS: usize = 16;
 const SLOTS: usize = 10;
+const QSLOTS: usize = 3;
 
-/// A call parked inside the kernel, to make again when its task next runs.
+/// A call that may block: made, and if it blocks made again when its task
+/// next runs.
 #[derive(Clone, Copy)]
 enum Call {
     Take(u64),
+    QSend { q: usize, value: u64, ticks: u64 },
+    QSendFront { q: usize, value: u64, ticks: u64 },
+    QRecv { q: usize, ticks: u64 },
+    QPeek { q: usize, ticks: u64 },
+}
+
+/// A wait's result as the C driver prints it: `ok` for a call that passed,
+/// 2 for blocked, 0 for full / empty / timed out.
+fn waited<T>(r: Result<Wait<T>, rusty_rtos_core::error::Error>, ok: impl Fn(T) -> i64) -> i64 {
+    match r {
+        Ok(Wait::Ready(v)) => ok(v),
+        Ok(Wait::Blocked) => 2,
+        Err(_) => 0,
+    }
 }
 
 fn state_char(s: TaskState) -> char {
@@ -148,7 +167,7 @@ macro_rules! replay {
                 { list_slots_for(TASKS, 1, lists_for(5, QUEUES, 0)) },
                 { lists_for(5, QUEUES, 0) },
                 QUEUES,
-                8,
+                ITEMS,
                 0,
                 0,
                 1,
@@ -162,6 +181,7 @@ macro_rules! replay {
                 app: [Option<TaskHandle>; SLOTS],
                 pending: [Option<Call>; SLOTS],
                 sem: QueueHandle,
+                queues: [Option<QueueHandle>; QSLOTS],
             }
 
             impl D {
@@ -194,12 +214,21 @@ macro_rules! replay {
                 /// Make (or make again) a parked call: 1 / 0 as the C's call
                 /// returns, 2 for "blocked, now pending".
                 fn call(&mut self, slot: usize, call: Call) -> i64 {
+                    let q = |i: usize| self.queues[i].expect("a live queue");
                     let r = match call {
-                        Call::Take(ticks) => match self.k.semaphore_take(self.sem, ticks) {
-                            Ok(Wait::Ready(())) => 1,
-                            Ok(Wait::Blocked) => 2,
-                            Err(_) => 0,
-                        },
+                        Call::Take(ticks) => waited(self.k.semaphore_take(self.sem, ticks), |()| 1),
+                        Call::QSend { q: i, value, ticks } => {
+                            waited(self.k.queue_send(q(i), value, ticks), |()| 1)
+                        }
+                        Call::QSendFront { q: i, value, ticks } => {
+                            waited(self.k.queue_send_to_front(q(i), value, ticks), |()| 1)
+                        }
+                        Call::QRecv { q: i, ticks } => {
+                            waited(self.k.queue_receive(q(i), ticks), |v| v as i64)
+                        }
+                        Call::QPeek { q: i, ticks } => {
+                            waited(self.k.queue_peek(q(i), ticks), |v| v as i64)
+                        }
                     };
                     self.pending[slot] = (r == 2).then_some(call);
                     r
@@ -233,7 +262,19 @@ macro_rules! replay {
                         }
                     }
                     let count = self.k.semaphore_count(self.sem).unwrap_or(99);
-                    let _ = write!(s, " s={count}");
+                    let _ = write!(s, " s={count} Q=");
+                    for i in 0..QSLOTS {
+                        match self.queues[i] {
+                            None => s.push('-'),
+                            Some(h) => {
+                                let n = self.k.queue_messages_waiting(h).unwrap_or(99);
+                                let _ = write!(s, "{n}");
+                            }
+                        }
+                        if i + 1 < QSLOTS {
+                            s.push('.');
+                        }
+                    }
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -264,6 +305,7 @@ macro_rules! replay {
                 app: [None; SLOTS],
                 pending: [None; SLOTS],
                 sem,
+                queues: [None; QSLOTS],
             };
             for (i, p) in init.iter().enumerate() {
                 d.app[i] = Some(d.k.create_task(&format!("t{i}"), *p).expect("initial task"));
@@ -342,6 +384,70 @@ macro_rules! replay {
                             r = d.call(s, Call::Take(ticks));
                         }
                     }
+                    "qcreate" => match d.k.queue_create(num(1) as usize) {
+                        Ok(h) => {
+                            d.queues[num(0) as usize] = Some(h);
+                            r = 1;
+                        }
+                        Err(_) => r = -1,
+                    },
+                    "qdelete" => {
+                        let h = d.queues[num(0) as usize].take().unwrap();
+                        d.k.queue_delete(h).expect("queue delete");
+                    }
+                    "qsend" | "qsendf" | "qrecv" | "qpeek" => {
+                        let s = cur_slot.expect("a queue call from an app task");
+                        let q = num(0) as usize;
+                        let call = match op {
+                            "qsend" => Call::QSend { q, value: num(1), ticks: num(2) },
+                            "qsendf" => Call::QSendFront { q, value: num(1), ticks: num(2) },
+                            "qrecv" => Call::QRecv { q, ticks: num(1) },
+                            _ => Call::QPeek { q, ticks: num(1) },
+                        };
+                        r = d.call(s, call);
+                    }
+                    "qover" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        r = waited(d.k.queue_overwrite(h, num(1)), |()| 1);
+                    }
+                    "qreset" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        d.k.queue_reset(h).expect("reset");
+                        r = 1; // xQueueReset answers pdPASS, always
+                    }
+                    "qsend_isr" | "qsendf_isr" | "qover_isr" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        let sent = match op {
+                            "qsend_isr" => d.k.queue_send_from_isr(h, num(1)),
+                            "qsendf_isr" => d.k.queue_send_to_front_from_isr(h, num(1)),
+                            _ => d.k.queue_overwrite_from_isr(h, num(1)),
+                        };
+                        match sent {
+                            Ok(woken) => {
+                                r = 1;
+                                d.k.port().yield_from_isr(woken);
+                            }
+                            Err(_) => r = 0,
+                        }
+                    }
+                    "qrecv_isr" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        match d.k.queue_receive_from_isr(h) {
+                            Ok((v, woken)) => {
+                                r = v as i64;
+                                d.k.port().yield_from_isr(woken);
+                            }
+                            Err(_) => r = 0,
+                        }
+                    }
+                    "qpeek_isr" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        r = d.k.queue_peek_from_isr(h).map_or(0, |v| v as i64);
+                    }
+                    "qfull_isr" => {
+                        let h = d.queues[num(0) as usize].unwrap();
+                        r = i64::from(d.k.queue_is_full_from_isr(h).unwrap_or(false));
+                    }
                     "tick" => {
                         r = i64::from(d.k.increment_tick());
                         if r != 0 {
@@ -375,21 +481,57 @@ replay!(replay_one, OneCore);
 replay!(replay_two, TwoCores);
 
 /// The script must actually exercise what it claims to, or a pass proves
-/// little: blocked calls, continued ones, and timed-out ones.
+/// little. Floors, per op and per outcome, well under what the pinned
+/// scripts reach -- a regenerated script that stopped reaching an arm
+/// fails here rather than passing quietly.
 fn exercised(trace: &str) {
     let t = trace.replace("\r\n", "\n");
-    let blocked = t
-        .lines()
-        .filter(|l| l.contains(" take ") && l.contains(" r=2 "))
-        .count();
-    let cont = t.lines().filter(|l| l.contains(" cont ")).count();
-    let timeouts = t
-        .lines()
-        .filter(|l| l.contains(" cont ") && l.contains(" r=0 "))
-        .count();
-    assert!(blocked > 100, "only {blocked} takes blocked");
-    assert!(cont > 100, "only {cont} continued calls");
-    assert!(timeouts > 0, "no blocked call ever timed out");
+    let op = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_owned();
+    let count = |pred: &dyn Fn(&str) -> bool| t.lines().skip(1).filter(|l| pred(l)).count();
+    for (name, floor) in [
+        ("create", 50),
+        ("delete", 50),
+        ("suspend", 100),
+        ("resume", 100),
+        ("prio", 100),
+        ("delay", 100),
+        ("give", 100),
+        ("give_isr", 100),
+        ("take", 100),
+        ("qcreate", 100),
+        ("qdelete", 100),
+        ("qsend", 200),
+        ("qsendf", 100),
+        ("qrecv", 200),
+        ("qpeek", 100),
+        ("qover", 50),
+        ("qreset", 100),
+        ("qsend_isr", 100),
+        ("qsendf_isr", 100),
+        ("qover_isr", 50),
+        ("qrecv_isr", 100),
+        ("qpeek_isr", 50),
+        ("qfull_isr", 50),
+        ("tick", 500),
+        ("cont", 200),
+    ] {
+        let n = count(&|l| op(l) == name);
+        assert!(n >= floor, "only {n} `{name}` steps (floor {floor})");
+    }
+    let blocked = count(&|l| l.contains(" r=2 ") && op(l) != "cont");
+    let timeouts = count(&|l| op(l) == "cont" && l.contains(" r=0 "));
+    let values = count(&|l| {
+        let v: i64 = l
+            .split(" r=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(0);
+        v >= 10
+    });
+    assert!(blocked >= 300, "only {blocked} calls blocked");
+    assert!(timeouts >= 50, "only {timeouts} blocked calls timed out");
+    assert!(values >= 500, "only {values} values received");
 }
 
 #[test]

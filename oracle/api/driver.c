@@ -6,16 +6,21 @@
  * script of kernel calls, each made "from" a chosen core, and the driver
  * writes one line per step:
  *
- *     <step> c<core> <op> <args...> | r=<result> y=<yield mask> cur=<..> T=<..> s=<..>
+ *     <step> c<core> <op> <args...> | r=<result> y=<yields> cur=<..> T=<..> s=<..> Q=<..>
  *
  * Left of the bar is the STEP, fully specified: `tests/api_differential.rs`
  * parses it and makes the same call on Kairos. It never sees this RNG, so
  * the grammar lives here alone. Right of the bar is what the C kernel then
  * looked like -- the call's result, the yields it asked for (taken before
  * the line is printed), each core's current task, every app task's state and
- * priority (`eTaskGetState`, `uxTaskPriorityGet`) and the semaphore's count
- * -- and Kairos must print the same. A wrong decision shows on the step that
- * makes it, not three steps later when the schedule finally moves.
+ * priority (`eTaskGetState`, `uxTaskPriorityGet`), the semaphore's count and
+ * every queue's message count -- and Kairos must print the same. A wrong
+ * decision shows on the step that makes it.
+ *
+ * Results: 1 / 0 for pass / fail (pdPASS, errQUEUE_FULL, pdFALSE), -1 for a
+ * create that failed, 2 for "blocked, now pending", and a RECEIVED VALUE
+ * itself for a receive or peek that got one -- values are 10..99, so they
+ * never collide with the codes, and an ordering bug shows on the receive.
  *
  * A call that BLOCKS runs in a ucontext coroutine: the blocking trace hook
  * marks it, and the yield that follows swaps back to the driver, leaving the
@@ -23,6 +28,10 @@
  * next current on a core the step is `cont`, and the kernel's own loop
  * carries on with its own timeout state. Kairos does the same through its
  * retry protocol (`Wait::Blocked`: call again when the task next runs).
+ *
+ * The script never asks the C for undefined behaviour (plan decision D1):
+ * no call on a deleted object, no overwrite of a queue longer than one, no
+ * deleting a queue a task is blocked on.
  *
  * Usage: driver <seed> <steps>
  */
@@ -32,11 +41,13 @@
 #include <ucontext.h>
 
 #include "FreeRTOS.h"
+#include "queue.h"
 #include "semphr.h"
 #include "task.h"
 #include "timers.h"
 
-#define SLOTS    10
+#define SLOTS     10 /* app tasks */
+#define QSLOTS    3  /* queues */
 
 static uint32_t rng;
 static uint32_t next( void )
@@ -50,6 +61,8 @@ static uint32_t next( void )
 static TaskHandle_t app[ SLOTS ];
 static unsigned created;
 static SemaphoreHandle_t sem;
+static QueueHandle_t queue[ QSLOTS ];
+static unsigned queue_len[ QSLOTS ];
 
 static void body( void * p )
 {
@@ -65,12 +78,14 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK };
 
 struct call
 {
     enum call_kind kind;
     TickType_t ticks;
+    int q;          /* queue slot, for the queue calls */
+    uint32_t value; /* what a send sends */
 };
 
 #define CORO_STACK    ( 256 * 1024 )
@@ -95,15 +110,39 @@ static void on_yield( void )
     }
 }
 
+/* A receive or peek's result: the value, or 0 for "nothing". */
+static long got( BaseType_t ok,
+                 const uint32_t * v )
+{
+    return ok ? ( long ) *v : 0;
+}
+
 static void coro_main( void )
 {
     int s = coro_start_slot;
     struct call * c = &coro_call[ s ];
+    uint32_t v = 0;
 
     switch( c->kind )
     {
         case CALL_TAKE:
             coro_result[ s ] = xSemaphoreTake( sem, c->ticks );
+            break;
+
+        case CALL_QSEND:
+            coro_result[ s ] = xQueueSendToBack( queue[ c->q ], &c->value, c->ticks );
+            break;
+
+        case CALL_QSENDF:
+            coro_result[ s ] = xQueueSendToFront( queue[ c->q ], &c->value, c->ticks );
+            break;
+
+        case CALL_QRECV:
+            coro_result[ s ] = got( xQueueReceive( queue[ c->q ], &v, c->ticks ), &v );
+            break;
+
+        case CALL_QPEEK:
+            coro_result[ s ] = got( xQueuePeek( queue[ c->q ], &v, c->ticks ), &v );
             break;
     }
 
@@ -147,6 +186,21 @@ static long start_call( int s,
     coro_start_slot = s;
     makecontext( &coro[ s ], coro_main, 0 );
     return run_coro( s );
+}
+
+/* Whether any task is blocked inside a call on queue slot q: such a queue
+ * must not be deleted (the C would leave its waiters on a freed list). */
+static int queue_has_waiter( int q )
+{
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( pending[ i ] && ( coro_call[ i ].kind != CALL_TAKE ) && ( coro_call[ i ].q == q ) )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 /* ------------------------------------------------ the observation -- */
@@ -233,7 +287,209 @@ static void line( unsigned step,
         printf( i + 1 < SLOTS ? "." : "" );
     }
 
-    printf( " s=%lu\n", ( unsigned long ) uxSemaphoreGetCount( sem ) );
+    printf( " s=%lu Q=", ( unsigned long ) uxSemaphoreGetCount( sem ) );
+
+    for( int q = 0; q < QSLOTS; q++ )
+    {
+        if( queue[ q ] == NULL )
+        {
+            printf( "-" );
+        }
+        else
+        {
+            printf( "%lu", ( unsigned long ) uxQueueMessagesWaiting( queue[ q ] ) );
+        }
+
+        printf( q + 1 < QSLOTS ? "." : "" );
+    }
+
+    printf( "\n" );
+}
+
+/* -------------------------------------------------------- the families -- */
+
+/* A blocking call's ticks: a third of the time none (the call returns at
+ * once), otherwise 1..6. */
+static TickType_t block_ticks( unsigned arg )
+{
+    return ( arg % 3 == 0 ) ? 0 : 1 + ( arg >> 2 ) % 6;
+}
+
+/* Make a call from task slot `s` that may block: through a coroutine if it
+ * has ticks, directly if not. */
+static long call_from_task( int s,
+                            struct call c )
+{
+    if( c.ticks > 0 )
+    {
+        return start_call( s, c );
+    }
+
+    coro_call[ s ] = c; /* not pending: only the arguments, for queue_has_waiter */
+    uint32_t v = 0;
+
+    switch( c.kind )
+    {
+        case CALL_TAKE:   return xSemaphoreTake( sem, 0 );
+        case CALL_QSEND:  return xQueueSendToBack( queue[ c.q ], &c.value, 0 );
+        case CALL_QSENDF: return xQueueSendToFront( queue[ c.q ], &c.value, 0 );
+        case CALL_QRECV:  return got( xQueueReceive( queue[ c.q ], &v, 0 ), &v );
+        case CALL_QPEEK:  return got( xQueuePeek( queue[ c.q ], &v, 0 ), &v );
+    }
+
+    return 0;
+}
+
+static void isr_enter( void )
+{
+    fake_in_isr = 1;
+}
+
+static void isr_exit( BaseType_t woken )
+{
+    fake_in_isr = 0;
+    portYIELD_FROM_ISR( woken );
+}
+
+/* The queue family. Writes the op text; returns the result. */
+static long queue_op( int cur_slot,
+                      unsigned slot,
+                      unsigned arg,
+                      char * op,
+                      size_t n )
+{
+    int q = ( int ) ( slot % QSLOTS );
+    unsigned which = ( arg >> 8 ) % 14;
+    uint32_t value = 10 + ( arg >> 16 ) % 90;
+    uint32_t v = 0;
+    BaseType_t woken = pdFALSE;
+    long r = 0;
+
+    if( queue[ q ] == NULL )
+    {
+        unsigned len = 1 + arg % 3;
+        queue[ q ] = xQueueCreate( len, sizeof( uint32_t ) );
+        queue_len[ q ] = len;
+        snprintf( op, n, "qcreate %d %u", q, len );
+        return queue[ q ] ? 1 : -1;
+    }
+
+    switch( which )
+    {
+        case 0:
+
+            if( queue_has_waiter( q ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            vQueueDelete( queue[ q ] );
+            queue[ q ] = NULL;
+            snprintf( op, n, "qdelete %d", q );
+            return 0;
+
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        {
+            /* The task-context calls, any of which may block. */
+            static const enum call_kind kinds[] = { CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QRECV, CALL_QPEEK, CALL_QSEND };
+            static const char * names[] = { "qsend", "qsendf", "qrecv", "qrecv", "qpeek", "qsend" };
+
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { kinds[ which - 1 ], block_ticks( arg ), q, value };
+            r = call_from_task( cur_slot, c );
+
+            if( ( c.kind == CALL_QSEND ) || ( c.kind == CALL_QSENDF ) )
+            {
+                snprintf( op, n, "%s %d %lu %lu", names[ which - 1 ], q, ( unsigned long ) value, ( unsigned long ) c.ticks );
+            }
+            else
+            {
+                snprintf( op, n, "%s %d %lu", names[ which - 1 ], q, ( unsigned long ) c.ticks );
+            }
+
+            return r;
+        }
+
+        case 7:
+
+            if( queue_len[ q ] != 1 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xQueueOverwrite( queue[ q ], &value );
+            snprintf( op, n, "qover %d %lu", q, ( unsigned long ) value );
+            return r;
+
+        case 8:
+            r = xQueueReset( queue[ q ] );
+            snprintf( op, n, "qreset %d", q );
+            return r;
+
+        case 9:
+            isr_enter();
+            r = xQueueSendToBackFromISR( queue[ q ], &value, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "qsend_isr %d %lu", q, ( unsigned long ) value );
+            return r;
+
+        case 10:
+            isr_enter();
+            r = xQueueSendToFrontFromISR( queue[ q ], &value, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "qsendf_isr %d %lu", q, ( unsigned long ) value );
+            return r;
+
+        case 11:
+
+            if( queue_len[ q ] != 1 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            isr_enter();
+            r = xQueueOverwriteFromISR( queue[ q ], &value, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "qover_isr %d %lu", q, ( unsigned long ) value );
+            return r;
+
+        case 12:
+            isr_enter();
+            r = got( xQueueReceiveFromISR( queue[ q ], &v, &woken ), &v );
+            isr_exit( woken );
+            snprintf( op, n, "qrecv_isr %d", q );
+            return r;
+
+        default:
+            isr_enter();
+
+            if( arg & 1 )
+            {
+                r = got( xQueuePeekFromISR( queue[ q ], &v ), &v );
+                snprintf( op, n, "qpeek_isr %d", q );
+            }
+            else
+            {
+                r = xQueueIsQueueFullFromISR( queue[ q ] );
+                snprintf( op, n, "qfull_isr %d", q );
+            }
+
+            isr_exit( pdFALSE );
+            return r;
+    }
 }
 
 /* ------------------------------------------------------- the script -- */
@@ -243,12 +499,12 @@ int main( int argc,
 {
     char op[ 64 ];
     unsigned steps = ( argc > 2 ) ? ( unsigned ) strtoul( argv[ 2 ], NULL, 0 ) : 20000u;
+    uint32_t seed = ( argc > 1 ) ? ( uint32_t ) strtoul( argv[ 1 ], NULL, 0 ) : 0x2545f491u;
 
-    rng = ( argc > 1 ) ? ( uint32_t ) strtoul( argv[ 1 ], NULL, 0 ) : 0x2545f491u;
+    rng = seed;
     fake_yield_hook = on_yield;
 
     sem = xSemaphoreCreateBinary();
-
     UBaseType_t init[ 4 ];
 
     for( int i = 0; i < 4; i++ )
@@ -270,10 +526,10 @@ int main( int argc,
     }
 
     /* The setup above is the same on both sides and is not a step; the
-     * first line records where it left the kernel. */
+     * header says what it chose, and line 0 where it left the kernel. */
     printf( "seed=0x%08lx cores=%d steps=%u init=%lu,%lu,%lu,%lu\n",
-            ( unsigned long ) ( argc > 1 ? strtoul( argv[ 1 ], NULL, 0 ) : 0x2545f491u ),
-            configNUMBER_OF_CORES, steps, ( unsigned long ) init[ 0 ], ( unsigned long ) init[ 1 ],
+            ( unsigned long ) seed, configNUMBER_OF_CORES, steps,
+            ( unsigned long ) init[ 0 ], ( unsigned long ) init[ 1 ],
             ( unsigned long ) init[ 2 ], ( unsigned long ) init[ 3 ] );
     line( 0, 0, "start", 0, 0 );
 
@@ -301,7 +557,7 @@ int main( int argc,
             continue;
         }
 
-        if( kind < 10 )
+        if( kind < 6 )
         {
             if( t == NULL )
             {
@@ -316,7 +572,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 18 )
+        else if( kind < 11 )
         {
             if( t != NULL )
             {
@@ -330,7 +586,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 30 )
+        else if( kind < 18 )
         {
             if( t != NULL )
             {
@@ -342,7 +598,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 42 )
+        else if( kind < 25 )
         {
             if( t != NULL )
             {
@@ -354,7 +610,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 54 )
+        else if( kind < 32 )
         {
             if( t != NULL )
             {
@@ -367,7 +623,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 64 )
+        else if( kind < 38 )
         {
             if( cur_slot >= 0 )
             {
@@ -380,42 +636,35 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 72 )
+        else if( kind < 43 )
         {
             r = xSemaphoreGive( sem );
             snprintf( op, sizeof op, "give" );
         }
-        else if( kind < 78 )
+        else if( kind < 46 )
         {
             BaseType_t woken = pdFALSE;
-            fake_in_isr = 1;
+            isr_enter();
             r = xSemaphoreGiveFromISR( sem, &woken );
-            fake_in_isr = 0;
-            portYIELD_FROM_ISR( woken );
+            isr_exit( woken );
             snprintf( op, sizeof op, "give_isr" );
         }
-        else if( kind < 86 )
+        else if( kind < 51 )
         {
             if( cur_slot >= 0 )
             {
-                TickType_t ticks = ( arg % 3 == 0 ) ? 0 : 1 + ( arg >> 2 ) % 6;
-
-                if( ticks > 0 )
-                {
-                    struct call c = { CALL_TAKE, ticks };
-                    r = start_call( cur_slot, c );
-                }
-                else
-                {
-                    r = xSemaphoreTake( sem, 0 );
-                }
-
-                snprintf( op, sizeof op, "take %lu", ( unsigned long ) ticks );
+                struct call c = { CALL_TAKE, block_ticks( arg ), 0, 0 };
+                r = call_from_task( cur_slot, c );
+                snprintf( op, sizeof op, "take %lu", ( unsigned long ) c.ticks );
             }
             else
             {
                 snprintf( op, sizeof op, "noop" );
             }
+        }
+        else if( kind < 85 )
+        {
+            r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
         else if( kind < 96 )
         {
