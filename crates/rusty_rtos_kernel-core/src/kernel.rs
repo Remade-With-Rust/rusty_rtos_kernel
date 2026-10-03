@@ -1566,6 +1566,20 @@ where
     /// Worth queue -7, group -3 on its own.
     #[cold]
     pub(crate) fn port_yield(&mut self) {
+        // Two cores, a committing port, inside a kernel critical section: the
+        // C does not yield here, it PENDS -- `prvYieldCore` and
+        // `vTaskYieldWithinAPI` both set `xYieldPendings[ core ]` while the
+        // nesting is non-zero -- and the yield is the section's exit
+        // (`exit_critical`). Yielding here as well counted a yield the C
+        // never makes whenever the switch then declined, under a suspended
+        // scheduler (two-core `StreamBufferDemo`).
+        if C::NUMBER_OF_CORES > 1 && P::COMMITS_SWITCH {
+            let core = self.core();
+            if self.nesting.get(core).copied().unwrap_or(0) > 0 {
+                self.set_pending_on(core, true);
+                return;
+            }
+        }
         // The port's section, not the kernel's: on two cores the kernel's
         // outermost exit is a yield point, and a yield is not one of its
         // own -- on a port that commits its own switches the flag is still
@@ -1583,7 +1597,17 @@ where
             // The exception cannot fire yet -- `exit_critical` below is
             // what unmasks -- so the kernel is consistent at the moment it
             // is taken.
-            self.port.yield_now();
+            //
+            // Two cores with the scheduler suspended: the C's yield is
+            // counted and its switch DECLINES (`vTaskSwitchContext` re-pends
+            // under `uxSchedulerSuspended`), so the yield that takes the
+            // switch is the one the resume makes. Requesting it here would
+            // hand a port that counts yields one request where the C made two
+            // (two-core `StreamBufferDemo`: a send's completion notifying a
+            // higher-priority reader inside the send's suspension).
+            if !(C::NUMBER_OF_CORES > 1 && self.suspended_depth != 0) {
+                self.port.yield_now();
+            }
         } else {
             // A STACKLESS kernel: moving `current` IS the switch, because
             // no task owns a stack. This is the path every corpus
@@ -2612,7 +2636,15 @@ where
         if !T::EMITS {
             return;
         }
-        if self.cur() == caller {
+        // "Still the running task" has two halves on a port that commits its
+        // own switches. A stackless port moves `current` at the yield, so the
+        // first test says it all; a committing port takes the switch AFTER
+        // the call (PendSV, the two-core sim's runner), so `current` still
+        // names the caller while a yield this core owes is about to take it
+        // away -- and the C, switched at the yield, prints this line only
+        // when the task runs again (two-core TaskNotify, tick 574: an
+        // `xTimerStart` that readied the daemon).
+        if self.cur() == caller && !(P::COMMITS_SWITCH && self.pending_here()) {
             let tick = self.tick;
             self.note_exits();
             match owed {

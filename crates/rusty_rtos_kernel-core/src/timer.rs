@@ -1017,26 +1017,61 @@ where
     /// # Errors
     /// As the queue receive.
     pub fn process_one_timer_command(&mut self, ticks: u64) -> Result<Wait<bool>> {
-        let slot = match self.queue_receive(self.timer_queue, ticks) {
-            Ok(Ready(slot)) => slot,
-            Ok(Wait::Blocked) => return Ok(Wait::Blocked),
-            Err(_) => return Ok(Ready(false)),
-        };
-        let message = self
-            .timer_messages
-            .get(slot as usize)
-            .copied()
-            .unwrap_or_default();
+        match self.timer_receive_command(ticks)? {
+            Wait::Blocked => Ok(Wait::Blocked),
+            Ready(None) => Ok(Ready(false)),
+            Ready(Some(message)) => {
+                self.timer_execute_command(message)?;
+                Ok(Ready(true))
+            }
+        }
+    }
 
+    /// The first half of [`Kernel::process_one_timer_command`]: the
+    /// `xQueueReceive` of `prvProcessReceivedCommands`'s loop: the message,
+    /// for [`Kernel::timer_execute_command`], or `None` for an empty queue.
+    ///
+    /// A COPY of the message, as the C copies it into the daemon's local
+    /// `xMessage`: the receive frees the ring slot it sat in, and a post
+    /// between the two halves -- the tick hook's, say -- can reuse it.
+    ///
+    /// The halves are separate for a daemon that has to stop BETWEEN them.
+    /// On two cores the receive is a top-level call that leaves a critical
+    /// section, so it ends the daemon's turn (the two-core contract), and
+    /// what the command then does -- a callback, the `vPortFree` a delete
+    /// costs -- happens in the turns after. One call for both put the
+    /// daemon a turn ahead of the C (two-core `TaskNotify`, a delete).
+    ///
+    /// # Errors
+    /// As the queue receive.
+    pub fn timer_receive_command(&mut self, ticks: u64) -> Result<Wait<Option<Message>>> {
+        match self.queue_receive(self.timer_queue, ticks) {
+            Ok(Ready(slot)) => Ok(Ready(Some(
+                self.timer_messages
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or_default(),
+            ))),
+            Ok(Wait::Blocked) => Ok(Wait::Blocked),
+            Err(_) => Ok(Ready(None)),
+        }
+    }
+
+    /// The second half of [`Kernel::process_one_timer_command`]: carry out
+    /// the command [`Kernel::timer_receive_command`] took.
+    ///
+    /// # Errors
+    /// As the list operations.
+    pub fn timer_execute_command(&mut self, message: Message) -> Result<()> {
         if message.command.id() < 0 {
             // A pended function call: the daemon just runs it.
             H::pended(self, message.function, message.param1, message.value);
-            return Ok(Ready(true));
+            return Ok(());
         }
 
         let timer = message.timer;
         if self.timers.resolve(timer).is_err() {
-            return Ok(Ready(true));
+            return Ok(());
         }
         let item = Self::timer_item(timer);
         // `remove` is its own guard: it answers `NotActive` for an item
@@ -1104,7 +1139,7 @@ where
             // the first delete onwards.
             self.account_for_allocation();
         }
-        Ok(Ready(true))
+        Ok(())
     }
 
     /// Which timer a list item belongs to.
