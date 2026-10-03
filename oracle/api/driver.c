@@ -1849,6 +1849,28 @@ static const struct row sweep_notaset[] =
     { 0, NOTASET, 0, 0, 1 },
 };
 
+/* prvInsertTimerInActiveList's overflow arm: a command SENT before the tick
+ * wraps and PROCESSED after it. 584 ticks reach 0xFFFFFFF0; a one-shot timer
+ * of period 6 is created and started there (kind 75: the first op on slot 0
+ * creates it, arg 0x50 for period 6; then arg 0x100 is `tstart`), so its
+ * expiry is 0xFFFFFFF6. The daemon (priority 2) cannot run while t3
+ * (priority 3) stays ready, so 18 more ticks take the clock past the wrap to
+ * 2 with the command still queued. Then t3 sleeps (kind 82, arg 0x4700:
+ * dlyuntil 5); two ticks of time slicing hand priority 2 to the daemon
+ * before t3 wakes at 5, and it processes the start with xTimeNow <
+ * xCommandTime and the expiry >= xCommandTime: the C counts the timer as
+ * expired at once and runs its callback. `tactive` (arg 0xA00) watches. */
+static const struct row sweep_wrapcmd[] =
+{
+    { 0, 91, 0, 0,       584 },
+    { 0, 75, 0, 0x50u,   1   },
+    { 0, 75, 0, 0x100u,  1   },
+    { 0, 91, 0, 0,       18  },
+    { 0, 82, 0, 0x4700u, 1   },
+    { 0, 91, 0, 0,       2   },
+    { 0, 75, 0, 0xA00u,  3   },
+};
+
 static const struct row * sweep;
 static unsigned sweep_rows;
 static unsigned sweep_pos;
@@ -1914,6 +1936,11 @@ int main( int argc,
         {
             sweep = sweep_notaset;
             sweep_rows = sizeof sweep_notaset / sizeof sweep_notaset[ 0 ];
+        }
+        else if( strcmp( argv[ 3 ], "wrapcmd" ) == 0 )
+        {
+            sweep = sweep_wrapcmd;
+            sweep_rows = sizeof sweep_wrapcmd / sizeof sweep_wrapcmd[ 0 ];
         }
         else
         {

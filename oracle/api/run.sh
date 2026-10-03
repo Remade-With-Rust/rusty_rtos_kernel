@@ -26,7 +26,7 @@ for cores in 1 2; do
     # The authored sweeps (plan P3): short hand-written scripts for the arms
     # the random one cannot reach, committed whole.
     mkdir -p "$here/sweeps"
-    for sweep in overflow notaset; do
+    for sweep in overflow notaset wrapcmd; do
         "$here/api$cores" "$SEED" 0 "$sweep" > "$here/sweeps/api$cores-$sweep.trace"
         echo "wrote $(wc -l < "$here/sweeps/api$cores-$sweep.trace") lines to sweeps/api$cores-$sweep.trace"
     done
