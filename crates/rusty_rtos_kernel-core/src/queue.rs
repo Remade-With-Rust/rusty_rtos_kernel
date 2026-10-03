@@ -1718,11 +1718,11 @@ where
             // is a null test, a bounds check, a generation compare and an
             // `Option` unwrap -- all of it repeated to reach the same slot.
             // The unlock is written on the SAME lookup that read the lock,
-            // whenever the loop below is not going to run -- which is every
+            // whenever the drain below is not going to run -- which is every
             // call where nothing was sent while the queue was held, i.e. the
             // common one. It used to take a second `resolve_mut` after the
             // loop to store a value already known here.
-            let (mut tx_lock, container) = match self.queues.resolve_mut(queue) {
+            let (tx_lock, container) = match self.queues.resolve_mut(queue) {
                 Ok(q) => {
                     // The container is read only when queue sets exist. With
                     // `USE_QUEUE_SETS` false nothing ever writes `set_container`,
@@ -1744,38 +1744,15 @@ where
                 }
                 Err(_) => (UNLOCKED, QueueHandle::NULL),
             };
-            let tx_looped = tx_lock > LOCKED_UNMODIFIED;
-            while tx_lock > LOCKED_UNMODIFIED {
-                if C::USE_QUEUE_SETS && !container.is_null() {
-                    if C::USE_QUEUE_SETS && self.notify_queue_set_container(queue)? {
-                        self.missed_yield();
-                    }
-                    // Wrapping: the loop runs only while this is above
-                    // `LOCKED_UNMODIFIED`, so one off it stays in range.
-                    tx_lock = tx_lock.wrapping_sub(1);
-                    continue;
-                }
-                let receivers = Self::queue_receive_list(queue);
-                if self.lists.is_empty_of(receivers) {
-                    break;
-                }
-                if self.remove_from_event_list(receivers)? {
-                    self.missed_yield();
-                }
-                // Wrapping: bounded by the loop, as above.
-                tx_lock = tx_lock.wrapping_sub(1);
-            }
-            if tx_looped {
-                if let Ok(q) = self.queues.resolve_mut(queue) {
-                    q.tx_lock = UNLOCKED;
-                }
+            if tx_lock > LOCKED_UNMODIFIED {
+                self.unlock_drain::<false>(queue, tx_lock, container)?;
             }
         }
         self.exit_critical();
         self.enter_critical();
         {
             // Same trade as the tx half above.
-            let mut rx_lock = match self.queues.resolve_mut(queue) {
+            let rx_lock = match self.queues.resolve_mut(queue) {
                 Ok(q) => {
                     let read = q.rx_lock;
                     if read <= LOCKED_UNMODIFIED {
@@ -1785,25 +1762,68 @@ where
                 }
                 Err(_) => UNLOCKED,
             };
-            let rx_looped = rx_lock > LOCKED_UNMODIFIED;
-            while rx_lock > LOCKED_UNMODIFIED {
-                let senders = Self::queue_send_list(queue);
-                if self.lists.is_empty_of(senders) {
-                    break;
-                }
-                if self.remove_from_event_list(senders)? {
-                    self.missed_yield();
-                }
-                // Wrapping: bounded by the loop, as above.
-                rx_lock = rx_lock.wrapping_sub(1);
-            }
-            if rx_looped {
-                if let Ok(q) = self.queues.resolve_mut(queue) {
-                    q.rx_lock = UNLOCKED;
-                }
+            if rx_lock > LOCKED_UNMODIFIED {
+                self.unlock_drain::<true>(queue, rx_lock, QueueHandle::NULL)?;
             }
         }
         self.exit_critical();
+        Ok(())
+    }
+
+    /// Either half of [`Kernel::unlock_queue`] when an interrupt used the
+    /// queue while it was locked: wake one waiter per operation it made
+    /// (`RX` false: receivers, for its sends; true: senders, for its
+    /// receives), then unlock that half.
+    ///
+    /// Out of line because the loop is what makes `unlock_queue` CALL
+    /// anything, and a body that calls saves six registers on entry. Nearly
+    /// every unlock finds nothing to drain (BlockQ: all 21,490), and it was
+    /// paying that frame for a loop it never ran.
+    ///
+    /// In line under `small`: out of line it is +232 B on the flash profile
+    /// (17,776 -> 18,008), a speed trade that profile does not make. In line
+    /// it is +8 B there (17,784), which is LLVM picking a different compare
+    /// for the loop counter; three arrangements of the same loop read +8,
+    /// +8 and +16, so the 8 is layout, not work.
+    #[cfg_attr(not(feature = "small"), cold, inline(never))]
+    #[cfg_attr(feature = "small", inline(always))]
+    fn unlock_drain<const RX: bool>(
+        &mut self,
+        queue: QueueHandle,
+        mut lock: i8,
+        container: QueueHandle,
+    ) -> Result<()> {
+        while lock > LOCKED_UNMODIFIED {
+            if !RX && C::USE_QUEUE_SETS && !container.is_null() {
+                if C::USE_QUEUE_SETS && self.notify_queue_set_container(queue)? {
+                    self.missed_yield();
+                }
+                // Wrapping: the loop runs only while this is above
+                // `LOCKED_UNMODIFIED`, so one off it stays in range.
+                lock = lock.wrapping_sub(1);
+                continue;
+            }
+            let waiters = if RX {
+                Self::queue_send_list(queue)
+            } else {
+                Self::queue_receive_list(queue)
+            };
+            if self.lists.is_empty_of(waiters) {
+                break;
+            }
+            if self.remove_from_event_list(waiters)? {
+                self.missed_yield();
+            }
+            // Wrapping: bounded by the loop, as above.
+            lock = lock.wrapping_sub(1);
+        }
+        if let Ok(q) = self.queues.resolve_mut(queue) {
+            if RX {
+                q.rx_lock = UNLOCKED;
+            } else {
+                q.tx_lock = UNLOCKED;
+            }
+        }
         Ok(())
     }
 
