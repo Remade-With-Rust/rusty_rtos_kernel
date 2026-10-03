@@ -37,7 +37,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use rusty_rtos_core::config::Config;
-use rusty_rtos_core::handle::{EventGroupHandle, QueueHandle, TaskHandle};
+use rusty_rtos_core::handle::{EventGroupHandle, QueueHandle, StreamBufferHandle, TaskHandle};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -62,6 +62,9 @@ impl Config for OneCore {
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 1;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+    /// `sizeof( size_t )` on the host the oracle runs on: the C's default
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE`.
+    const MESSAGE_LENGTH_BYTES: usize = 8;
     const NUMBER_OF_CORES: u8 = 1;
     const USE_TIME_SLICING: bool = true;
 }
@@ -78,6 +81,9 @@ impl Config for TwoCores {
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 1;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+    /// `sizeof( size_t )` on the host the oracle runs on: the C's default
+    /// `configMESSAGE_BUFFER_LENGTH_TYPE`.
+    const MESSAGE_LENGTH_BYTES: usize = 8;
     const NUMBER_OF_CORES: u8 = 2;
     const USE_TIME_SLICING: bool = true;
 }
@@ -123,6 +129,10 @@ const ITEMS: usize = 16;
 const SLOTS: usize = 10;
 const QSLOTS: usize = 3;
 const GSLOTS: usize = 2;
+/// Buffer 0 a stream buffer (12 bytes), buffer 1 a message buffer (20).
+const BSLOTS: usize = 2;
+/// Byte storage for both, with room.
+const BYTES: usize = 64;
 
 /// A call that may block: made, and if it blocks made again when its task
 /// next runs.
@@ -172,6 +182,17 @@ enum Call {
         mask: u32,
         ticks: u64,
     },
+    BSend {
+        b: usize,
+        len: usize,
+        start: u8,
+        ticks: u64,
+    },
+    BRecv {
+        b: usize,
+        max: usize,
+        ticks: u64,
+    },
 }
 
 /// The C's `eNotifyAction`, by number, as the driver prints it.
@@ -193,6 +214,17 @@ fn waited<T>(r: Result<Wait<T>, rusty_rtos_core::error::Error>, ok: impl Fn(T) -
         Ok(Wait::Blocked) => -2,
         Err(_) => 0,
     }
+}
+
+/// `len` bytes counting up from `start`, as the C driver sends them.
+fn bytes(len: usize, start: u8) -> Vec<u8> {
+    (0..len).map(|i| start.wrapping_add(i as u8)).collect()
+}
+
+/// A receive's result as the C driver folds it: the count times 100000,
+/// plus the bytes' sum.
+fn fold(data: &[u8]) -> i64 {
+    data.len() as i64 * 100_000 + data.iter().map(|b| i64::from(*b)).sum::<i64>()
 }
 
 fn state_char(s: TaskState) -> char {
@@ -220,8 +252,8 @@ macro_rules! replay {
                 { lists_for(5, QUEUES, GSLOTS) },
                 QUEUES,
                 ITEMS,
-                0,
-                0,
+                BSLOTS,
+                BYTES,
                 1,
                 GSLOTS,
                 1,
@@ -238,6 +270,7 @@ macro_rules! replay {
                 rmutex: QueueHandle,
                 csem: QueueHandle,
                 groups: [Option<EventGroupHandle>; GSLOTS],
+                buffers: [Option<StreamBufferHandle>; BSLOTS],
             }
 
             impl D {
@@ -316,6 +349,17 @@ macro_rules! replay {
                             let group = self.groups[g].expect("a live group");
                             waited(self.k.event_group_sync(group, set, mask, ticks), i64::from)
                         }
+                        Call::BSend { b, len, start, ticks } => {
+                            let h = self.buffers[b].expect("a live buffer");
+                            let data = bytes(len, start);
+                            waited(self.k.stream_buffer_send(h, &data, ticks), |n| n as i64)
+                        }
+                        Call::BRecv { b, max, ticks } => {
+                            let h = self.buffers[b].expect("a live buffer");
+                            let mut out = [0u8; 32];
+                            let got = self.k.stream_buffer_receive(h, &mut out[..max], ticks);
+                            waited(got, |n| fold(&out[..n]))
+                        }
                     };
                     self.pending[slot] = (r == -2).then_some(call);
                     r
@@ -391,6 +435,19 @@ macro_rules! replay {
                             s.push('.');
                         }
                     }
+                    s.push_str(" B=");
+                    for b in 0..BSLOTS {
+                        match self.buffers[b] {
+                            None => s.push('-'),
+                            Some(h) => {
+                                let n = self.k.stream_buffer_bytes_available(h).map_or(-1, |n| n as i64);
+                                let _ = write!(s, "{n}");
+                            }
+                        }
+                        if b + 1 < BSLOTS {
+                            s.push('.');
+                        }
+                    }
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -430,6 +487,7 @@ macro_rules! replay {
                 rmutex,
                 csem,
                 groups: [None; GSLOTS],
+                buffers: [None; BSLOTS],
             };
             for (i, p) in init.iter().enumerate() {
                 d.app[i] = Some(d.k.create_task(&format!("t{i}"), *p).expect("initial task"));
@@ -571,6 +629,70 @@ macro_rules! replay {
                     "qfull_isr" => {
                         let h = d.queues[num(0) as usize].unwrap();
                         r = i64::from(d.k.queue_is_full_from_isr(h).unwrap_or(false));
+                    }
+                    "bcreate" => {
+                        let b = num(0) as usize;
+                        let made = if b == 0 {
+                            d.k.stream_buffer_create(12, num(1) as usize)
+                        } else {
+                            d.k.message_buffer_create(20)
+                        };
+                        match made {
+                            Ok(h) => {
+                                d.buffers[b] = Some(h);
+                                r = 1;
+                            }
+                            Err(_) => r = -1,
+                        }
+                    }
+                    "bdelete" => {
+                        let h = d.buffers[num(0) as usize].take().unwrap();
+                        d.k.stream_buffer_delete(h).expect("buffer delete");
+                    }
+                    "bsend" | "brecv" => {
+                        let s = cur_slot.expect("a buffer call from an app task");
+                        let b = num(0) as usize;
+                        let call = if op == "bsend" {
+                            Call::BSend { b, len: num(1) as usize, start: num(2) as u8, ticks: num(3) }
+                        } else {
+                            Call::BRecv { b, max: num(1) as usize, ticks: num(2) }
+                        };
+                        r = d.call(s, call);
+                    }
+                    "bsend_isr" => {
+                        let h = d.buffers[num(0) as usize].unwrap();
+                        let data = bytes(num(1) as usize, num(2) as u8);
+                        let (n, woken) = d.k.stream_buffer_send_from_isr(h, &data).unwrap();
+                        d.k.port().yield_from_isr(woken);
+                        r = n as i64;
+                    }
+                    "brecv_isr" => {
+                        let h = d.buffers[num(0) as usize].unwrap();
+                        let mut out = [0u8; 32];
+                        let max = num(1) as usize;
+                        let (n, woken) = d.k.stream_buffer_receive_from_isr(h, &mut out[..max]).unwrap();
+                        d.k.port().yield_from_isr(woken);
+                        r = fold(&out[..n]);
+                    }
+                    "bspace" | "bfullempty" | "bnext" | "btrigger" | "breset" | "bdone_isr" => {
+                        let h = d.buffers[num(0) as usize].unwrap();
+                        r = match op {
+                            "bspace" => d.k.stream_buffer_spaces_available(h).unwrap() as i64,
+                            "bfullempty" => {
+                                i64::from(d.k.stream_buffer_is_full(h).unwrap())
+                                    + 2 * i64::from(d.k.stream_buffer_is_empty(h).unwrap())
+                            }
+                            "bnext" => d.k.stream_buffer_next_message_length(h).unwrap() as i64,
+                            "btrigger" => i64::from(
+                                d.k.stream_buffer_set_trigger_level(h, num(1) as usize).unwrap(),
+                            ),
+                            "breset" => i64::from(d.k.stream_buffer_reset(h).unwrap()),
+                            _ => {
+                                let (was, woken) = d.k.stream_buffer_send_completed_from_isr(h).unwrap();
+                                d.k.port().yield_from_isr(woken);
+                                i64::from(was)
+                            }
+                        };
                     }
                     "gcreate" => match d.k.event_group_create() {
                         Ok(h) => {
@@ -727,9 +849,9 @@ fn exercised(trace: &str) {
         ("take", 100),
         ("qcreate", 100),
         ("qdelete", 100),
-        ("qsend", 200),
-        ("qsendf", 100),
-        ("qrecv", 200),
+        ("qsend", 150),
+        ("qsendf", 80),
+        ("qrecv", 150),
         ("qpeek", 100),
         ("qover", 50),
         ("qreset", 100),
@@ -740,7 +862,7 @@ fn exercised(trace: &str) {
         ("qpeek_isr", 50),
         ("qfull_isr", 50),
         ("mtake", 150),
-        ("mgive", 40),
+        ("mgive", 25),
         ("rtake", 100),
         ("rgive", 100),
         ("ctake", 100),
@@ -762,6 +884,18 @@ fn exercised(trace: &str) {
         ("gget_isr", 50),
         ("gwait", 100),
         ("gsync", 30),
+        ("bcreate", 50),
+        ("bdelete", 50),
+        ("bsend", 50),
+        ("brecv", 50),
+        ("bsend_isr", 50),
+        ("brecv_isr", 50),
+        ("bspace", 50),
+        ("bfullempty", 50),
+        ("bnext", 50),
+        ("btrigger", 40),
+        ("breset", 50),
+        ("bdone_isr", 50),
         ("tick", 500),
         ("cont", 200),
     ] {

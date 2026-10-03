@@ -18,9 +18,11 @@
 //! the machine the oracle runs on. That width is in the arithmetic of every
 //! message send, so it is a [`Config`] const here rather than a guess.
 
+use core::num::NonZeroU64;
+
 use rusty_rtos_core::config::Config;
 use rusty_rtos_core::error::{Error, Result};
-use rusty_rtos_core::handle::{StreamBufferHandle, TaskHandle};
+use rusty_rtos_core::handle::{QueueHandle, StreamBufferHandle, TaskHandle};
 use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -124,6 +126,12 @@ where
 {
     /// How many bytes a message buffer spends on each message's length.
     pub const MESSAGE_LENGTH_BYTES: usize = C::MESSAGE_LENGTH_BYTES;
+
+    /// The key a blocking `xStreamBufferSend` files its `TimeOut_t` under
+    /// in the task's wait frame, which is keyed by queue. Index `u32::MAX`
+    /// is past `Handle::MAX_INDEX`, so no queue is ever this one, and a task
+    /// is inside one blocking call at a time.
+    const STREAM_SEND_WAIT: QueueHandle = QueueHandle::from_parts(u32::MAX, 1);
 
     /// `xStreamBufferCreate`.
     ///
@@ -412,24 +420,6 @@ where
 
     // ---------------------------------------------------------- sending --
 
-    /// `xTaskCheckForTimeOut`, the tail of `xStreamBufferSend`'s do-while.
-    ///
-    /// The C wraps the sample-and-wait in
-    /// `do { ... } while( xTaskCheckForTimeOut( &xTimeOut, &xTicksToWait )
-    /// == pdFALSE )`, and that call takes a critical section of its own
-    /// (tasks.c:5703) -- so on the sim it is one more exit, and one more
-    /// sixteenth of a tick.
-    ///
-    /// It runs **only when the wait actually blocked**: a send that finds
-    /// the space it needs on the first pass leaves the loop with a `break`
-    /// from inside the sampling section and never reaches the condition.
-    /// `xStreamBufferReceive` has no loop and no such call, which is why
-    /// this is on the send alone.
-    fn check_for_time_out(&mut self) {
-        self.enter_critical();
-        self.exit_critical();
-    }
-
     /// `xStreamBufferSend`.
     ///
     /// Returns how many bytes went in. `Blocked` means the caller must
@@ -540,6 +530,10 @@ where
             required = max_reported;
         }
 
+        // The do-while's condition, `xTaskCheckForTimeOut(..) == pdFALSE`:
+        // `Some(left)` goes round again with what is left of the block time,
+        // `None` leaves the loop. Set by whichever arm finished a wait.
+        let mut again: Option<u64> = None;
         let mut sampled = self.take_stream_resume(caller);
         if let Some(space) = sampled {
             // Resuming after the exit that sampled the space. The same
@@ -547,14 +541,19 @@ where
             // xRequiredSpace` below the exit, against the sample taken
             // inside it, so a task preempted there still blocks.
             if space < required {
-                match self.notify_wait(notify_index, 0, 0, ticks)? {
-                    Blocked => return Ok(Blocked),
+                // What is left of the block time: the frame is this call's,
+                // so `begin_wait` answers it without touching it.
+                let left = self
+                    .begin_wait(caller, Self::STREAM_SEND_WAIT, ticks)
+                    .unwrap_or(0);
+                match self.notify_wait(notify_index, 0, 0, left)? {
+                    Blocked => {
+                        self.park_stream_sample(caller, space);
+                        return Ok(Blocked);
+                    }
                     Ready(_) => {
                         self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
-                        self.check_for_time_out();
-                        // The sample it went to sleep on is stale now, and
-                        // the C re-reads whenever that sample was zero.
-                        sampled = None;
+                        again = self.check_for_timeout(caller).map(NonZeroU64::get);
                     }
                 }
             }
@@ -563,14 +562,16 @@ where
                 Blocked => return Ok(Blocked),
                 Ready(_) => {}
             }
-            // Spelled out at all three resume arms rather than factored into a
-            // helper the way the receive side's `after_stream_wait` is. Factoring
-            // it measured **+28 B** on 2026-09-25, identical with and without
-            // `#[inline(never)]` -- so LLVM outlines it either way, and one shared
-            // body plus three calls costs more than three copies that each fold
-            // against their own arm.
+            // Spelled out at both resume arms and in the loop rather than
+            // factored into a helper the way the receive side's
+            // `after_stream_wait` is. Factoring it measured **+28 B** on
+            // 2026-09-25, identical with and without `#[inline(never)]` -- so
+            // LLVM outlines it either way, and one shared body plus three
+            // calls costs more than three copies that each fold against their
+            // own arm.
             self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
-            self.check_for_time_out();
+            sampled = Some(self.stream_sample(caller));
+            again = self.check_for_timeout(caller).map(NonZeroU64::get);
         } else if ticks > 0 {
             // `vTaskSetTimeOutState( &xTimeOut )` (stream_buffer.c:878),
             // which the C runs before it looks at the buffer at all.
@@ -585,12 +586,25 @@ where
             // exit resumes BELOW it, so re-entry must not buy it again.
             if !self.take_stream_timed(caller) {
                 self.enter_critical();
+                // A fresh `TimeOut_t` every call, as the C's is a local:
+                // a frame an erroring call left behind must not be reused.
+                self.end_wait(caller);
+                let _ = self.begin_wait(caller, Self::STREAM_SEND_WAIT, ticks);
                 self.exit_critical();
                 if self.cur() != caller {
                     self.set_stream_timed(caller);
                     return Ok(Blocked);
                 }
             }
+            again = Some(ticks);
+        }
+
+        // `do { ... } while( xTaskCheckForTimeOut( &xTimeOut, &xTicksToWait )
+        // == pdFALSE )`. A wake is not a verdict: the receiver notifies on
+        // every read, and if that freed too little the C samples again and
+        // blocks again for what is left. One pass and a partial write was
+        // what the API differential caught (one core, step 9106).
+        while let Some(left) = again {
             self.enter_critical();
             let space = self.buffers.resolve(buffer)?.spaces_available();
             let must_block = space < required;
@@ -599,6 +613,7 @@ where
                 self.buffers.resolve_mut(buffer)?.waiting_to_send = caller;
             }
             self.exit_critical();
+            sampled = Some(space);
             // That exit can release a tick, and a tick can switch this task
             // away. The C's thread stops inside the exit and everything
             // below it runs when the task is resumed — with the sample it
@@ -607,22 +622,30 @@ where
                 self.set_stream_resume(caller, space);
                 return Ok(Blocked);
             }
-            if must_block {
-                // `traceBLOCKING_ON_STREAM_BUFFER_SEND` is not one of the
-                // harness's hooks, so blocking says nothing on either side.
-                match self.notify_wait(notify_index, 0, 0, ticks)? {
-                    Blocked => return Ok(Blocked),
-                    Ready(_) => {
-                        self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
-                        self.check_for_time_out();
-                    }
+            if !must_block {
+                break;
+            }
+            // `traceBLOCKING_ON_STREAM_BUFFER_SEND` is not one of the
+            // harness's hooks, so blocking says nothing on either side.
+            match self.notify_wait(notify_index, 0, 0, left)? {
+                Blocked => {
+                    self.park_stream_sample(caller, space);
+                    return Ok(Blocked);
+                }
+                Ready(_) => {
+                    self.buffers.resolve_mut(buffer)?.waiting_to_send = TaskHandle::NULL;
+                    again = self.check_for_timeout(caller).map(NonZeroU64::get);
                 }
             }
         }
+        self.end_wait(caller);
 
+        // `if( xSpace == 0 ) xSpace = xStreamBufferSpacesAvailable(..)`: the
+        // last sample stands, stale or not, unless it was zero -- which a
+        // send that never sampled (no block time) always is.
         let space = match sampled.take() {
-            Some(space) => space,
-            None => self.buffers.resolve(buffer)?.spaces_available(),
+            Some(space) if space != 0 => space,
+            _ => self.buffers.resolve(buffer)?.spaces_available(),
         };
         let written = self.write_message(buffer, data, space, required)?;
         if written > 0 {
@@ -941,6 +964,26 @@ where
         let (_, woken) = self.notify_from_isr(waiting, index, 0, NotifyAction::None)?;
         self.buffers.resolve_mut(buffer)?.waiting_to_receive = TaskHandle::NULL;
         Ok(woken)
+    }
+
+    /// `xStreamBufferSendCompletedFromISR` with the C's ANSWER: whether a task
+    /// was waiting to receive (and so was notified), and whether waking it
+    /// wants a switch.
+    ///
+    /// [`Kernel::send_completed_from_isr`] does the same work but answers
+    /// only the second, which is all a `sbSEND_COMPLETED` replacement needs;
+    /// the C function's own return value had no Rust spelling until the API
+    /// differential (P1.6) asked for it.
+    ///
+    /// # Errors
+    /// [`Error::Gone`] for a stale handle.
+    pub fn stream_buffer_send_completed_from_isr(
+        &mut self,
+        buffer: StreamBufferHandle,
+    ) -> Result<(bool, Woken)> {
+        let waiting = !self.buffers.resolve(buffer)?.waiting_to_receive.is_null();
+        let woken = self.send_completed_from_isr(buffer)?;
+        Ok((waiting, woken))
     }
 
     /// `sbRECEIVE_COMPLETED`.

@@ -46,6 +46,8 @@
 #include "task.h"
 #include "timers.h"
 #include "event_groups.h"
+#include "stream_buffer.h"
+#include "message_buffer.h"
 
 #define SLOTS     10 /* app tasks */
 #define QSLOTS    3  /* queues */
@@ -68,6 +70,11 @@ static SemaphoreHandle_t rmutex; /* a recursive mutex */
 static SemaphoreHandle_t csem;   /* a counting semaphore, max 3, from 1 */
 #define GSLOTS    2                /* event groups */
 static EventGroupHandle_t group[ GSLOTS ];
+/* Buffer 0 is a stream buffer of 12 bytes, buffer 1 a message buffer of 20. */
+#define BSLOTS    2
+#define SB_SIZE   12
+#define MB_SIZE   20
+static StreamBufferHandle_t buffer[ BSLOTS ];
 static unsigned queue_len[ QSLOTS ];
 
 static void body( void * p )
@@ -84,7 +91,49 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC, CALL_BSEND, CALL_BRECV };
+
+/* Send `len` bytes counting up from `start` -- the replay builds the same
+ * bytes from the same two numbers. */
+static long buffer_send( int b,
+                         unsigned len,
+                         unsigned start,
+                         TickType_t ticks )
+{
+    uint8_t data[ 32 ];
+
+    for( unsigned i = 0; i < len; i++ )
+    {
+        data[ i ] = ( uint8_t ) ( start + i );
+    }
+
+    return ( long ) xStreamBufferSend( buffer[ b ], data, len, ticks );
+}
+
+/* A receive's result: how many bytes, times 100000, plus their sum -- a
+ * wrong byte shows as surely as a wrong count. */
+static long fold( size_t n,
+                  const uint8_t * data )
+{
+    long sum = 0;
+
+    for( size_t i = 0; i < n; i++ )
+    {
+        sum += data[ i ];
+    }
+
+    return ( long ) n * 100000 + sum;
+}
+
+static long buffer_recv( int b,
+                         unsigned max,
+                         TickType_t ticks )
+{
+    uint8_t data[ 32 ];
+    size_t n = xStreamBufferReceive( buffer[ b ], data, max, ticks );
+
+    return fold( n, data );
+}
 
 static int is_group_call( enum call_kind k )
 {
@@ -202,6 +251,14 @@ static void coro_main( void )
         case CALL_GSYNC:
             coro_result[ s ] = ( long ) xEventGroupSync( group[ c->q ], c->value, c->a, c->ticks );
             break;
+
+        case CALL_BSEND:
+            coro_result[ s ] = buffer_send( c->q, c->a, c->value, c->ticks );
+            break;
+
+        case CALL_BRECV:
+            coro_result[ s ] = buffer_recv( c->q, c->a, c->ticks );
+            break;
     }
 
     coro_done[ s ] = 1;
@@ -267,6 +324,23 @@ static int group_has_waiter( int g )
     for( int i = 0; i < SLOTS; i++ )
     {
         if( pending[ i ] && is_group_call( coro_call[ i ].kind ) && ( coro_call[ i ].q == g ) )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Whether a task is blocked in a `kind` call on buffer b. A stream buffer
+ * has ONE reader and ONE writer: the C asserts if a second task blocks on
+ * the same side, so the script never asks. */
+static int buffer_has_waiter( int b,
+                              int kind )
+{
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( pending[ i ] && ( ( int ) coro_call[ i ].kind == kind ) && ( coro_call[ i ].q == b ) )
         {
             return 1;
         }
@@ -437,6 +511,22 @@ static void line( unsigned step,
         printf( g + 1 < GSLOTS ? "." : "" );
     }
 
+    printf( " B=" );
+
+    for( int b = 0; b < BSLOTS; b++ )
+    {
+        if( buffer[ b ] == NULL )
+        {
+            printf( "-" );
+        }
+        else
+        {
+            printf( "%lu", ( unsigned long ) xStreamBufferBytesAvailable( buffer[ b ] ) );
+        }
+
+        printf( b + 1 < BSLOTS ? "." : "" );
+    }
+
     printf( "\n" );
 }
 
@@ -483,6 +573,8 @@ static long call_from_task( int s,
         case CALL_NWAIT:  return notify_wait( c.a, c.b, 0 );
         case CALL_GWAIT:  return ( long ) xEventGroupWaitBits( group[ c.q ], c.a, c.b & 1, ( c.b >> 1 ) & 1, 0 );
         case CALL_GSYNC:  return ( long ) xEventGroupSync( group[ c.q ], c.value, c.a, 0 );
+        case CALL_BSEND:  return buffer_send( c.q, c.a, c.value, 0 );
+        case CALL_BRECV:  return buffer_recv( c.q, c.a, 0 );
     }
 
     return 0;
@@ -937,6 +1029,173 @@ static long group_op( int cur_slot,
     }
 }
 
+/* The buffer family: buffer 0 a stream buffer (12 bytes, trigger level
+ * 1..3), buffer 1 a message buffer (20 bytes; each message also costs
+ * sizeof( size_t ) of length prefix -- eight here). */
+static long buffer_op( int cur_slot,
+                       unsigned slot,
+                       unsigned arg,
+                       char * op,
+                       size_t n )
+{
+    int b = ( int ) ( slot % BSLOTS );
+    unsigned which = ( arg >> 8 ) % 13;
+    unsigned len = 1 + ( arg >> 12 ) % ( b == 0 ? 6 : 5 );
+    unsigned start = ( arg >> 16 ) & 0xff;
+    TickType_t ticks = block_ticks( arg );
+    BaseType_t woken = pdFALSE;
+    long r;
+
+    if( buffer[ b ] == NULL )
+    {
+        if( b == 0 )
+        {
+            unsigned trigger = 1 + arg % 3;
+            buffer[ b ] = xStreamBufferCreate( SB_SIZE, trigger );
+            snprintf( op, n, "bcreate %d %u", b, trigger );
+        }
+        else
+        {
+            buffer[ b ] = xMessageBufferCreate( MB_SIZE );
+            snprintf( op, n, "bcreate %d 0", b );
+        }
+
+        return buffer[ b ] ? 1 : -1;
+    }
+
+    switch( which )
+    {
+        case 0:
+
+            if( buffer_has_waiter( b, CALL_BSEND ) || buffer_has_waiter( b, CALL_BRECV ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            vStreamBufferDelete( buffer[ b ] );
+            buffer[ b ] = NULL;
+            snprintf( op, n, "bdelete %d", b );
+            return 0;
+
+        case 1:
+        case 2:
+        {
+            if( ( cur_slot < 0 ) || buffer_has_waiter( b, CALL_BSEND ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { CALL_BSEND, ticks, b, start, len, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "bsend %d %u %u %lu", b, len, start, ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 3:
+        case 4:
+        {
+            if( ( cur_slot < 0 ) || buffer_has_waiter( b, CALL_BRECV ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            unsigned max = 1 + ( arg >> 12 ) % 8;
+            struct call c = { CALL_BRECV, ticks, b, 0, max, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "brecv %d %u %lu", b, max, ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 5:
+        {
+            uint8_t data[ 32 ];
+
+            /* Single writer: a task blocked sending holds a stale xSpace,
+             * and a second writer under it makes the C overwrite. */
+            if( buffer_has_waiter( b, CALL_BSEND ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            for( unsigned i = 0; i < len; i++ )
+            {
+                data[ i ] = ( uint8_t ) ( start + i );
+            }
+
+            isr_enter();
+            r = ( long ) xStreamBufferSendFromISR( buffer[ b ], data, len, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "bsend_isr %d %u %u", b, len, start );
+            return r;
+        }
+
+        case 6:
+        {
+            uint8_t data[ 32 ];
+            unsigned max = 1 + ( arg >> 12 ) % 8;
+
+            /* Single reader, the same contract from the other side. */
+            if( buffer_has_waiter( b, CALL_BRECV ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            isr_enter();
+            size_t got_n = xStreamBufferReceiveFromISR( buffer[ b ], data, max, &woken );
+            isr_exit( woken );
+            snprintf( op, n, "brecv_isr %d %u", b, max );
+            return fold( got_n, data );
+        }
+
+        case 7:
+            r = ( long ) xStreamBufferSpacesAvailable( buffer[ b ] );
+            snprintf( op, n, "bspace %d", b );
+            return r;
+
+        case 8:
+            r = xStreamBufferIsFull( buffer[ b ] ) + 2 * xStreamBufferIsEmpty( buffer[ b ] );
+            snprintf( op, n, "bfullempty %d", b );
+            return r;
+
+        case 9:
+            r = ( long ) xStreamBufferNextMessageLengthBytes( buffer[ b ] );
+            snprintf( op, n, "bnext %d", b );
+            return r;
+
+        case 10:
+
+            if( b != 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            {
+                unsigned level = 1 + arg % 14; /* past SB_SIZE sometimes: refused */
+                r = xStreamBufferSetTriggerLevel( buffer[ b ], level );
+                snprintf( op, n, "btrigger %d %u", b, level );
+                return r;
+            }
+
+        case 11:
+            r = xStreamBufferReset( buffer[ b ] );
+            snprintf( op, n, "breset %d", b );
+            return r;
+
+        default:
+            isr_enter();
+            r = xStreamBufferSendCompletedFromISR( buffer[ b ], &woken );
+            isr_exit( woken );
+            snprintf( op, n, "bdone_isr %d", b );
+            return r;
+    }
+}
+
 /* ------------------------------------------------------- the script -- */
 
 int main( int argc,
@@ -1022,7 +1281,14 @@ int main( int argc,
         }
         else if( kind < 11 )
         {
-            if( ( t != NULL ) && !holds_a_mutex( t ) )
+            /* Not a mutex holder, and not a task blocked on a stream
+             * buffer: a buffer records its waiting task by HANDLE, not on a
+             * list, so deleting that task leaves the buffer pointing at a
+             * freed TCB (the first script that tried it segfaulted). */
+            int on_buffer = pending[ slot ] &&
+                            ( ( coro_call[ slot ].kind == CALL_BSEND ) || ( coro_call[ slot ].kind == CALL_BRECV ) );
+
+            if( ( t != NULL ) && !holds_a_mutex( t ) && !on_buffer )
             {
                 snprintf( op, sizeof op, "delete %u", slot );
                 app[ slot ] = NULL;
@@ -1110,21 +1376,25 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 69 )
+        else if( kind < 65 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 78 )
+        else if( kind < 74 )
         {
             r = mutex_op( cur_slot, arg, op, sizeof op );
         }
-        else if( kind < 85 )
+        else if( kind < 81 )
         {
             r = notify_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 91 )
+        else if( kind < 85 )
         {
             r = group_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 93 )
+        {
+            r = buffer_op( cur_slot, slot, arg, op, sizeof op );
         }
         else if( kind < 98 )
         {

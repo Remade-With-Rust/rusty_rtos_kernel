@@ -3377,6 +3377,23 @@ where
         }
     }
 
+    /// Keep a blocking send's last `xSpace` across the wait it parks in.
+    ///
+    /// The C's local survives the block, and a send that then TIMES OUT
+    /// writes with it -- stale -- re-reading only if it was zero. This
+    /// kernel returns at the block, so the TCB holds it instead. No marker:
+    /// the notify wait itself says the call is pending.
+    pub(crate) fn park_stream_sample(&mut self, task: TaskHandle, local: usize) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.stream_local = local;
+        }
+    }
+
+    /// The `xSpace` [`Kernel::park_stream_sample`] kept.
+    pub(crate) fn stream_sample(&self, task: TaskHandle) -> usize {
+        self.tcbs.resolve(task).map_or(0, |t| t.stream_local)
+    }
+
     /// Whether `task` has a queue call to resume below its sampling exit.
     /// Taking it clears the marker.
     pub(crate) fn take_queue_resume(&mut self, task: TaskHandle) -> QueueResume {
