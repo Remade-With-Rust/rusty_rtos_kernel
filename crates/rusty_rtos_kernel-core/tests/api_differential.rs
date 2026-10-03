@@ -137,8 +137,11 @@ const TASKS: usize = 20;
 /// The semaphore, three app queues, the mutex, the recursive mutex, the
 /// counting semaphore and the timer's command queue, with room.
 const QUEUES: usize = 12;
-/// Queue item storage: three queues of up to three, and the timer's.
-const ITEMS: usize = 16;
+/// Queue item storage: three queues of up to three, the timer's, and the
+/// queue set's nine.
+const ITEMS: usize = 32;
+/// The queue set's length: every member's every item (`SET_LEN` in the C).
+const SET_LEN: usize = 3 * QSLOTS;
 const SLOTS: usize = 10;
 const QSLOTS: usize = 3;
 const GSLOTS: usize = 2;
@@ -238,6 +241,8 @@ enum Call {
         value: u64,
         ticks: u64,
     },
+    /// Select from the set, then receive from the member it named.
+    SSelect(u64),
 }
 
 /// The C's `eNotifyAction`, by number, as the driver prints it.
@@ -341,6 +346,9 @@ macro_rules! replay {
                 csem: QueueHandle,
                 groups: [Option<EventGroupHandle>; GSLOTS],
                 buffers: [Option<StreamBufferHandle>; BSLOTS],
+                qset: QueueHandle,
+                /// Each task's `pxPreviousWakeTime`.
+                wake: [u64; SLOTS],
                 timers: [Option<TimerHandle>; TSLOTS],
                 daemon: TaskHandle,
                 timer_queue: QueueHandle,
@@ -453,9 +461,33 @@ macro_rules! replay {
                         Call::TPend { value, ticks } => {
                             waited(self.k.timer_pend_function_call(1, 0, value, ticks), i64::from)
                         }
+                        Call::SSelect(ticks) => match self.k.queue_select_from_set(self.qset, ticks) {
+                            Ok(Wait::Blocked) => -2,
+                            Ok(Wait::Ready(m)) => self.take_selected(m, false),
+                            Err(_) => 0,
+                        },
                     };
                     self.pending[slot] = (r == -2).then_some(call);
                     r
+                }
+                /// The C's `select_and_take`: 0 for no member, else a hundred
+                /// times one more than its slot, plus what the receive it
+                /// licenses took. From an ISR the receive's woken is dropped,
+                /// as the C drops it.
+                fn take_selected(&mut self, m: Option<QueueHandle>, from_isr: bool) -> i64 {
+                    let Some(m) = m else {
+                        return 0;
+                    };
+                    let i = self.queues.iter().position(|q| *q == Some(m)).expect("a member slot");
+                    let v = if from_isr {
+                        self.k.queue_receive_from_isr(m).map_or(0, |(v, _woken)| v as i64)
+                    } else {
+                        match self.k.queue_receive(m, 0) {
+                            Ok(Wait::Ready(v)) => v as i64,
+                            _ => 0,
+                        }
+                    };
+                    (i as i64 + 1) * 100 + v
                 }
                 /// `prvTimerTask`, run until it blocks again, as the C runs its
                 /// coroutine: the callbacks and pended functions it ran. The
@@ -635,7 +667,8 @@ macro_rules! replay {
                             s.push('.');
                         }
                     }
-                    let _ = write!(s, "/{} P={}", hook.fired[TSLOTS], hook.pended);
+                    let set = self.k.queue_messages_waiting(self.qset).unwrap_or(99);
+                    let _ = write!(s, "/{} P={} S={set}", hook.fired[TSLOTS], hook.pended);
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -665,6 +698,7 @@ macro_rules! replay {
             let mutex = k.mutex_create().expect("mutex");
             let rmutex = k.mutex_create_recursive().expect("recursive mutex");
             let csem = k.semaphore_create_counting(3, 1).expect("counting semaphore");
+            let qset = k.queue_create_set(SET_LEN).expect("queue set");
             let mut d = D {
                 k,
                 app: [None; SLOTS],
@@ -676,6 +710,8 @@ macro_rules! replay {
                 csem,
                 groups: [None; GSLOTS],
                 buffers: [None; BSLOTS],
+                qset,
+                wake: [0; SLOTS],
                 timers: [None; TSLOTS],
                 daemon: TaskHandle::NULL,
                 timer_queue: QueueHandle::NULL,
@@ -714,6 +750,72 @@ macro_rules! replay {
                 let mut r: i64 = 0;
                 match op {
                     "start" | "noop" => {}
+                    "abort" => {
+                        r = i64::from(d.k.abort_delay(d.app[num(0) as usize].unwrap()).expect("abort"));
+                    }
+                    "dlyuntil" => {
+                        let s = cur_slot.expect("delay until from an app task");
+                        let mut prev = d.wake[s];
+                        let ok = d.k.delay_until(&mut prev, num(0)).expect("delay until");
+                        d.wake[s] = prev;
+                        r = i64::from(ok) + 2 * prev as i64;
+                    }
+                    "gethandle" => {
+                        let want = d.app[num(0) as usize];
+                        r = match d.k.task_get_handle(args[1]) {
+                            Ok(h) if h.is_null() => 0,
+                            Ok(h) if Some(h) == want => 1,
+                            Ok(_) => 2,
+                            Err(_) => 0,
+                        };
+                    }
+                    "sall" => {
+                        d.k.suspend_all();
+                        let a: i64 = match num(0) {
+                            0 => {
+                                let t = d.k.increment_tick();
+                                if t {
+                                    d.k.port().yield_now();
+                                }
+                                i64::from(t)
+                            }
+                            1 => i64::from(matches!(d.k.semaphore_give(d.sem), Ok(Wait::Ready(())))),
+                            _ => match d.k.semaphore_give_from_isr(d.sem) {
+                                Ok(woken) => {
+                                    d.k.port().yield_from_isr(woken);
+                                    1
+                                }
+                                Err(_) => 0,
+                            },
+                        };
+                        r = 2 * a + i64::from(d.k.resume_all());
+                    }
+                    "crit" => {
+                        d.k.enter_critical();
+                        d.k.exit_critical();
+                    }
+                    "tickcount" => r = d.k.tick_count() as i64,
+                    "tickcount_isr" => r = d.k.tick_count_from_isr() as i64,
+                    "semspaces" => r = d.k.queue_spaces_available(d.sem).unwrap() as i64,
+                    "qspaces" => {
+                        r = d.k.queue_spaces_available(d.queues[num(0) as usize].unwrap()).unwrap() as i64;
+                    }
+                    "sadd" => {
+                        let q = d.queues[num(0) as usize].unwrap();
+                        r = i64::from(d.k.queue_add_to_set(q, d.qset).expect("add to set"));
+                    }
+                    "sremove" => {
+                        let q = d.queues[num(0) as usize].unwrap();
+                        r = i64::from(d.k.queue_remove_from_set(q, d.qset).expect("remove from set"));
+                    }
+                    "sselect" => {
+                        let s = cur_slot.expect("a select from an app task");
+                        r = d.call(s, Call::SSelect(num(0)));
+                    }
+                    "sselect_isr" => {
+                        let m = d.k.queue_select_from_set_from_isr(d.qset).expect("select from ISR");
+                        r = d.take_selected(m, true);
+                    }
                     "daemon" => {
                         assert_eq!(d.k.current_on(usize::from(core)), d.daemon, "daemon: not current");
                         r = d.run_daemon();
@@ -822,6 +924,7 @@ macro_rules! replay {
                         match d.k.create_task(args[1], num(2) as u8) {
                             Ok(h) => {
                                 d.app[slot] = Some(h);
+                                d.wake[slot] = 0;
                                 r = 1;
                             }
                             Err(_) => r = -1,
@@ -1143,18 +1246,18 @@ fn exercised(trace: &str) {
         ("give", 100),
         ("give_isr", 100),
         ("take", 100),
-        ("qcreate", 100),
-        ("qdelete", 100),
+        ("qcreate", 40),
+        ("qdelete", 40),
         ("qsend", 150),
         ("qsendf", 80),
-        ("qrecv", 150),
+        ("qrecv", 70),
         ("qpeek", 100),
         ("qover", 50),
-        ("qreset", 100),
+        ("qreset", 70),
         ("qsend_isr", 100),
         ("qsendf_isr", 100),
         ("qover_isr", 30),
-        ("qrecv_isr", 100),
+        ("qrecv_isr", 60),
         ("qpeek_isr", 50),
         ("qfull_isr", 50),
         ("mtake", 150),
@@ -1212,6 +1315,19 @@ fn exercised(trace: &str) {
         ("tpend_isr", 40),
         ("gset_isr", 30),
         ("gclear_isr", 30),
+        ("abort", 60),
+        ("dlyuntil", 50),
+        ("gethandle", 80),
+        ("sall", 80),
+        ("crit", 80),
+        ("tickcount", 60),
+        ("tickcount_isr", 60),
+        ("semspaces", 60),
+        ("qspaces", 60),
+        ("sadd", 30),
+        ("sremove", 30),
+        ("sselect", 100),
+        ("sselect_isr", 80),
         ("tick", 500),
         ("cont", 200),
     ] {
@@ -1238,12 +1354,12 @@ fn exercised(trace: &str) {
 fn one_core_answers_every_step_as_the_c_kernel_does() {
     exercised(TRACE_1);
     let n = replay_one(&TRACE_1.replace("\r\n", "\n"), "one core");
-    assert_eq!(n, 24_001, "every step replayed");
+    assert_eq!(n, 28_001, "every step replayed");
 }
 
 #[test]
 fn two_cores_answer_every_step_as_the_c_kernel_does() {
     exercised(TRACE_2);
     let n = replay_two(&TRACE_2.replace("\r\n", "\n"), "two cores");
-    assert_eq!(n, 24_001, "every step replayed");
+    assert_eq!(n, 28_001, "every step replayed");
 }

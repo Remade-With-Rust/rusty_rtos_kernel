@@ -29,6 +29,7 @@
 #define configUSE_MUTEXES                       1
 #define configUSE_RECURSIVE_MUTEXES             1
 #define configUSE_COUNTING_SEMAPHORES           1
+#define configUSE_QUEUE_SETS                    1
 #define configUSE_TASK_NOTIFICATIONS            1
 #define configTASK_NOTIFICATION_ARRAY_ENTRIES   1
 #define configUSE_TIMERS                        1
@@ -52,6 +53,9 @@
 #define INCLUDE_xQueueGetMutexHolder            1
 #define INCLUDE_xTimerGetTimerDaemonTaskHandle  1
 #define INCLUDE_xTimerPendFunctionCall          1
+#define INCLUDE_xTaskGetHandle                  1
+#define INCLUDE_xTaskAbortDelay                 1
+#define INCLUDE_xTaskDelayUntil                 1
 
 void vAssertCalled( const char * file, int line );
 #define configASSERT( x )    if( ( x ) == 0 ) vAssertCalled( __FILE__, __LINE__ )

@@ -4454,11 +4454,20 @@ where
                 break;
             }
             moved_any = true;
-            let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
-            if C::NUMBER_OF_CORES > 1 {
-                let _ = self.smp_readied(task, woken);
-            } else if woken > self.current_priority() {
-                self.set_pending_here(true);
+            // One core: a task readied above the running one owes a yield.
+            // Two cores: nothing. The C's SMP `xTaskResumeAll` makes no yield
+            // decision here -- "all appropriate tasks yield at the moment a
+            // task is added to xPendingReadyList" -- and every insertion
+            // into that list runs `prvYieldForTask` already. Asking again
+            // found the core the first ask had picked already requested and
+            // picked ANOTHER: two cores both running idle, an ISR give under
+            // suspension woke a task onto core 1, and the resume yielded
+            // core 0 as well (the API differential, step 14312).
+            if C::NUMBER_OF_CORES == 1 {
+                let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
+                if woken > self.current_priority() {
+                    self.set_pending_here(true);
+                }
             }
         }
         if moved_any {

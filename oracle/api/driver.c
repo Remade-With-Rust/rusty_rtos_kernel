@@ -91,6 +91,16 @@ static unsigned long daemon_work;
 static unsigned group_pend_out[ GSLOTS ];
 static TaskHandle_t daemon;
 static unsigned queue_len[ QSLOTS ];
+/* One queue set, room for every member's every item (lengths are 1..3). A
+ * member is never received from directly, reset or deleted, and is added
+ * only while no task waits on it: each of those can leave the set holding an
+ * entry for an item that is gone, and enough of them overflow it -- the C
+ * asserts on that (prvNotifyQueueSetContainer). */
+#define SET_LEN    ( 3 * QSLOTS )
+static QueueSetHandle_t qset;
+static int in_set[ QSLOTS ];
+/* Each task's `pxPreviousWakeTime` for xTaskDelayUntil. */
+static TickType_t wake[ SLOTS ];
 
 static void body( void * p )
 {
@@ -106,7 +116,7 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC, CALL_BSEND, CALL_BRECV, CALL_TCMD, CALL_TPEND };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC, CALL_BSEND, CALL_BRECV, CALL_TCMD, CALL_TPEND, CALL_SSELECT };
 
 /* A timer's callback: count it against the slot holding the timer. */
 static void timer_cb( TimerHandle_t t )
@@ -123,6 +133,34 @@ static void timer_cb( TimerHandle_t t )
 }
 
 /* What `xTimerPendFunctionCall` defers: sum its second parameter. */
+/* A select's result: 0 for none, else (the member's slot + 1) * 100 plus the
+ * value its receive took -- the select and the receive it licenses are one
+ * step, as the C documents them. */
+static long select_and_take( QueueSetMemberHandle_t m,
+                             int from_isr )
+{
+    uint32_t v = 0;
+    int q = 0;
+    BaseType_t woken = pdFALSE;
+    BaseType_t ok;
+
+    if( m == NULL )
+    {
+        return 0;
+    }
+
+    while( ( q < QSLOTS ) && ( queue[ q ] != m ) )
+    {
+        q++;
+    }
+
+    configASSERT( q < QSLOTS );
+    ok = from_isr ? xQueueReceiveFromISR( m, &v, &woken ) : xQueueReceive( m, &v, 0 );
+    ( void ) woken; /* a sender it wakes is left a PENDING yield, as an ISR
+                     * with no woken pointer leaves one */
+    return ( long ) ( q + 1 ) * 100 + ( ok ? ( long ) v : 0 );
+}
+
 static void pended_fn( void * p1,
                        uint32_t p2 )
 {
@@ -331,6 +369,10 @@ static void coro_main( void )
 
         case CALL_TPEND:
             coro_result[ s ] = xTimerPendFunctionCall( pended_fn, NULL, c->value, c->ticks );
+            break;
+
+        case CALL_SSELECT:
+            coro_result[ s ] = select_and_take( xQueueSelectFromSet( qset, c->ticks ), 0 );
             break;
     }
 
@@ -654,7 +696,7 @@ static void line( unsigned step,
         printf( t + 1 < TSLOTS ? "." : "" );
     }
 
-    printf( "/%lu P=%lu", fired[ TSLOTS ], pended_sum );
+    printf( "/%lu P=%lu S=%lu", fired[ TSLOTS ], pended_sum, ( unsigned long ) uxQueueMessagesWaiting( qset ) );
 
     printf( "\n" );
 }
@@ -709,6 +751,7 @@ static long call_from_task( int s,
         case CALL_BRECV:  return buffer_recv( c.q, c.a, 0 );
         case CALL_TCMD:   return timer_cmd( c.q, c.a, c.value, 0 );
         case CALL_TPEND:  return xTimerPendFunctionCall( pended_fn, NULL, c.value, 0 );
+        case CALL_SSELECT: return select_and_take( xQueueSelectFromSet( qset, 0 ), 0 );
     }
 
     return 0;
@@ -752,7 +795,7 @@ static long queue_op( int cur_slot,
     {
         case 0:
 
-            if( queue_has_waiter( q ) )
+            if( queue_has_waiter( q ) || in_set[ q ] )
             {
                 snprintf( op, n, "noop" );
                 return 0;
@@ -774,7 +817,8 @@ static long queue_op( int cur_slot,
             static const enum call_kind kinds[] = { CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QRECV, CALL_QPEEK, CALL_QSEND };
             static const char * names[] = { "qsend", "qsendf", "qrecv", "qrecv", "qpeek", "qsend" };
 
-            if( cur_slot < 0 )
+            /* A set member is read only through the set. */
+            if( ( cur_slot < 0 ) || ( in_set[ q ] && ( kinds[ which - 1 ] == CALL_QRECV ) ) )
             {
                 snprintf( op, n, "noop" );
                 return 0;
@@ -808,6 +852,13 @@ static long queue_op( int cur_slot,
             return r;
 
         case 8:
+
+            if( in_set[ q ] )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
             r = xQueueReset( queue[ q ] );
             snprintf( op, n, "qreset %d", q );
             return r;
@@ -841,6 +892,13 @@ static long queue_op( int cur_slot,
             return r;
 
         case 12:
+
+            if( in_set[ q ] )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
             isr_enter();
             r = got( xQueueReceiveFromISR( queue[ q ], &v, &woken ), &v );
             isr_exit( woken );
@@ -1179,6 +1237,200 @@ static long group_op( int cur_slot,
             snprintf( op, n, "gsync %d %lu %lu %lu", g, ( unsigned long ) bits, ( unsigned long ) mask, ( unsigned long ) ticks );
             return r;
         }
+    }
+}
+
+/* The scheduling odds and ends: abort a delay, delay until, look a task up
+ * by name, suspend the scheduler around a tick or a give, an empty critical
+ * section (on two cores every task-level exit is a yield point), and the
+ * tick count both ways. */
+static long sched_op( int cur_slot,
+                      unsigned slot,
+                      unsigned arg,
+                      char * op,
+                      size_t n )
+{
+    unsigned which = ( arg >> 8 ) % 8;
+    TaskHandle_t t = app[ slot ];
+    BaseType_t woken = pdFALSE;
+    long r = 0;
+
+    switch( which )
+    {
+        case 0:
+
+            if( t == NULL )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xTaskAbortDelay( t );
+            snprintf( op, n, "abort %u", slot );
+            return r;
+
+        case 1:
+        {
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            TickType_t inc = 1 + ( arg >> 12 ) % 5;
+            TickType_t prev = wake[ cur_slot ];
+            BaseType_t ok = xTaskDelayUntil( &prev, inc );
+            wake[ cur_slot ] = prev;
+            snprintf( op, n, "dlyuntil %lu", ( unsigned long ) inc );
+            return ( long ) ok + 2 * ( long ) prev;
+        }
+
+        case 2:
+        {
+            /* A live task's own name, or one no task ever had. A deleted
+             * task's name is not asked: the C keeps a self-deleted TCB on
+             * its termination list, which its idle task never empties here. */
+            const char * name = t ? pcTaskGetName( t ) : "tX";
+            TaskHandle_t h = xTaskGetHandle( name );
+            snprintf( op, n, "gethandle %u %s", slot, name );
+            return ( h == NULL ) ? 0 : ( h == t ) ? 1 : 2;
+        }
+
+        case 3:
+        {
+            unsigned sub = ( arg >> 12 ) % 3;
+            long a;
+
+            vTaskSuspendAll();
+
+            if( sub == 0 )
+            {
+                fake_in_isr = 1;
+                UBaseType_t saved = taskENTER_CRITICAL_FROM_ISR();
+                a = xTaskIncrementTick();
+                taskEXIT_CRITICAL_FROM_ISR( saved );
+                fake_in_isr = 0;
+
+                if( a )
+                {
+                    portYIELD();
+                }
+            }
+            else if( sub == 1 )
+            {
+                a = xSemaphoreGive( sem );
+            }
+            else
+            {
+                isr_enter();
+                a = xSemaphoreGiveFromISR( sem, &woken );
+                isr_exit( woken );
+            }
+
+            r = 2 * a + xTaskResumeAll();
+            snprintf( op, n, "sall %u", sub );
+            return r;
+        }
+
+        case 4:
+            taskENTER_CRITICAL();
+            taskEXIT_CRITICAL();
+            snprintf( op, n, "crit" );
+            return 0;
+
+        case 5:
+            r = ( long ) xTaskGetTickCount();
+            snprintf( op, n, "tickcount" );
+            return r;
+
+        case 6:
+            isr_enter();
+            r = ( long ) xTaskGetTickCountFromISR();
+            isr_exit( pdFALSE );
+            snprintf( op, n, "tickcount_isr" );
+            return r;
+
+        default:
+            r = ( long ) uxQueueSpacesAvailable( sem );
+            snprintf( op, n, "semspaces" );
+            return r;
+    }
+}
+
+/* The queue-set family. See SET_LEN for what a member may not do. */
+static long set_op( int cur_slot,
+                    unsigned slot,
+                    unsigned arg,
+                    char * op,
+                    size_t n )
+{
+    int q = ( int ) ( slot % QSLOTS );
+    unsigned which = ( arg >> 8 ) % 6;
+    TickType_t ticks = block_ticks( arg >> 12 );
+    BaseType_t woken = pdFALSE;
+    long r;
+
+    switch( which )
+    {
+        case 0:
+
+            if( ( queue[ q ] == NULL ) || in_set[ q ] || queue_has_waiter( q ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xQueueAddToSet( queue[ q ], qset );
+            in_set[ q ] = ( r == pdPASS );
+            snprintf( op, n, "sadd %d", q );
+            return r;
+
+        case 1:
+
+            if( !in_set[ q ] )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xQueueRemoveFromSet( queue[ q ], qset );
+            in_set[ q ] = ( r != pdPASS );
+            snprintf( op, n, "sremove %d", q );
+            return r;
+
+        case 2:
+        case 3:
+        {
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { CALL_SSELECT, ticks, 0, 0, 0, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "sselect %lu", ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 4:
+            isr_enter();
+            r = select_and_take( xQueueSelectFromSetFromISR( qset ), 1 );
+            isr_exit( woken );
+            snprintf( op, n, "sselect_isr" );
+            return r;
+
+        default:
+
+            if( queue[ q ] == NULL )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = ( long ) uxQueueSpacesAvailable( queue[ q ] );
+            snprintf( op, n, "qspaces %d", q );
+            return r;
     }
 }
 
@@ -1525,6 +1777,7 @@ int main( int argc,
     mutex = xSemaphoreCreateMutex();
     rmutex = xSemaphoreCreateRecursiveMutex();
     csem = xSemaphoreCreateCounting( 3, 1 );
+    qset = xQueueCreateSet( SET_LEN );
     UBaseType_t init[ 4 ];
 
     for( int i = 0; i < 4; i++ )
@@ -1596,6 +1849,7 @@ int main( int argc,
                 snprintf( n, sizeof n, "t%u", created++ );
                 UBaseType_t p = arg % 4;
                 r = xTaskCreate( body, n, configMINIMAL_STACK_SIZE, NULL, p, &app[ slot ] );
+                wake[ slot ] = 0;
                 snprintf( op, sizeof op, "create %u %s %lu", slot, n, ( unsigned long ) p );
             }
             else
@@ -1624,7 +1878,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 15 )
+        else if( kind < 14 )
         {
             if( t != NULL )
             {
@@ -1636,7 +1890,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 21 )
+        else if( kind < 19 )
         {
             if( t != NULL )
             {
@@ -1648,7 +1902,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 27 )
+        else if( kind < 24 )
         {
             if( t != NULL )
             {
@@ -1661,7 +1915,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 32 )
+        else if( kind < 28 )
         {
             if( cur_slot >= 0 )
             {
@@ -1674,12 +1928,12 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 36 )
+        else if( kind < 32 )
         {
             r = xSemaphoreGive( sem );
             snprintf( op, sizeof op, "give" );
         }
-        else if( kind < 39 )
+        else if( kind < 35 )
         {
             BaseType_t woken = pdFALSE;
             isr_enter();
@@ -1687,7 +1941,7 @@ int main( int argc,
             isr_exit( woken );
             snprintf( op, sizeof op, "give_isr" );
         }
-        else if( kind < 43 )
+        else if( kind < 39 )
         {
             if( cur_slot >= 0 )
             {
@@ -1700,29 +1954,37 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 56 )
+        else if( kind < 51 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 64 )
+        else if( kind < 58 )
         {
             r = mutex_op( cur_slot, arg, op, sizeof op );
         }
-        else if( kind < 71 )
+        else if( kind < 64 )
         {
             r = notify_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 76 )
+        else if( kind < 69 )
         {
             r = group_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 83 )
+        else if( kind < 75 )
         {
             r = buffer_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 91 )
+        else if( kind < 82 )
         {
             r = timer_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 87 )
+        {
+            r = sched_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 91 )
+        {
+            r = set_op( cur_slot, slot, arg, op, sizeof op );
         }
         else if( kind < 96 )
         {
