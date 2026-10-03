@@ -1163,7 +1163,9 @@ where
     /// # Errors
     /// A list error surfaces as itself.
     pub fn task_state_get(&mut self, task: TaskHandle) -> Result<TaskState> {
-        if task == self.cur() {
+        // One core only: the SMP `eTaskGetState` has no shortcut for the
+        // caller's own task -- it always reads the lists, in the section.
+        if C::NUMBER_OF_CORES <= 1 && task == self.cur() {
             return Ok(TaskState::Running);
         }
         self.enter_critical();
@@ -1180,7 +1182,11 @@ where
         if !self.tcbs.contains(task) {
             return Ok(TaskState::Deleted);
         }
-        if task == self.cur() {
+        // `pxTCB == pxCurrentTCB` is a ONE-core shortcut in the C. On two
+        // cores there is none: a task that is current here but has just
+        // placed itself on the delayed list reads Blocked, and "running" is
+        // decided below, for a task on a ready list, on ANY core.
+        if C::NUMBER_OF_CORES <= 1 && task == self.cur() {
             return Ok(TaskState::Running);
         }
         let Some(list) = self.lists.container(Self::state_item(task))? else {
@@ -1213,6 +1219,12 @@ where
         }
         if list == self.delayed_list() || list == self.overflow_delayed_list() {
             return Ok(TaskState::Blocked);
+        }
+        // SMP: `taskTASK_IS_RUNNING( pxTCB )` -- current on SOME core and not
+        // asked to yield it. Found by the API differential (P1): a task
+        // running on the other core read Ready, on its very first step.
+        if C::NUMBER_OF_CORES > 1 && self.running_core(task).is_some() {
+            return Ok(TaskState::Running);
         }
         Ok(TaskState::Ready)
     }
