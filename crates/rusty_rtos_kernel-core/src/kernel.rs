@@ -1802,6 +1802,23 @@ where
     /// to capture that result, test it, and build a new one, at every site.
     pub(crate) fn add_task_to_ready_list(&mut self, task: TaskHandle) -> Result<()> {
         let priority = self.tcbs.resolve(task)?.priority;
+        self.add_task_to_ready_list_at(task, priority)
+    }
+
+    /// [`Kernel::add_task_to_ready_list`] for a caller that already holds
+    /// `task`'s priority. `priority` MUST be the TCB's own.
+    ///
+    /// The priority goes IN, not out: handing it back measured +3.69% on
+    /// kdelay-ir (the doc above). `remove_from_event_list` resolves the woken
+    /// TCB right after `handle_at` read the same slot, where the two fold, and
+    /// passes the field down instead of resolving twice more around the list
+    /// edits, which LLVM cannot see past.
+    ///
+    /// In line on the speed profile only: at that site it is +30 B of flash
+    /// for -6 on rv32 `block_cycle`, and `small` does not make that trade.
+    #[cfg_attr(not(feature = "small"), inline(always))]
+    #[cfg_attr(feature = "small", inline(never))]
+    fn add_task_to_ready_list_at(&mut self, task: TaskHandle, priority: u8) -> Result<()> {
         self.trace_task(task, |task, name| Event::MovedTaskToReadyState {
             task,
             name,
@@ -5268,10 +5285,19 @@ where
         let Ok(task) = self.task_of_event_item(item) else {
             return Err(self.event_item_error(item));
         };
+        // Read here, beside `handle_at`'s read of the same slot, and carried:
+        // nothing below writes a priority, and after the list edits LLVM can
+        // no longer prove that, so it resolved the TCB twice more. `task`
+        // came live out of `handle_at`, so this cannot fail -- and its error
+        // is built in the cold helper for the reason the one above is: a `?`
+        // here put its constants back in the entry block (+30 B of flash).
+        let Ok(woken) = self.tcbs.resolve(task).map(|t| t.priority) else {
+            return Err(self.event_item_error(item));
+        };
         let _ = self.lists.remove(item);
         if self.suspended_depth == 0 {
             let _ = self.lists.remove(Self::state_item(task));
-            self.add_task_to_ready_list(task)?;
+            self.add_task_to_ready_list_at(task, woken)?;
             // `configUSE_TICKLESS_IDLE`, as in `notify`.
             if C::USE_TICKLESS_IDLE {
                 self.reset_next_task_unblock_time();
@@ -5279,7 +5305,6 @@ where
         } else {
             self.lists.insert_end(Self::pending_ready_list(), item)?;
         }
-        let woken = self.tcbs.resolve(task)?.priority;
         if C::NUMBER_OF_CORES > 1 {
             // `prvYieldForTask`, and the answer is whether THIS core now owes
             // a yield -- the C's `xYieldPendings[ portGET_CORE_ID() ]`.
