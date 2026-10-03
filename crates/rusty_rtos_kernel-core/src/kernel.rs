@@ -1317,7 +1317,13 @@ where
             ""
         };
         let tick = *tick;
-        trace.note_exits(port.exits());
+        // Gated as `Kernel::note_exits` is. A silent sink discards the count,
+        // but on a port whose counter is an atomic the LOAD survives the
+        // discarded value: `lw zero, ...` in every traced path on rv32
+        // (`RiscvPort`), one per wake in `block_cycle` alone.
+        if T::EMITS {
+            trace.note_exits(port.exits());
+        }
         trace.event(tick, make(task, name));
     }
 
