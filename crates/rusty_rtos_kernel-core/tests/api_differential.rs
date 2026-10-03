@@ -37,12 +37,15 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use rusty_rtos_core::config::Config;
-use rusty_rtos_core::handle::{EventGroupHandle, QueueHandle, StreamBufferHandle, TaskHandle};
-use rusty_rtos_core::hooks::NoTickHook;
+use rusty_rtos_core::handle::{
+    EventGroupHandle, QueueHandle, StreamBufferHandle, TaskHandle, TimerHandle,
+};
+use rusty_rtos_core::hooks::TickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
 use rusty_rtos_core::tick::Bits32;
 use rusty_rtos_core::trace::NoTrace;
+use rusty_rtos_kernel_core::events::{PENDED_CLEAR_BITS, PENDED_SET_BITS};
 use rusty_rtos_kernel_core::kernel::{NotifyAction, TaskState};
 use rusty_rtos_kernel_core::queue::Wait;
 use rusty_rtos_kernel_core::{Kernel, list_slots_for, lists_for};
@@ -58,7 +61,7 @@ impl Config for OneCore {
     const MAX_PRIORITIES: u8 = 5;
     const MINIMAL_STACK_SIZE: usize = 128;
     const MAX_TASK_NAME_LEN: usize = 8;
-    const TIMER_TASK_PRIORITY: u8 = 4;
+    const TIMER_TASK_PRIORITY: u8 = 2;
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 1;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
@@ -67,6 +70,11 @@ impl Config for OneCore {
     const MESSAGE_LENGTH_BYTES: usize = 8;
     const NUMBER_OF_CORES: u8 = 1;
     const USE_TIME_SLICING: bool = true;
+    /// heap_3: every free is `vTaskSuspendAll` / `xTaskResumeAll`, and that
+    /// resume takes a yield left pending -- by an ISR call with no woken
+    /// pointer, say.
+    const DYNAMIC_ALLOCATION: bool = true;
+    const TOTAL_HEAP_SIZE: usize = 1024 * 1024;
 }
 
 /// The same, at two cores.
@@ -77,7 +85,7 @@ impl Config for TwoCores {
     const MAX_PRIORITIES: u8 = 5;
     const MINIMAL_STACK_SIZE: usize = 128;
     const MAX_TASK_NAME_LEN: usize = 8;
-    const TIMER_TASK_PRIORITY: u8 = 4;
+    const TIMER_TASK_PRIORITY: u8 = 2;
     const TIMER_TASK_STACK_DEPTH: usize = 128;
     const TIMER_QUEUE_LENGTH: usize = 1;
     const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
@@ -86,6 +94,11 @@ impl Config for TwoCores {
     const MESSAGE_LENGTH_BYTES: usize = 8;
     const NUMBER_OF_CORES: u8 = 2;
     const USE_TIME_SLICING: bool = true;
+    /// heap_3: every free is `vTaskSuspendAll` / `xTaskResumeAll`, and that
+    /// resume takes a yield left pending -- by an ISR call with no woken
+    /// pointer, say.
+    const DYNAMIC_ALLOCATION: bool = true;
+    const TOTAL_HEAP_SIZE: usize = 1024 * 1024;
 }
 
 /// The fake port's twin: a settable core, and every yield RECORDED.
@@ -133,6 +146,27 @@ const GSLOTS: usize = 2;
 const BSLOTS: usize = 2;
 /// Byte storage for both, with room.
 const BYTES: usize = 64;
+/// Software timers the script names.
+const TSLOTS: usize = 3;
+/// Timers Kairos may hold at once: a deleted timer lives until the daemon
+/// takes its command, so a slot can be refilled while one is queued.
+const TIMERS: usize = 6;
+
+/// The C driver's timer callback and pended function, counted where a hook
+/// reaches them: in the kernel's own copy of the hook. Both run on the
+/// daemon, which reaches its state through the kernel (`TickHook::timer`).
+#[derive(Clone, Copy, Default)]
+struct DiffHook {
+    /// Which timer each slot holds, so a callback can be counted against it.
+    timers: [Option<TimerHandle>; TSLOTS],
+    /// Each slot's callbacks, and (last) those of a timer whose delete was
+    /// still queued when it fired.
+    fired: [u64; TSLOTS + 1],
+    /// What the pended function has been handed, summed.
+    pended: u64,
+    /// Callbacks and pended functions run: a `daemon` step's result.
+    work: u64,
+}
 
 /// A call that may block: made, and if it blocks made again when its task
 /// next runs.
@@ -193,6 +227,17 @@ enum Call {
         max: usize,
         ticks: u64,
     },
+    /// `cmd`: 0 start, 1 stop, 2 reset, 3 change period to `value`.
+    TCmd {
+        t: usize,
+        cmd: u32,
+        value: u64,
+        ticks: u64,
+    },
+    TPend {
+        value: u64,
+        ticks: u64,
+    },
 }
 
 /// The C's `eNotifyAction`, by number, as the driver prints it.
@@ -246,18 +291,43 @@ macro_rules! replay {
                 $config,
                 DiffPort,
                 NoTrace,
-                NoTickHook,
+                DiffHook,
                 TASKS,
-                { list_slots_for(TASKS, 1, lists_for(5, QUEUES, GSLOTS)) },
+                { list_slots_for(TASKS, TIMERS, lists_for(5, QUEUES, GSLOTS)) },
                 { lists_for(5, QUEUES, GSLOTS) },
                 QUEUES,
                 ITEMS,
                 BSLOTS,
                 BYTES,
-                1,
+                TIMERS,
                 GSLOTS,
                 1,
             >;
+
+            impl TickHook<K> for DiffHook {
+                fn tick(self, _kernel: &mut K) -> Self {
+                    self
+                }
+                fn timer(kernel: &mut K, timer: TimerHandle, _callback: u16, _id: u64) {
+                    let h = kernel.tick_hook_mut();
+                    let i = h.timers.iter().position(|t| *t == Some(timer)).unwrap_or(TSLOTS);
+                    h.fired[i] += 1;
+                    h.work += 1;
+                }
+                fn pended(kernel: &mut K, function: u16, param1: u64, param2: u64) {
+                    // The event-group ISR calls are the kernel's own pended
+                    // functions, as `vEventGroupSetBitsCallback` is the C's.
+                    if function == PENDED_SET_BITS || function == PENDED_CLEAR_BITS {
+                        kernel
+                            .event_group_pended_call(function, param1, param2)
+                            .expect("a pended group call");
+                        return;
+                    }
+                    let h = kernel.tick_hook_mut();
+                    h.pended += param2;
+                    h.work += 1;
+                }
+            }
             const CORES: u8 = <$config as Config>::NUMBER_OF_CORES;
 
             struct D {
@@ -271,6 +341,16 @@ macro_rules! replay {
                 csem: QueueHandle,
                 groups: [Option<EventGroupHandle>; GSLOTS],
                 buffers: [Option<StreamBufferHandle>; BSLOTS],
+                timers: [Option<TimerHandle>; TSLOTS],
+                daemon: TaskHandle,
+                timer_queue: QueueHandle,
+                /// `prvTimerTask`, stepped: where it stopped, and its locals.
+                dpc: u8,
+                next_expire: u64,
+                list_was_empty: bool,
+                now: u64,
+                placed: bool,
+                resumed_yielded: bool,
             }
 
             impl D {
@@ -360,9 +440,102 @@ macro_rules! replay {
                             let got = self.k.stream_buffer_receive(h, &mut out[..max], ticks);
                             waited(got, |n| fold(&out[..n]))
                         }
+                        Call::TCmd { t, cmd, value, ticks } => {
+                            let h = self.timers[t].expect("a live timer");
+                            let r = match cmd {
+                                0 => self.k.timer_start(h, ticks),
+                                1 => self.k.timer_stop(h, ticks),
+                                2 => self.k.timer_reset(h, ticks),
+                                _ => self.k.timer_change_period(h, value, ticks),
+                            };
+                            waited(r, i64::from)
+                        }
+                        Call::TPend { value, ticks } => {
+                            waited(self.k.timer_pend_function_call(1, 0, value, ticks), i64::from)
+                        }
                     };
                     self.pending[slot] = (r == -2).then_some(call);
                     r
+                }
+                /// `prvTimerTask`, run until it blocks again, as the C runs its
+                /// coroutine: the callbacks and pended functions it ran. The
+                /// arms are the demo runner's `Timer`, without the step
+                /// boundaries -- no tick lands inside a script step.
+                fn run_daemon(&mut self) -> i64 {
+                    let before = self.k.tick_hook().work;
+                    loop {
+                        match self.dpc {
+                            // xNextExpireTime = prvGetNextExpireTime( &xListWasEmpty );
+                            0 => {
+                                let (next, empty) = self.k.timer_next_expire();
+                                self.next_expire = next;
+                                self.list_was_empty = empty;
+                                self.dpc = 1;
+                            }
+                            1 => {
+                                self.k.suspend_all();
+                                self.dpc = 2;
+                            }
+                            2 => {
+                                let (now, switched) = self.k.timer_sample_time_now().expect("sample");
+                                self.now = now;
+                                if switched {
+                                    self.dpc = 7;
+                                } else if !self.list_was_empty && self.next_expire <= now {
+                                    self.dpc = 3;
+                                } else {
+                                    if self.list_was_empty {
+                                        self.list_was_empty = self.k.overflow_timer_list_is_empty();
+                                    }
+                                    let wait = self.next_expire.wrapping_sub(self.now);
+                                    // `vQueueWaitForMessageRestricted` places
+                                    // the daemon only on an empty queue.
+                                    self.placed = self.k.queue_messages_waiting(self.timer_queue).expect("queue") == 0;
+                                    self.k
+                                        .wait_for_message_restricted(self.timer_queue, wait, self.list_was_empty)
+                                        .expect("wait");
+                                    self.dpc = 6;
+                                }
+                            }
+                            3 => {
+                                let _ = self.k.resume_all();
+                                self.dpc = 4;
+                            }
+                            4 => {
+                                self.k.process_expired_timer(self.next_expire, self.now).expect("expired");
+                                self.dpc = 8;
+                            }
+                            // The block: the C's coroutine leaves at the
+                            // first yield after it, inside `xTaskResumeAll`
+                            // or at `taskYIELD_WITHIN_API`.
+                            6 => {
+                                self.resumed_yielded = self.k.resume_all();
+                                self.dpc = 9;
+                                if self.resumed_yielded && self.placed {
+                                    break;
+                                }
+                            }
+                            9 => {
+                                self.dpc = 8;
+                                if !self.resumed_yielded {
+                                    self.k.task_yield();
+                                    if self.placed {
+                                        break;
+                                    }
+                                }
+                            }
+                            7 => {
+                                let _ = self.k.resume_all();
+                                self.dpc = 8;
+                            }
+                            // prvProcessReceivedCommands(), one at a time.
+                            _ => match self.k.process_one_timer_command(0) {
+                                Ok(Wait::Ready(true)) => {}
+                                _ => self.dpc = 0,
+                            },
+                        }
+                    }
+                    (self.k.tick_hook().work - before) as i64
                 }
                 /// Take the step's yields, lowest core first, then observe
                 /// from core 0: the right-hand side of the C's line.
@@ -448,6 +621,21 @@ macro_rules! replay {
                             s.push('.');
                         }
                     }
+                    s.push_str(" F=");
+                    let hook = *self.k.tick_hook();
+                    for t in 0..TSLOTS {
+                        match self.timers[t] {
+                            None => s.push('-'),
+                            Some(h) => {
+                                let a = if self.k.timer_is_active(h).expect("active") { 'a' } else { 'i' };
+                                let _ = write!(s, "{}{a}", hook.fired[t]);
+                            }
+                        }
+                        if t + 1 < TSLOTS {
+                            s.push('.');
+                        }
+                    }
+                    let _ = write!(s, "/{} P={}", hook.fired[TSLOTS], hook.pended);
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -488,13 +676,23 @@ macro_rules! replay {
                 csem,
                 groups: [None; GSLOTS],
                 buffers: [None; BSLOTS],
+                timers: [None; TSLOTS],
+                daemon: TaskHandle::NULL,
+                timer_queue: QueueHandle::NULL,
+                dpc: 0,
+                next_expire: 0,
+                list_was_empty: false,
+                now: 0,
+                placed: false,
+                resumed_yielded: false,
             };
             for (i, p) in init.iter().enumerate() {
                 d.app[i] = Some(d.k.create_task(&format!("t{i}"), *p).expect("initial task"));
             }
             let started = d.k.start_scheduler().expect("start");
+            d.daemon = started.timer;
+            d.timer_queue = started.timer_queue;
             d.on(0);
-            d.k.suspend(Some(started.timer)).expect("park the timer daemon");
             let _ = d.take_mask();
             for c in 0..CORES {
                 d.switch_core(c);
@@ -516,6 +714,104 @@ macro_rules! replay {
                 let mut r: i64 = 0;
                 match op {
                     "start" | "noop" => {}
+                    "daemon" => {
+                        assert_eq!(d.k.current_on(usize::from(core)), d.daemon, "daemon: not current");
+                        r = d.run_daemon();
+                    }
+                    "tcreate" => {
+                        let t = num(0) as usize;
+                        match d.k.timer_create("T", num(1), num(2) == 1, t as u64, 0) {
+                            Ok(h) => {
+                                d.timers[t] = Some(h);
+                                d.k.tick_hook_mut().timers[t] = Some(h);
+                                r = 1;
+                            }
+                            Err(_) => r = -1,
+                        }
+                    }
+                    "tdelete" => {
+                        let t = num(0) as usize;
+                        let h = d.timers[t].unwrap();
+                        r = waited(d.k.timer_delete(h, 0), i64::from);
+                        if r == 1 {
+                            // The daemon frees it; nothing names it after.
+                            d.timers[t] = None;
+                            d.k.tick_hook_mut().timers[t] = None;
+                        }
+                    }
+                    "tstart" | "tstop" | "treset" | "tperiod" => {
+                        let s = cur_slot.expect("a timer command from an app task");
+                        let cmd = match op {
+                            "tstart" => 0,
+                            "tstop" => 1,
+                            "treset" => 2,
+                            _ => 3,
+                        };
+                        let call = Call::TCmd { t: num(0) as usize, cmd, value: num(1), ticks: num(2) };
+                        r = d.call(s, call);
+                    }
+                    "tstart_isr" | "tstop_isr" | "treset_isr" | "tperiod_isr" => {
+                        let h = d.timers[num(0) as usize].unwrap();
+                        let (ok, woken) = match op {
+                            "tstart_isr" => d.k.timer_start_from_isr(h),
+                            "tstop_isr" => d.k.timer_stop_from_isr(h),
+                            "treset_isr" => d.k.timer_reset_from_isr(h),
+                            _ => d.k.timer_change_period_from_isr(h, num(1)),
+                        }
+                        .expect("a timer command from an ISR");
+                        d.k.port().yield_from_isr(woken);
+                        r = i64::from(ok);
+                    }
+                    "tactive" | "tinfo" | "treload" | "tsetid" | "texpiry" | "tinactive" => {
+                        let h = d.timers[num(0) as usize].unwrap();
+                        r = match op {
+                            "tactive" => i64::from(d.k.timer_is_active(h).unwrap()),
+                            "tinfo" => {
+                                d.k.timer_period(h).unwrap() as i64
+                                    + 100 * i64::from(d.k.timer_auto_reload(h).unwrap())
+                                    + 1000 * d.k.timer_id(h).unwrap() as i64
+                            }
+                            "treload" => {
+                                d.k.timer_set_auto_reload(h, num(1) == 1).unwrap();
+                                0
+                            }
+                            "tsetid" => {
+                                d.k.timer_set_id(h, num(1)).unwrap();
+                                0
+                            }
+                            // The C's guard asked first, and that is a call.
+                            "tinactive" => {
+                                assert!(!d.k.timer_is_active(h).unwrap(), "tinactive: active");
+                                0
+                            }
+                            _ => {
+                                assert!(d.k.timer_is_active(h).unwrap(), "texpiry: inactive");
+                                d.k.timer_expiry_time(h).unwrap() as i64
+                            }
+                        };
+                    }
+                    "tpend" => {
+                        let s = cur_slot.expect("a pended call from an app task");
+                        r = d.call(s, Call::TPend { value: num(0), ticks: num(1) });
+                    }
+                    "tpend_isr" => {
+                        let (ok, woken) = d.k.timer_pend_function_call_from_isr(1, 0, num(0)).unwrap();
+                        d.k.port().yield_from_isr(woken);
+                        r = i64::from(ok);
+                    }
+                    "gset_isr" => {
+                        let h = d.groups[num(0) as usize].unwrap();
+                        let (ok, woken) = d.k.event_group_set_bits_from_isr(h, num(1) as u32).unwrap();
+                        d.k.port().yield_from_isr(woken);
+                        r = i64::from(ok);
+                    }
+                    "gclear_isr" => {
+                        // `xEventGroupClearBitsFromISR` takes no woken
+                        // pointer: whatever it wakes waits for a yield.
+                        let h = d.groups[num(0) as usize].unwrap();
+                        let (ok, _woken) = d.k.event_group_clear_bits_from_isr(h, num(1) as u32).unwrap();
+                        r = i64::from(ok);
+                    }
                     "cont" => {
                         let s = cur_slot.expect("cont: the current task is an app task");
                         let call = d.pending[s].expect("cont: a call is pending");
@@ -857,7 +1153,7 @@ fn exercised(trace: &str) {
         ("qreset", 100),
         ("qsend_isr", 100),
         ("qsendf_isr", 100),
-        ("qover_isr", 50),
+        ("qover_isr", 30),
         ("qrecv_isr", 100),
         ("qpeek_isr", 50),
         ("qfull_isr", 50),
@@ -896,6 +1192,26 @@ fn exercised(trace: &str) {
         ("btrigger", 40),
         ("breset", 50),
         ("bdone_isr", 50),
+        ("daemon", 500),
+        ("tcreate", 50),
+        ("tdelete", 50),
+        ("tstart", 30),
+        ("tstop", 20),
+        ("treset", 25),
+        ("tperiod", 20),
+        ("tstart_isr", 30),
+        ("tstop_isr", 30),
+        ("treset_isr", 30),
+        ("tperiod_isr", 30),
+        ("tactive", 50),
+        ("tinfo", 40),
+        ("treload", 40),
+        ("tsetid", 40),
+        ("texpiry", 15),
+        ("tpend", 20),
+        ("tpend_isr", 40),
+        ("gset_isr", 30),
+        ("gclear_isr", 30),
         ("tick", 500),
         ("cont", 200),
     ] {
@@ -922,12 +1238,12 @@ fn exercised(trace: &str) {
 fn one_core_answers_every_step_as_the_c_kernel_does() {
     exercised(TRACE_1);
     let n = replay_one(&TRACE_1.replace("\r\n", "\n"), "one core");
-    assert_eq!(n, 20_001, "every step replayed");
+    assert_eq!(n, 24_001, "every step replayed");
 }
 
 #[test]
 fn two_cores_answer_every_step_as_the_c_kernel_does() {
     exercised(TRACE_2);
     let n = replay_two(&TRACE_2.replace("\r\n", "\n"), "two cores");
-    assert_eq!(n, 20_001, "every step replayed");
+    assert_eq!(n, 24_001, "every step replayed");
 }

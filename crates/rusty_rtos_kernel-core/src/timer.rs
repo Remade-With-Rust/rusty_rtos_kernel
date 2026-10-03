@@ -464,6 +464,18 @@ where
         value: u64,
         ticks: u64,
     ) -> Result<Wait<bool>> {
+        // The retry of a command that blocked on a full queue sends what its
+        // first pass built. `xTimerStart` and `xTimerReset` read the tick
+        // count ONCE, before the send, and the C carries that sample in the
+        // message through the block; reading the clock again here made the
+        // command time late by however long the task waited, and the timer
+        // expire that much late. The API differential found it with the
+        // daemon below a task (two cores, step 4015: blocked, a tick, then
+        // the retry). The first pass's frame on the command queue is what
+        // says this is a retry.
+        let caller = self.cur();
+        let retry = self.waiting_on(caller, self.timer_queue);
+        let value = if retry { self.held(caller) } else { value };
         let message = Message {
             command,
             value,
@@ -478,17 +490,20 @@ where
         // `if( xTaskGetSchedulerState() == taskSCHEDULER_RUNNING )` — before
         // the scheduler runs, a command may not block.
         let ticks = if self.is_running() { ticks } else { 0 };
-        // Who to trace against. The C runs `traceTIMER_COMMAND_SEND` on the
-        // line after `xQueueSendToBack`, so a send that made the daemon
-        // ready switches away first and the line runs when this task has
-        // the CPU back — after the `TASK_SWITCHED_IN` that returns it.
-        let caller = self.current();
+        // `caller` is also who to trace against. The C runs
+        // `traceTIMER_COMMAND_SEND` on the line after `xQueueSendToBack`, so a
+        // send that made the daemon ready switches away first and the line
+        // runs when this task has the CPU back — after the `TASK_SWITCHED_IN`
+        // that returns it.
         // `traceTIMER_COMMAND_SEND` fires whatever the send returned — and
         // a full queue is the *point* of TimerDemo's first test, which
         // starts exactly as many timers as the queue holds and then
         // requires the next one to fail.
         match self.post_timer_message(message, ticks) {
-            Ok(Wait::Blocked) => Ok(Wait::Blocked),
+            Ok(Wait::Blocked) => {
+                self.hold(caller, value);
+                Ok(Wait::Blocked)
+            }
             Ok(Ready(ok)) => {
                 self.trace_command_send_for(caller, timer, command, value);
                 Ok(Ready(ok))

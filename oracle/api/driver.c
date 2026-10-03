@@ -75,6 +75,21 @@ static EventGroupHandle_t group[ GSLOTS ];
 #define SB_SIZE   12
 #define MB_SIZE   20
 static StreamBufferHandle_t buffer[ BSLOTS ];
+#define TSLOTS    3 /* software timers */
+static TimerHandle_t tmr[ TSLOTS ];
+/* Each slot's callbacks, and (last) those of a timer whose delete was
+ * still queued when it fired. */
+static unsigned long fired[ TSLOTS + 1 ];
+/* What the pended function has been handed, summed. */
+static unsigned long pended_sum;
+/* Callbacks and pended functions the daemon ran: a `daemon` step's result. */
+static unsigned long daemon_work;
+/* Event-group ISR calls posted to the daemon and not yet run: a group with
+ * one outstanding is not deleted (the daemon would set bits in freed
+ * memory). The daemon drains its queue before it blocks, so every `daemon`
+ * step that ends clears these. */
+static unsigned group_pend_out[ GSLOTS ];
+static TaskHandle_t daemon;
 static unsigned queue_len[ QSLOTS ];
 
 static void body( void * p )
@@ -91,7 +106,45 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC, CALL_BSEND, CALL_BRECV };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC, CALL_BSEND, CALL_BRECV, CALL_TCMD, CALL_TPEND };
+
+/* A timer's callback: count it against the slot holding the timer. */
+static void timer_cb( TimerHandle_t t )
+{
+    int i = 0;
+
+    while( ( i < TSLOTS ) && ( tmr[ i ] != t ) )
+    {
+        i++;
+    }
+
+    fired[ i ]++;
+    daemon_work++;
+}
+
+/* What `xTimerPendFunctionCall` defers: sum its second parameter. */
+static void pended_fn( void * p1,
+                       uint32_t p2 )
+{
+    ( void ) p1;
+    pended_sum += p2;
+    daemon_work++;
+}
+
+/* A task's timer command: 0 start, 1 stop, 2 reset, 3 change period. */
+static long timer_cmd( int t,
+                       uint32_t cmd,
+                       uint32_t value,
+                       TickType_t ticks )
+{
+    switch( cmd )
+    {
+        case 0:  return xTimerStart( tmr[ t ], ticks );
+        case 1:  return xTimerStop( tmr[ t ], ticks );
+        case 2:  return xTimerReset( tmr[ t ], ticks );
+        default: return xTimerChangePeriod( tmr[ t ], value, ticks );
+    }
+}
 
 /* Send `len` bytes counting up from `start` -- the replay builds the same
  * bytes from the same two numbers. */
@@ -155,10 +208,18 @@ struct call
     uint32_t b;     /* a notify wait's exit mask */
 };
 
+/* The timer daemon is coroutine SLOTS: the C runs `prvTimerTask` itself. */
+#define DAEMON    SLOTS
+extern TaskFunction_t fake_last_code;
+extern void * fake_last_param;
+static TaskFunction_t daemon_code;
+static void * daemon_param;
+static int daemon_started;
+
 #define CORO_STACK    ( 256 * 1024 )
 static ucontext_t driver_ctx;
-static ucontext_t coro[ SLOTS ];
-static char * coro_stack[ SLOTS ];
+static ucontext_t coro[ SLOTS + 1 ];
+static char * coro_stack[ SLOTS + 1 ];
 static struct call coro_call[ SLOTS ];
 static int pending[ SLOTS ];
 static int coro_done[ SLOTS ];
@@ -166,11 +227,15 @@ static long coro_result[ SLOTS ];
 static int in_coro = -1;
 static int coro_start_slot;
 
+extern volatile int fake_suspended;
+
 /* A yield of the core the coroutine runs on: if the call has just blocked,
- * leave the kernel here. Any other yield (a preemption) is only recorded. */
+ * leave the kernel here. Any other yield (a preemption, or one taken while
+ * the scheduler is suspended, which a real switch declines) is only
+ * recorded. */
 static void on_yield( void )
 {
-    if( ( in_coro >= 0 ) && fake_blocking )
+    if( ( in_coro >= 0 ) && fake_blocking && ( fake_suspended == 0 ) )
     {
         fake_blocking = 0;
         swapcontext( &coro[ in_coro ], &driver_ctx );
@@ -259,6 +324,14 @@ static void coro_main( void )
         case CALL_BRECV:
             coro_result[ s ] = buffer_recv( c->q, c->a, c->ticks );
             break;
+
+        case CALL_TCMD:
+            coro_result[ s ] = timer_cmd( c->q, c->a, c->value, c->ticks );
+            break;
+
+        case CALL_TPEND:
+            coro_result[ s ] = xTimerPendFunctionCall( pended_fn, NULL, c->value, c->ticks );
+            break;
     }
 
     coro_done[ s ] = 1;
@@ -282,6 +355,42 @@ static long run_coro( int s )
 
     pending[ s ] = 1;
     return -2;
+}
+
+static void daemon_main( void )
+{
+    daemon_code( daemon_param ); /* never returns */
+}
+
+/* Run the timer daemon until it blocks again: the callbacks and pended
+ * functions it ran. It is never preempted -- it has the top priority -- so
+ * the only yield that leaves it is the one after it blocks. */
+static long run_daemon( void )
+{
+    unsigned long before = daemon_work;
+
+    if( !daemon_started )
+    {
+        coro_stack[ DAEMON ] = malloc( CORO_STACK );
+        getcontext( &coro[ DAEMON ] );
+        coro[ DAEMON ].uc_stack.ss_sp = coro_stack[ DAEMON ];
+        coro[ DAEMON ].uc_stack.ss_size = CORO_STACK;
+        coro[ DAEMON ].uc_link = &driver_ctx;
+        makecontext( &coro[ DAEMON ], daemon_main, 0 );
+        daemon_started = 1;
+    }
+
+    in_coro = DAEMON;
+    fake_blocking = 0;
+    swapcontext( &driver_ctx, &coro[ DAEMON ] );
+    in_coro = -1;
+
+    for( int g = 0; g < GSLOTS; g++ )
+    {
+        group_pend_out[ g ] = 0;
+    }
+
+    return ( long ) ( daemon_work - before );
 }
 
 static long start_call( int s,
@@ -527,6 +636,26 @@ static void line( unsigned step,
         printf( b + 1 < BSLOTS ? "." : "" );
     }
 
+    /* Each timer's callbacks and whether it is active, then the orphans;
+     * then the pended functions' sum. */
+    printf( " F=" );
+
+    for( int t = 0; t < TSLOTS; t++ )
+    {
+        if( tmr[ t ] == NULL )
+        {
+            printf( "-" );
+        }
+        else
+        {
+            printf( "%lu%c", fired[ t ], xTimerIsTimerActive( tmr[ t ] ) ? 'a' : 'i' );
+        }
+
+        printf( t + 1 < TSLOTS ? "." : "" );
+    }
+
+    printf( "/%lu P=%lu", fired[ TSLOTS ], pended_sum );
+
     printf( "\n" );
 }
 
@@ -534,7 +663,10 @@ static void line( unsigned step,
  * leave the mutex naming a freed TCB). */
 static int holds_a_mutex( TaskHandle_t t )
 {
-    return ( xSemaphoreGetMutexHolder( mutex ) == t ) || ( xSemaphoreGetMutexHolder( rmutex ) == t );
+    /* The FromISR read: no critical section. A guard must not touch the
+     * kernel in a way the replay does not -- on two cores every task-level
+     * exit is a yield point (`vTaskExitCritical`). */
+    return ( xSemaphoreGetMutexHolderFromISR( mutex ) == t ) || ( xSemaphoreGetMutexHolderFromISR( rmutex ) == t );
 }
 
 /* -------------------------------------------------------- the families -- */
@@ -575,6 +707,8 @@ static long call_from_task( int s,
         case CALL_GSYNC:  return ( long ) xEventGroupSync( group[ c.q ], c.value, c.a, 0 );
         case CALL_BSEND:  return buffer_send( c.q, c.a, c.value, 0 );
         case CALL_BRECV:  return buffer_recv( c.q, c.a, 0 );
+        case CALL_TCMD:   return timer_cmd( c.q, c.a, c.value, 0 );
+        case CALL_TPEND:  return xTimerPendFunctionCall( pended_fn, NULL, c.value, 0 );
     }
 
     return 0;
@@ -767,7 +901,7 @@ static long mutex_op( int cur_slot,
              * The holder GIVES instead, which is also what keeps the mutex
              * changing hands: given only when its holder happened to be the
              * caller, it sat held for 19,208 of 20,000 steps. */
-            if( xSemaphoreGetMutexHolder( mutex ) == cur )
+            if( xSemaphoreGetMutexHolderFromISR( mutex ) == cur )
             {
                 r = xSemaphoreGive( mutex );
                 snprintf( op, n, "mgive" );
@@ -782,7 +916,7 @@ static long mutex_op( int cur_slot,
 
         case 2:
 
-            if( xSemaphoreGetMutexHolder( mutex ) != cur )
+            if( xSemaphoreGetMutexHolderFromISR( mutex ) != cur )
             {
                 snprintf( op, n, "noop" );
                 return 0;
@@ -940,9 +1074,10 @@ static long notify_op( int cur_slot,
     }
 }
 
-/* The event-group family, task context (the ISR set and clear are deferred
- * to the timer daemon, which this script keeps suspended until P1.7). Bits
- * stay in the low four; a wait mask is never zero (the C asserts it). */
+/* The event-group family. The ISR set and clear are deferred to the timer
+ * daemon (`xTimerPendFunctionCallFromISR`), so they also fail when its
+ * one-slot queue is full. Bits stay in the low four; a wait mask is never
+ * zero (the C asserts it). */
 static long group_op( int cur_slot,
                       unsigned slot,
                       unsigned arg,
@@ -950,7 +1085,7 @@ static long group_op( int cur_slot,
                       size_t n )
 {
     int g = ( int ) ( slot % GSLOTS );
-    unsigned which = ( arg >> 8 ) % 9;
+    unsigned which = ( arg >> 8 ) % 11;
     EventBits_t bits = ( arg >> 12 ) % 16;
     EventBits_t mask = 1 + ( arg >> 16 ) % 15;
     TickType_t ticks = block_ticks( arg );
@@ -967,7 +1102,7 @@ static long group_op( int cur_slot,
     {
         case 0:
 
-            if( group_has_waiter( g ) )
+            if( group_has_waiter( g ) || group_pend_out[ g ] )
             {
                 snprintf( op, n, "noop" );
                 return 0;
@@ -1013,6 +1148,24 @@ static long group_op( int cur_slot,
             return r;
         }
 
+        case 9:
+        case 10:
+        {
+            BaseType_t woken = pdFALSE;
+            isr_enter();
+            r = ( which == 9 ) ? xEventGroupSetBitsFromISR( group[ g ], bits, &woken )
+                : xEventGroupClearBitsFromISR( group[ g ], bits );
+            isr_exit( woken );
+
+            if( r )
+            {
+                group_pend_out[ g ]++;
+            }
+
+            snprintf( op, n, "%s %d %lu", ( which == 9 ) ? "gset_isr" : "gclear_isr", g, ( unsigned long ) bits );
+            return r;
+        }
+
         default:
         {
             if( cur_slot < 0 )
@@ -1026,6 +1179,166 @@ static long group_op( int cur_slot,
             snprintf( op, n, "gsync %d %lu %lu %lu", g, ( unsigned long ) bits, ( unsigned long ) mask, ( unsigned long ) ticks );
             return r;
         }
+    }
+}
+
+/* Whether a task is blocked sending a command for timer slot t: such a
+ * timer is not deleted (the command would name a freed timer). */
+static int timer_has_sender( int t )
+{
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( pending[ i ] && ( coro_call[ i ].kind == CALL_TCMD ) && ( coro_call[ i ].q == t ) )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* The timer family. Periods are 1..6 ticks. A delete posts its command and
+ * forgets the handle at once: the daemon frees the timer, so nothing may
+ * name it afterwards. Expiry is read only while active -- a timer never
+ * started has an item value nothing ever wrote. */
+static long timer_op( int cur_slot,
+                      unsigned slot,
+                      unsigned arg,
+                      char * op,
+                      size_t n )
+{
+    int t = ( int ) ( slot % TSLOTS );
+    unsigned which = ( arg >> 8 ) % 17;
+    uint32_t period = 1 + ( arg >> 4 ) % 6;
+    uint32_t value = ( arg >> 12 ) % 10;
+    TickType_t ticks = block_ticks( arg >> 20 );
+    BaseType_t woken = pdFALSE;
+    long r;
+
+    if( ( which == 15 ) || ( which == 16 ) )
+    {
+        if( which == 15 )
+        {
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { CALL_TPEND, ticks, 0, value, 0, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "tpend %lu %lu", ( unsigned long ) value, ( unsigned long ) ticks );
+            return r;
+        }
+
+        isr_enter();
+        r = xTimerPendFunctionCallFromISR( pended_fn, NULL, value, &woken );
+        isr_exit( woken );
+        snprintf( op, n, "tpend_isr %lu", ( unsigned long ) value );
+        return r;
+    }
+
+    if( tmr[ t ] == NULL )
+    {
+        UBaseType_t reload = ( arg >> 16 ) & 1;
+        tmr[ t ] = xTimerCreate( "T", period, reload, ( void * ) ( uintptr_t ) t, timer_cb );
+        snprintf( op, n, "tcreate %d %lu %lu", t, ( unsigned long ) period, ( unsigned long ) reload );
+        return tmr[ t ] ? 1 : -1;
+    }
+
+    switch( which )
+    {
+        case 0:
+
+            if( timer_has_sender( t ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = xTimerDelete( tmr[ t ], 0 );
+
+            if( r )
+            {
+                tmr[ t ] = NULL;
+            }
+
+            snprintf( op, n, "tdelete %d", t );
+            return r;
+
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        {
+            static const uint32_t cmds[] = { 0, 0, 1, 2, 3 };
+            static const char * names[] = { "tstart", "tstart", "tstop", "treset", "tperiod" };
+
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { CALL_TCMD, ticks, t, period, cmds[ which - 1 ], 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "%s %d %lu %lu", names[ which - 1 ], t, ( unsigned long ) period, ( unsigned long ) ticks );
+            return r;
+        }
+
+        case 6:
+        case 7:
+        case 8:
+        case 9:
+            isr_enter();
+
+            switch( which )
+            {
+                case 6:  r = xTimerStartFromISR( tmr[ t ], &woken ); break;
+                case 7:  r = xTimerStopFromISR( tmr[ t ], &woken ); break;
+                case 8:  r = xTimerResetFromISR( tmr[ t ], &woken ); break;
+                default: r = xTimerChangePeriodFromISR( tmr[ t ], period, &woken ); break;
+            }
+
+            isr_exit( woken );
+            snprintf( op, n, "%s %d %lu", ( which == 6 ) ? "tstart_isr" : ( which == 7 ) ? "tstop_isr" : ( which == 8 ) ? "treset_isr" : "tperiod_isr",
+                      t, ( unsigned long ) period );
+            return r;
+
+        case 10:
+            r = xTimerIsTimerActive( tmr[ t ] );
+            snprintf( op, n, "tactive %d", t );
+            return r;
+
+        case 11:
+            r = ( long ) xTimerGetPeriod( tmr[ t ] ) + 100 * ( long ) uxTimerGetReloadMode( tmr[ t ] ) +
+                1000 * ( long ) ( uintptr_t ) pvTimerGetTimerID( tmr[ t ] );
+            snprintf( op, n, "tinfo %d", t );
+            return r;
+
+        case 12:
+            vTimerSetReloadMode( tmr[ t ], value & 1 );
+            snprintf( op, n, "treload %d %lu", t, ( unsigned long ) ( value & 1 ) );
+            return 0;
+
+        case 13:
+            vTimerSetTimerID( tmr[ t ], ( void * ) ( uintptr_t ) value );
+            snprintf( op, n, "tsetid %d %lu", t, ( unsigned long ) value );
+            return 0;
+
+        default:
+
+            /* A real call, so a real op: the replay makes it too. */
+            if( !xTimerIsTimerActive( tmr[ t ] ) )
+            {
+                snprintf( op, n, "tinactive %d", t );
+                return 0;
+            }
+
+            r = ( long ) xTimerGetExpiryTime( tmr[ t ] );
+            snprintf( op, n, "texpiry %d", t );
+            return r;
     }
 }
 
@@ -1224,7 +1537,10 @@ int main( int argc,
 
     vTaskStartScheduler();
     fake_core = 0;
-    vTaskSuspend( xTimerGetTimerDaemonTaskHandle() );
+    daemon = xTimerGetTimerDaemonTaskHandle();
+    daemon_code = fake_last_code;
+    daemon_param = fake_last_param;
+    configASSERT( daemon_code != body );
     fake_yields = 0;
 
     for( int c = 0; c < configNUMBER_OF_CORES; c++ )
@@ -1257,6 +1573,14 @@ int main( int argc,
          * continuation. */
         int cur_slot = slot_of( xTaskGetCurrentTaskHandleForCore( core ) );
 
+        /* The daemon runs whenever it is current: until it blocks again. */
+        if( xTaskGetCurrentTaskHandleForCore( core ) == daemon )
+        {
+            r = run_daemon();
+            line( step, core, "daemon", r, fake_yields );
+            continue;
+        }
+
         if( ( cur_slot >= 0 ) && pending[ cur_slot ] )
         {
             r = run_coro( cur_slot );
@@ -1264,7 +1588,7 @@ int main( int argc,
             continue;
         }
 
-        if( kind < 6 )
+        if( kind < 5 )
         {
             if( t == NULL )
             {
@@ -1279,7 +1603,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 11 )
+        else if( kind < 9 )
         {
             /* Not a mutex holder, and not a task blocked on a stream
              * buffer: a buffer records its waiting task by HANDLE, not on a
@@ -1300,7 +1624,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 18 )
+        else if( kind < 15 )
         {
             if( t != NULL )
             {
@@ -1312,7 +1636,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 25 )
+        else if( kind < 21 )
         {
             if( t != NULL )
             {
@@ -1324,7 +1648,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 32 )
+        else if( kind < 27 )
         {
             if( t != NULL )
             {
@@ -1337,7 +1661,7 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 38 )
+        else if( kind < 32 )
         {
             if( cur_slot >= 0 )
             {
@@ -1350,12 +1674,12 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 43 )
+        else if( kind < 36 )
         {
             r = xSemaphoreGive( sem );
             snprintf( op, sizeof op, "give" );
         }
-        else if( kind < 46 )
+        else if( kind < 39 )
         {
             BaseType_t woken = pdFALSE;
             isr_enter();
@@ -1363,7 +1687,7 @@ int main( int argc,
             isr_exit( woken );
             snprintf( op, sizeof op, "give_isr" );
         }
-        else if( kind < 51 )
+        else if( kind < 43 )
         {
             if( cur_slot >= 0 )
             {
@@ -1376,27 +1700,31 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 65 )
+        else if( kind < 56 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 74 )
+        else if( kind < 64 )
         {
             r = mutex_op( cur_slot, arg, op, sizeof op );
         }
-        else if( kind < 81 )
+        else if( kind < 71 )
         {
             r = notify_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 85 )
+        else if( kind < 76 )
         {
             r = group_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 93 )
+        else if( kind < 83 )
         {
             r = buffer_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 98 )
+        else if( kind < 91 )
+        {
+            r = timer_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 96 )
         {
             /* As every SMP port's tick handler does (RP2040's included):
              * xTaskIncrementTick inside the ISR critical section, on core 0. */

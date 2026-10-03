@@ -230,6 +230,12 @@ pub(crate) struct Tcb {
     /// event item value — so the second call has to know it is the far side
     /// of the switch and not a fresh wait.
     event_blocked: bool,
+    /// What a timer command that blocked on a full command queue is sending:
+    /// for `xTimerStart` and `xTimerReset`, the tick count the C read ONCE,
+    /// before the send, and carries through the block in its message. See
+    /// [`Kernel::timer_command`]. Two words taken out of `_stride_pad`, so it
+    /// costs no RAM.
+    held: crate::timer::Split64,
     /// Padding that rounds `Slot<Tcb>` up to a POWER OF TWO (128 bytes), so
     /// `index * size_of::<Slot<Tcb>>()` is a shift and not a multiply.
     ///
@@ -248,17 +254,18 @@ pub(crate) struct Tcb {
 /// the `Name` alignment (see [`crate::name::Name`], aligned to eight on a
 /// 64-bit host only) both change size. Nine words gives 128 bytes on a 32-bit
 /// target -- the number `bench/kernel-ram` pins and `bench/kernel-flash`'s
-/// `mul = 0` depends on -- and four gives 128 on the host.
+/// `mul = 0` depends on -- and four gives 128 on the host. Two of each went to
+/// [`Tcb::held`] (2026-10-02), so it is seven and two now.
 ///
 /// Before this was split, the host slot was 144 bytes and every TCB index cost
 /// a `lea`+`shl` where a power-of-two stride costs one `shl`.
 #[cfg(target_pointer_width = "64")]
-pub(crate) const STRIDE_PAD_WORDS: usize = 4;
+pub(crate) const STRIDE_PAD_WORDS: usize = 2;
 
-/// See the 64-bit case above; nine words is what makes an rv32 `Slot<Tcb>` 128
-/// bytes, and that number is pinned by two benches.
+/// See the 64-bit case above; seven words is what makes an rv32 `Slot<Tcb>`
+/// 128 bytes, and that number is pinned by two benches.
 #[cfg(not(target_pointer_width = "64"))]
-pub(crate) const STRIDE_PAD_WORDS: usize = 9;
+pub(crate) const STRIDE_PAD_WORDS: usize = 7;
 
 /// How many notification slots a task has room for.
 ///
@@ -467,6 +474,10 @@ pub struct Kernel<
     running: bool,
     /// `xYieldPendings`, per core.
     yield_pending: [bool; MAX_CORES],
+    /// `portGET_CRITICAL_NESTING_COUNT( xCoreID )`, kept by the kernel on
+    /// two cores and more, where the outermost exit is a yield point (see
+    /// [`Kernel::exit_critical`]). Unused, and never written, on one core.
+    nesting: [u8; MAX_CORES],
     /// Which of the two delayed lists is `pxDelayedTaskList` right now.
     delayed_swapped: bool,
     /// Which of the two timer lists is `pxCurrentTimerList` right now.
@@ -761,6 +772,7 @@ where
             running: false,
             next_unblock_time: Self::MAX_DELAY,
             yield_pending: [false; MAX_CORES],
+            nesting: [0; MAX_CORES],
             yield_requested: [false; MAX_CORES],
             core_yields: 0,
             idle: [TaskHandle::NULL; MAX_CORES],
@@ -1332,6 +1344,12 @@ where
     /// `taskENTER_CRITICAL()`.
     pub fn enter_critical(&mut self) {
         self.port.enter_critical();
+        if C::NUMBER_OF_CORES > 1 {
+            let core = self.core();
+            if let Some(n) = self.nesting.get_mut(core) {
+                *n = n.wrapping_add(1);
+            }
+        }
     }
 
     /// `taskEXIT_CRITICAL()`.
@@ -1345,11 +1363,45 @@ where
     /// it saves that scenario 210,292 and costs `BlockQ` 200,912 and
     /// `GenQTest` 280,540, for a net loss of 271,962 over six scenarios.
     /// Whatever the hot sites gain, the switch-heavy ones lose more.
+    ///
+    /// # On two cores the outermost exit is a yield point
+    ///
+    /// SMP `vTaskExitCritical` reads `xYieldPendings[ xCoreID ]` as the
+    /// nesting reaches zero and yields if it is set -- whoever set it. A yield
+    /// left pending by an interrupt that had no woken pointer to report it
+    /// through (`xEventGroupClearBitsFromISR`, or any `FromISR` call passed
+    /// `NULL`) is taken at the next task-level exit on that core. Kairos took
+    /// it only at the sites that had set it themselves, so the task the
+    /// interrupt readied waited for some later switch: the API differential
+    /// caught it (two cores, a `vTaskSuspend` four steps after the ISR).
+    ///
+    /// Sampled BEFORE the port exit, as the C samples before it re-enables
+    /// interrupts, and taken after it. One core has no such rule -- its
+    /// `vTaskExitCritical` never yields -- and compiles none of this.
     pub fn exit_critical(&mut self) {
+        let owed = C::NUMBER_OF_CORES > 1 && self.leave_critical_smp();
         self.port.exit_critical();
         if self.port.take_pending_tick() {
             self.tick_on_exit();
         }
+        if owed {
+            self.port_yield();
+        }
+    }
+
+    /// Drop this core's nesting; `true` when that was the outermost exit and
+    /// a yield is pending here. Not before the scheduler runs, and not in the
+    /// tail of a frame a tick switched away from (`unwinding`): the C thread
+    /// is stopped there. [`Kernel::port_yield`] never reaches this -- its
+    /// section goes to the port directly.
+    #[inline(always)]
+    fn leave_critical_smp(&mut self) -> bool {
+        let core = self.core();
+        let Some(n) = self.nesting.get_mut(core) else {
+            return false;
+        };
+        *n = n.saturating_sub(1);
+        *n == 0 && self.running && self.unwinding.is_null() && self.pending_on(core)
     }
 
     /// The tick as [`Kernel::exit_critical`] reaches it, deliberately out of
@@ -1514,7 +1566,12 @@ where
     /// Worth queue -7, group -3 on its own.
     #[cold]
     pub(crate) fn port_yield(&mut self) {
-        self.enter_critical();
+        // The port's section, not the kernel's: on two cores the kernel's
+        // outermost exit is a yield point, and a yield is not one of its
+        // own -- on a port that commits its own switches the flag is still
+        // set at this exit, so it would yield again for ever. On one core the
+        // two are the same code.
+        self.port.enter_critical();
         self.port.count_yield();
         if P::COMMITS_SWITCH {
             // A STACKED port. Raise its switching exception and leave
@@ -1533,7 +1590,10 @@ where
             // architecture takes, and it is unchanged.
             self.switch_context();
         }
-        self.exit_critical();
+        self.port.exit_critical();
+        if self.port.take_pending_tick() {
+            self.tick_on_exit();
+        }
     }
 
     /// `taskYIELD()` from a task body (the idle task's yield).
@@ -1589,6 +1649,7 @@ where
             stream_timed: false,
             stream_waited: false,
             stream_local: 0,
+            held: crate::timer::Split64::new(0),
             _stride_pad: [0; STRIDE_PAD_WORDS],
         };
         let handle = match self.tcbs.try_insert(tcb) {
@@ -3386,6 +3447,30 @@ where
     pub(crate) fn park_stream_sample(&mut self, task: TaskHandle, local: usize) {
         if let Ok(tcb) = self.tcbs.resolve_mut(task) {
             tcb.stream_local = local;
+        }
+    }
+
+    /// Whether `task` is part-way through a blocking call on `queue` -- its
+    /// wait frame is that queue's -- so the call it is making now is the
+    /// retry of one that blocked.
+    pub(crate) fn waiting_on(&self, task: TaskHandle, queue: QueueHandle) -> bool {
+        if !self.flag(task.index() as usize, Self::F_WAIT, false) {
+            return false;
+        }
+        self.tcbs
+            .resolve(task)
+            .is_ok_and(|t| t.wait.entry_set && t.wait.queue == queue)
+    }
+
+    /// The value [`Kernel::hold`] kept for `task`.
+    pub(crate) fn held(&self, task: TaskHandle) -> u64 {
+        self.tcbs.resolve(task).map_or(0, |t| t.held.get())
+    }
+
+    /// Keep what a blocked timer command is sending, for its retry.
+    pub(crate) fn hold(&mut self, task: TaskHandle, value: u64) {
+        if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+            tcb.held = crate::timer::Split64::new(value);
         }
     }
 

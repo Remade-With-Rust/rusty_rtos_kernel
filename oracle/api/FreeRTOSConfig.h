@@ -32,7 +32,7 @@
 #define configUSE_TASK_NOTIFICATIONS            1
 #define configTASK_NOTIFICATION_ARRAY_ENTRIES   1
 #define configUSE_TIMERS                        1
-#define configTIMER_TASK_PRIORITY               4
+#define configTIMER_TASK_PRIORITY               2
 #define configTIMER_QUEUE_LENGTH                1
 #define configTIMER_TASK_STACK_DEPTH            128
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
@@ -51,6 +51,7 @@
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
 #define INCLUDE_xQueueGetMutexHolder            1
 #define INCLUDE_xTimerGetTimerDaemonTaskHandle  1
+#define INCLUDE_xTimerPendFunctionCall          1
 
 void vAssertCalled( const char * file, int line );
 #define configASSERT( x )    if( ( x ) == 0 ) vAssertCalled( __FILE__, __LINE__ )
@@ -67,5 +68,18 @@ void fake_trace_blocking( void );
 #define traceEVENT_GROUP_WAIT_BITS_BLOCK( g, w )        fake_trace_blocking()
 #define traceTASK_NOTIFY_TAKE_BLOCK( i )                fake_trace_blocking()
 #define traceTASK_NOTIFY_WAIT_BLOCK( i )                fake_trace_blocking()
+/* The timer daemon's block: `vQueueWaitForMessageRestricted` places it with
+ * no BLOCKING trace of its own. Only the daemon ever calls this. */
+#define traceENTER_vTaskPlaceOnEventListRestricted( l, t, w )    fake_trace_blocking()
+/* How deep the scheduler is suspended. A blocking call's trace hook fires
+ * BEFORE it places the task, and between the two a critical-section exit can
+ * take a yield pended by an ISR with no woken pointer (on two cores,
+ * `vTaskExitCritical` yields even while suspended). A real port's switch
+ * declines that one and the task carries on, so only a yield with the
+ * scheduler running is the block. Every resume decrements before it can
+ * yield, so counting at entry is exact. */
+extern volatile int fake_suspended;
+#define traceENTER_vTaskSuspendAll()    ( fake_suspended++ )
+#define traceENTER_xTaskResumeAll()     ( fake_suspended-- )
 
 #endif /* FREERTOS_CONFIG_H */

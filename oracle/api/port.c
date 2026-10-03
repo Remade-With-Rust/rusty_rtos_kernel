@@ -30,6 +30,9 @@ volatile int fake_in_isr = 0;
  * an event list, so its next yield is a BLOCK, not a preemption. */
 volatile int fake_blocking = 0;
 
+/* See FreeRTOSConfig.h: the scheduler's suspension depth. */
+volatile int fake_suspended = 0;
+
 /* What a yield of this core does besides recording it (the driver's
  * coroutine switch). */
 void ( * fake_yield_hook )( void ) = NULL;
@@ -49,12 +52,19 @@ void fake_yield( void )
     }
 }
 
+/* The last task body the kernel set a stack up for. `vTaskStartScheduler`
+ * creates the timer daemon LAST, so straight after it this is
+ * `prvTimerTask` -- which is static, and which the driver runs as a
+ * coroutine. App tasks never run their bodies. */
+TaskFunction_t fake_last_code = NULL;
+void * fake_last_param = NULL;
+
 StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
                                      TaskFunction_t pxCode,
                                      void * pvParameters )
 {
-    ( void ) pxCode;
-    ( void ) pvParameters;
+    fake_last_code = pxCode;
+    fake_last_param = pvParameters;
     return pxTopOfStack;
 }
 

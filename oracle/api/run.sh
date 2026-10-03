@@ -13,7 +13,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 kernel="$here/../../../oracle/FreeRTOS-Kernel"
 [ -f "$kernel/tasks.c" ] || { echo "no FreeRTOS-Kernel at $kernel -- run \`kairos oracle fetch\` first" >&2; exit 1; }
 SEED=${SEED:-0x2545f491}
-STEPS=${STEPS:-20000}
+STEPS=${STEPS:-24000}
 for cores in 1 2; do
     cc -O1 -g -Wall -Wno-unused-parameter -DCORES=$cores \
         -I "$here" -I "$kernel/include" \
