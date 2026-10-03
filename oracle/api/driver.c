@@ -45,6 +45,7 @@
 #include "semphr.h"
 #include "task.h"
 #include "timers.h"
+#include "event_groups.h"
 
 #define SLOTS     10 /* app tasks */
 #define QSLOTS    3  /* queues */
@@ -65,6 +66,8 @@ static QueueHandle_t queue[ QSLOTS ];
 static SemaphoreHandle_t mutex;  /* a mutex: priority inheritance */
 static SemaphoreHandle_t rmutex; /* a recursive mutex */
 static SemaphoreHandle_t csem;   /* a counting semaphore, max 3, from 1 */
+#define GSLOTS    2                /* event groups */
+static EventGroupHandle_t group[ GSLOTS ];
 static unsigned queue_len[ QSLOTS ];
 
 static void body( void * p )
@@ -81,7 +84,12 @@ static void body( void * p )
 extern volatile int fake_blocking;
 extern void ( * fake_yield_hook )( void );
 
-enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT };
+enum call_kind { CALL_TAKE, CALL_QSEND, CALL_QSENDF, CALL_QRECV, CALL_QPEEK, CALL_MTAKE, CALL_RTAKE, CALL_CTAKE, CALL_NTAKE, CALL_NWAIT, CALL_GWAIT, CALL_GSYNC };
+
+static int is_group_call( enum call_kind k )
+{
+    return ( k == CALL_GWAIT ) || ( k == CALL_GSYNC );
+}
 
 static int is_queue_call( enum call_kind k )
 {
@@ -186,6 +194,14 @@ static void coro_main( void )
         case CALL_NWAIT:
             coro_result[ s ] = notify_wait( c->a, c->b, c->ticks );
             break;
+
+        case CALL_GWAIT:
+            coro_result[ s ] = ( long ) xEventGroupWaitBits( group[ c->q ], c->a, c->b & 1, ( c->b >> 1 ) & 1, c->ticks );
+            break;
+
+        case CALL_GSYNC:
+            coro_result[ s ] = ( long ) xEventGroupSync( group[ c->q ], c->value, c->a, c->ticks );
+            break;
     }
 
     coro_done[ s ] = 1;
@@ -237,6 +253,20 @@ static int queue_has_waiter( int q )
     for( int i = 0; i < SLOTS; i++ )
     {
         if( pending[ i ] && is_queue_call( coro_call[ i ].kind ) && ( coro_call[ i ].q == q ) )
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* The same rule for an event group: no deleting one a task waits on. */
+static int group_has_waiter( int g )
+{
+    for( int i = 0; i < SLOTS; i++ )
+    {
+        if( pending[ i ] && is_group_call( coro_call[ i ].kind ) && ( coro_call[ i ].q == g ) )
         {
             return 1;
         }
@@ -365,6 +395,48 @@ static void line( unsigned step,
         printf( i + 1 < SLOTS ? "." : "" );
     }
 
+    /* A debugging aid, off unless asked for: KAIROS_API_DEBUG=<step> writes
+     * every pending call (task slot, kind, object) to stderr at that step. */
+    {
+        static long debug_at = -2;
+
+        if( debug_at == -2 )
+        {
+            const char * e = getenv( "KAIROS_API_DEBUG" );
+            debug_at = e ? strtol( e, NULL, 0 ) : -1;
+        }
+
+        if( ( long ) step == debug_at )
+        {
+            for( int i = 0; i < SLOTS; i++ )
+            {
+                if( pending[ i ] )
+                {
+                    fprintf( stderr, "step %u pending: slot %d (%s) kind %d obj %d a=%lu b=%lu value=%lu ticks=%lu\n",
+                             step, i, name_of( app[ i ] ), ( int ) coro_call[ i ].kind, coro_call[ i ].q,
+                             ( unsigned long ) coro_call[ i ].a, ( unsigned long ) coro_call[ i ].b,
+                             ( unsigned long ) coro_call[ i ].value, ( unsigned long ) coro_call[ i ].ticks );
+                }
+            }
+        }
+    }
+
+    printf( " E=" );
+
+    for( int g = 0; g < GSLOTS; g++ )
+    {
+        if( group[ g ] == NULL )
+        {
+            printf( "-" );
+        }
+        else
+        {
+            printf( "%lu", ( unsigned long ) xEventGroupGetBits( group[ g ] ) );
+        }
+
+        printf( g + 1 < GSLOTS ? "." : "" );
+    }
+
     printf( "\n" );
 }
 
@@ -409,6 +481,8 @@ static long call_from_task( int s,
         case CALL_CTAKE:  return xSemaphoreTake( csem, 0 );
         case CALL_NTAKE:  return ( long ) ulTaskNotifyTake( c.a, 0 );
         case CALL_NWAIT:  return notify_wait( c.a, c.b, 0 );
+        case CALL_GWAIT:  return ( long ) xEventGroupWaitBits( group[ c.q ], c.a, c.b & 1, ( c.b >> 1 ) & 1, 0 );
+        case CALL_GSYNC:  return ( long ) xEventGroupSync( group[ c.q ], c.value, c.a, 0 );
     }
 
     return 0;
@@ -774,6 +848,95 @@ static long notify_op( int cur_slot,
     }
 }
 
+/* The event-group family, task context (the ISR set and clear are deferred
+ * to the timer daemon, which this script keeps suspended until P1.7). Bits
+ * stay in the low four; a wait mask is never zero (the C asserts it). */
+static long group_op( int cur_slot,
+                      unsigned slot,
+                      unsigned arg,
+                      char * op,
+                      size_t n )
+{
+    int g = ( int ) ( slot % GSLOTS );
+    unsigned which = ( arg >> 8 ) % 9;
+    EventBits_t bits = ( arg >> 12 ) % 16;
+    EventBits_t mask = 1 + ( arg >> 16 ) % 15;
+    TickType_t ticks = block_ticks( arg );
+    long r;
+
+    if( group[ g ] == NULL )
+    {
+        group[ g ] = xEventGroupCreate();
+        snprintf( op, n, "gcreate %d", g );
+        return group[ g ] ? 1 : -1;
+    }
+
+    switch( which )
+    {
+        case 0:
+
+            if( group_has_waiter( g ) )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            vEventGroupDelete( group[ g ] );
+            group[ g ] = NULL;
+            snprintf( op, n, "gdelete %d", g );
+            return 0;
+
+        case 1:
+        case 2:
+            r = ( long ) xEventGroupSetBits( group[ g ], bits );
+            snprintf( op, n, "gset %d %lu", g, ( unsigned long ) bits );
+            return r;
+
+        case 3:
+            r = ( long ) xEventGroupClearBits( group[ g ], bits );
+            snprintf( op, n, "gclear %d %lu", g, ( unsigned long ) bits );
+            return r;
+
+        case 4:
+            isr_enter();
+            r = ( long ) xEventGroupGetBitsFromISR( group[ g ] );
+            isr_exit( pdFALSE );
+            snprintf( op, n, "gget_isr %d", g );
+            return r;
+
+        case 5:
+        case 6:
+        case 7:
+        {
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            unsigned flags = ( arg >> 4 ) % 4; /* bit 0 clear on exit, bit 1 wait for all */
+            struct call c = { CALL_GWAIT, ticks, g, 0, mask, flags };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "gwait %d %lu %u %lu", g, ( unsigned long ) mask, flags, ( unsigned long ) ticks );
+            return r;
+        }
+
+        default:
+        {
+            if( cur_slot < 0 )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            struct call c = { CALL_GSYNC, ticks, g, bits, mask, 0 };
+            r = call_from_task( cur_slot, c );
+            snprintf( op, n, "gsync %d %lu %lu %lu", g, ( unsigned long ) bits, ( unsigned long ) mask, ( unsigned long ) ticks );
+            return r;
+        }
+    }
+}
+
 /* ------------------------------------------------------- the script -- */
 
 int main( int argc,
@@ -947,17 +1110,21 @@ int main( int argc,
                 snprintf( op, sizeof op, "noop" );
             }
         }
-        else if( kind < 72 )
+        else if( kind < 69 )
         {
             r = queue_op( cur_slot, slot, arg, op, sizeof op );
         }
-        else if( kind < 82 )
+        else if( kind < 78 )
         {
             r = mutex_op( cur_slot, arg, op, sizeof op );
         }
-        else if( kind < 91 )
+        else if( kind < 85 )
         {
             r = notify_op( cur_slot, slot, arg, op, sizeof op );
+        }
+        else if( kind < 91 )
+        {
+            r = group_op( cur_slot, slot, arg, op, sizeof op );
         }
         else if( kind < 98 )
         {

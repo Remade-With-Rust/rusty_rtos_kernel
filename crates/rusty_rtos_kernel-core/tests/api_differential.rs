@@ -37,7 +37,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use rusty_rtos_core::config::Config;
-use rusty_rtos_core::handle::{QueueHandle, TaskHandle};
+use rusty_rtos_core::handle::{EventGroupHandle, QueueHandle, TaskHandle};
 use rusty_rtos_core::hooks::NoTickHook;
 use rusty_rtos_core::isr::Woken;
 use rusty_rtos_core::port::Port;
@@ -122,21 +122,56 @@ const QUEUES: usize = 12;
 const ITEMS: usize = 16;
 const SLOTS: usize = 10;
 const QSLOTS: usize = 3;
+const GSLOTS: usize = 2;
 
 /// A call that may block: made, and if it blocks made again when its task
 /// next runs.
 #[derive(Clone, Copy)]
 enum Call {
     Take(u64),
-    QSend { q: usize, value: u64, ticks: u64 },
-    QSendFront { q: usize, value: u64, ticks: u64 },
-    QRecv { q: usize, ticks: u64 },
-    QPeek { q: usize, ticks: u64 },
+    QSend {
+        q: usize,
+        value: u64,
+        ticks: u64,
+    },
+    QSendFront {
+        q: usize,
+        value: u64,
+        ticks: u64,
+    },
+    QRecv {
+        q: usize,
+        ticks: u64,
+    },
+    QPeek {
+        q: usize,
+        ticks: u64,
+    },
     MTake(u64),
     RTake(u64),
     CTake(u64),
-    NTake { clear: bool, ticks: u64 },
-    NWait { entry: u32, exit: u32, ticks: u64 },
+    NTake {
+        clear: bool,
+        ticks: u64,
+    },
+    NWait {
+        entry: u32,
+        exit: u32,
+        ticks: u64,
+    },
+    /// `flags`: bit 0 clear on exit, bit 1 wait for all.
+    GWait {
+        g: usize,
+        mask: u32,
+        flags: u32,
+        ticks: u64,
+    },
+    GSync {
+        g: usize,
+        set: u32,
+        mask: u32,
+        ticks: u64,
+    },
 }
 
 /// The C's `eNotifyAction`, by number, as the driver prints it.
@@ -181,14 +216,14 @@ macro_rules! replay {
                 NoTrace,
                 NoTickHook,
                 TASKS,
-                { list_slots_for(TASKS, 1, lists_for(5, QUEUES, 0)) },
-                { lists_for(5, QUEUES, 0) },
+                { list_slots_for(TASKS, 1, lists_for(5, QUEUES, GSLOTS)) },
+                { lists_for(5, QUEUES, GSLOTS) },
                 QUEUES,
                 ITEMS,
                 0,
                 0,
                 1,
-                0,
+                GSLOTS,
                 1,
             >;
             const CORES: u8 = <$config as Config>::NUMBER_OF_CORES;
@@ -202,6 +237,7 @@ macro_rules! replay {
                 mutex: QueueHandle,
                 rmutex: QueueHandle,
                 csem: QueueHandle,
+                groups: [Option<EventGroupHandle>; GSLOTS],
             }
 
             impl D {
@@ -263,6 +299,23 @@ macro_rules! replay {
                             self.k.notify_wait(0, entry, exit, ticks),
                             |(ok, v)| i64::from(ok) + 2 * i64::from(v),
                         ),
+                        Call::GWait { g, mask, flags, ticks } => {
+                            let group = self.groups[g].expect("a live group");
+                            waited(
+                                self.k.event_group_wait_bits(
+                                    group,
+                                    mask,
+                                    flags & 1 != 0,
+                                    flags & 2 != 0,
+                                    ticks,
+                                ),
+                                i64::from,
+                            )
+                        }
+                        Call::GSync { g, set, mask, ticks } => {
+                            let group = self.groups[g].expect("a live group");
+                            waited(self.k.event_group_sync(group, set, mask, ticks), i64::from)
+                        }
                     };
                     self.pending[slot] = (r == -2).then_some(call);
                     r
@@ -325,6 +378,19 @@ macro_rules! replay {
                             s.push('.');
                         }
                     }
+                    s.push_str(" E=");
+                    for g in 0..GSLOTS {
+                        match self.groups[g] {
+                            None => s.push('-'),
+                            Some(h) => {
+                                let bits = self.k.event_group_bits(h).map_or(-1, i64::from);
+                                let _ = write!(s, "{bits}");
+                            }
+                        }
+                        if g + 1 < GSLOTS {
+                            s.push('.');
+                        }
+                    }
                     // The idle task's reaping, which the C driver never needs
                     // to show: a deleted TCB the C leaves on its termination
                     // list costs nothing visible, but Kairos's reap slots are
@@ -363,6 +429,7 @@ macro_rules! replay {
                 mutex,
                 rmutex,
                 csem,
+                groups: [None; GSLOTS],
             };
             for (i, p) in init.iter().enumerate() {
                 d.app[i] = Some(d.k.create_task(&format!("t{i}"), *p).expect("initial task"));
@@ -504,6 +571,45 @@ macro_rules! replay {
                     "qfull_isr" => {
                         let h = d.queues[num(0) as usize].unwrap();
                         r = i64::from(d.k.queue_is_full_from_isr(h).unwrap_or(false));
+                    }
+                    "gcreate" => match d.k.event_group_create() {
+                        Ok(h) => {
+                            d.groups[num(0) as usize] = Some(h);
+                            r = 1;
+                        }
+                        Err(_) => r = -1,
+                    },
+                    "gdelete" => {
+                        let h = d.groups[num(0) as usize].take().unwrap();
+                        d.k.event_group_delete(h).expect("group delete");
+                    }
+                    "gset" | "gclear" | "gget_isr" => {
+                        let h = d.groups[num(0) as usize].unwrap();
+                        r = i64::from(match op {
+                            "gset" => d.k.event_group_set_bits(h, num(1) as u32).unwrap(),
+                            "gclear" => d.k.event_group_clear_bits(h, num(1) as u32).unwrap(),
+                            _ => d.k.event_group_bits_from_isr(h).unwrap(),
+                        });
+                    }
+                    "gwait" | "gsync" => {
+                        let s = cur_slot.expect("a group wait from an app task");
+                        let g = num(0) as usize;
+                        let call = if op == "gwait" {
+                            Call::GWait {
+                                g,
+                                mask: num(1) as u32,
+                                flags: num(2) as u32,
+                                ticks: num(3),
+                            }
+                        } else {
+                            Call::GSync {
+                                g,
+                                set: num(1) as u32,
+                                mask: num(2) as u32,
+                                ticks: num(3),
+                            }
+                        };
+                        r = d.call(s, call);
                     }
                     "ntf" | "ntfq" | "ntf_isr" | "ntfq_isr" => {
                         let t = d.app[num(0) as usize].unwrap();
@@ -649,6 +755,13 @@ fn exercised(trace: &str) {
         ("nwait", 60),
         ("nstate_clear", 60),
         ("nvalue_clear", 60),
+        ("gcreate", 40),
+        ("gdelete", 40),
+        ("gset", 100),
+        ("gclear", 50),
+        ("gget_isr", 50),
+        ("gwait", 100),
+        ("gsync", 30),
         ("tick", 500),
         ("cont", 200),
     ] {

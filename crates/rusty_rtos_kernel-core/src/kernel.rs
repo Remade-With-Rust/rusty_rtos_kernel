@@ -347,6 +347,11 @@ pub struct StartHandles {
 /// `TaskHandle` and two bytes and no instruction: `self.current[0]` is the
 /// same load the scalar field was.
 pub const MAX_CORES: usize = 2;
+
+/// `taskEVENT_LIST_ITEM_VALUE_IN_USE` at a 32-bit `EventBits_t`: the top bit
+/// of the control byte events.rs masks off. Set on an event item that holds
+/// an event-group wait's condition instead of a priority.
+pub(crate) const EVENT_LIST_ITEM_VALUE_IN_USE: u64 = 0x8000_0000;
 // [`Kernel::core`] MASKS a core id with `MAX_CORES - 1`. Out here rather
 // than in that body: a `const` block inside an `#[inline(always)]` accessor
 // is MIR the one-core build weighs at every call site.
@@ -4266,9 +4271,9 @@ where
                     }
                     self.tcbs.resolve_mut(target)?.base_priority = new_priority;
                 }
-                let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(new_priority));
-                self.lists
-                    .set_value(Self::event_item(target), event_value)?;
+                // "Only reset the event list item value if the value is not
+                // being used for anything else" (taskEVENT_LIST_ITEM_VALUE_IN_USE).
+                self.set_event_priority_value(target, new_priority)?;
                 let item = Self::state_item(target);
                 if self.lists.container(item)? == Some(Self::ready_list(used_on_entry)) {
                     let _ = self.lists.remove(item);
@@ -4678,12 +4683,13 @@ where
     /// condition rather than the priority, so the item goes on the end and
     /// the list is never sorted.
     ///
-    /// `taskEVENT_LIST_ITEM_VALUE_IN_USE` is not set here the way the C
-    /// sets it. The C needs it because the same `ListItem_t` is a
-    /// priority-ordered event item the rest of the time and the flag says
-    /// which; the value is only ever read back by the event-group code,
-    /// which masks the control byte off, so setting it would change
-    /// nothing but the arithmetic in the doc comment.
+    /// `taskEVENT_LIST_ITEM_VALUE_IN_USE` is set, as the C sets it: the same
+    /// item is a priority-ordered event item the rest of the time, and the
+    /// flag is how the priority setters know to leave a waiter's condition
+    /// alone (`set_event_priority_value`). This used to be omitted on the
+    /// argument that only the event-group code reads the value back; the
+    /// priority setters read it too, and the API differential caught one
+    /// rewriting a waiting task's mask (P1.5, two cores, step 4266).
     pub(crate) fn place_on_unordered_event_list(
         &mut self,
         list: ListId,
@@ -4691,7 +4697,8 @@ where
         ticks: u64,
     ) -> Result<()> {
         let item = Self::event_item(self.cur());
-        self.lists.set_value(item, value)?;
+        self.lists
+            .set_value(item, value | EVENT_LIST_ITEM_VALUE_IN_USE)?;
         self.lists.insert_end(list, item)?;
         self.add_current_task_to_delayed_list(ticks, true)
     }
@@ -4710,7 +4717,8 @@ where
         item: ItemId,
         value: u64,
     ) -> Result<()> {
-        self.lists.set_value(item, value)?;
+        self.lists
+            .set_value(item, value | EVENT_LIST_ITEM_VALUE_IN_USE)?;
         let task = self.task_of_event_item(item)?;
         let _ = self.lists.remove(item);
         let _ = self.lists.remove(Self::state_item(task));
@@ -4720,6 +4728,25 @@ where
             let _ = self.smp_readied(task, woken);
         } else if woken > self.current_priority() {
             self.set_pending_here(true);
+        }
+        Ok(())
+    }
+
+    /// Rewrite `task`'s event item with `priority`'s ordering value -- unless
+    /// the item holds an event-group wait's condition
+    /// (`taskEVENT_LIST_ITEM_VALUE_IN_USE`). `vTaskPrioritySet`,
+    /// `xTaskPriorityInherit` and `vTaskPriorityDisinheritAfterTimeout` all
+    /// leave such an item alone; overwriting it turned a waiter's "bit 3,
+    /// clear on exit" into "bits 0 and 1" (API differential P1.5).
+    pub(crate) fn set_event_priority_value(
+        &mut self,
+        task: TaskHandle,
+        priority: u8,
+    ) -> Result<()> {
+        let item = Self::event_item(task);
+        if self.lists.value(item)? & EVENT_LIST_ITEM_VALUE_IN_USE == 0 {
+            self.lists
+                .set_value(item, u64::from(C::MAX_PRIORITIES.saturating_sub(priority)))?;
         }
         Ok(())
     }
@@ -4839,9 +4866,7 @@ where
             // holder is running above its base, if it is.
             return Ok(holder_base < waiter_priority);
         }
-        let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(waiter_priority));
-        self.lists
-            .set_value(Self::event_item(holder), event_value)?;
+        self.set_event_priority_value(holder, waiter_priority)?;
         let item = Self::state_item(holder);
         if self.lists.container(item)? == Some(Self::ready_list(holder_priority)) {
             let _ = self.lists.remove(item);
@@ -4946,9 +4971,7 @@ where
             priority: Self::priority_value(target),
         });
         self.set_task_priority(holder, target)?;
-        let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(target));
-        self.lists
-            .set_value(Self::event_item(holder), event_value)?;
+        self.set_event_priority_value(holder, target)?;
         let item = Self::state_item(holder);
         if self.lists.container(item)? == Some(Self::ready_list(priority)) {
             let _ = self.lists.remove(item);
