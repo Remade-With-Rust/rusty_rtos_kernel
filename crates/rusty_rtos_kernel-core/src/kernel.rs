@@ -1512,7 +1512,12 @@ where
         let mut jump = ticks_to_jump.min(room);
 
         if self.tick.saturating_add(jump) == self.next_unblock_time && jump > 0 {
+            // `taskENTER_CRITICAL(); xPendedTicks++; taskEXIT_CRITICAL();` --
+            // a real section in the C, so a real exit here: on the sim the
+            // clock can move at it, and on two cores it is a yield point.
+            self.enter_critical();
             self.pended_ticks = self.pended_ticks.saturating_add(1);
+            self.exit_critical();
             jump = jump.wrapping_sub(1);
         }
 
@@ -3328,6 +3333,13 @@ where
                     let _ = self.lists.remove(item);
                 }
                 self.add_task_to_ready_list(task)?;
+                // `configUSE_TICKLESS_IDLE`: a task that leaves the delayed
+                // list early must not leave its wake time behind as the next
+                // unblock time, or a tickless sleep is cut short and a step
+                // (`step_tick`) stops at a wake that is no longer there.
+                if C::USE_TICKLESS_IDLE {
+                    self.reset_next_task_unblock_time();
+                }
             }
             let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
             if C::NUMBER_OF_CORES > 1 {
@@ -4881,6 +4893,11 @@ where
             .set_value(item, value | EVENT_LIST_ITEM_VALUE_IN_USE)?;
         let task = self.task_of_event_item(item)?;
         let _ = self.lists.remove(item);
+        // `configUSE_TICKLESS_IDLE`: here the C resets BEFORE the task leaves
+        // its delayed list, so the answer can still be the task's own wake.
+        if C::USE_TICKLESS_IDLE {
+            self.reset_next_task_unblock_time();
+        }
         let _ = self.lists.remove(Self::state_item(task));
         self.add_task_to_ready_list(task)?;
         let woken = self.tcbs.resolve(task)?.priority;
@@ -5235,6 +5252,10 @@ where
         if self.suspended_depth == 0 {
             let _ = self.lists.remove(Self::state_item(task));
             self.add_task_to_ready_list(task)?;
+            // `configUSE_TICKLESS_IDLE`, as in `notify`.
+            if C::USE_TICKLESS_IDLE {
+                self.reset_next_task_unblock_time();
+            }
         } else {
             self.lists.insert_end(Self::pending_ready_list(), item)?;
         }

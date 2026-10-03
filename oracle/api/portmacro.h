@@ -27,6 +27,7 @@ typedef uint32_t TickType_t;
 
 #define portMAX_DELAY              ( TickType_t ) 0xffffffffUL
 #define portTICK_TYPE_IS_ATOMIC    1
+#define portSUPPRESS_TICKS_AND_SLEEP( x )
 #define portSTACK_GROWTH           ( -1 )
 #define portTICK_PERIOD_MS         ( ( TickType_t ) 1000 / configTICK_RATE_HZ )
 #define portBYTE_ALIGNMENT         8

@@ -99,6 +99,11 @@ static unsigned queue_len[ QSLOTS ];
 #define SET_LEN    ( 3 * QSLOTS )
 static QueueSetHandle_t qset;
 static int in_set[ QSLOTS ];
+/* The last task deleted while it was running on a core: its TCB waits on
+ * the termination list for an idle task that never runs here, so its handle
+ * stays valid and eTaskGetState answers eDeleted. (One deleted while NOT
+ * running is freed at once, and must never be asked about.) */
+static TaskHandle_t dead;
 /* Each task's `pxPreviousWakeTime` for xTaskDelayUntil. */
 static TickType_t wake[ SLOTS ];
 
@@ -1250,7 +1255,7 @@ static long sched_op( int cur_slot,
                       char * op,
                       size_t n )
 {
-    unsigned which = ( arg >> 8 ) % 8;
+    unsigned which = ( arg >> 8 ) % 10;
     TaskHandle_t t = app[ slot ];
     BaseType_t woken = pdFALSE;
     long r = 0;
@@ -1350,9 +1355,40 @@ static long sched_op( int cur_slot,
             snprintf( op, n, "tickcount_isr" );
             return r;
 
-        default:
+        case 7:
             r = ( long ) uxQueueSpacesAvailable( sem );
             snprintf( op, n, "semspaces" );
+            return r;
+
+        case 8:
+        {
+            /* vTaskStepTick as a tickless port calls it: scheduler suspended,
+             * one tick. Never from 0xFFFFFFFF -- a step does not swap the
+             * delayed lists, so stepping across the wrap is undefined in both
+             * kernels -- and one tick never passes the next unblock time. */
+            TickType_t now = xTaskGetTickCount();
+
+            if( now != ( TickType_t ) 0xFFFFFFFFUL )
+            {
+                vTaskSuspendAll();
+                vTaskStepTick( 1 );
+                r = 1 + 2 * ( long ) xTaskResumeAll();
+            }
+
+            snprintf( op, n, "steptick" );
+            return r;
+        }
+
+        default:
+
+            if( dead == NULL )
+            {
+                snprintf( op, n, "noop" );
+                return 0;
+            }
+
+            r = ( long ) eTaskGetState( dead );
+            snprintf( op, n, "deadstate" );
             return r;
     }
 }
@@ -1763,6 +1799,97 @@ static long buffer_op( int cur_slot,
     }
 }
 
+/* ------------------------------------------------- authored sweeps -- */
+
+/* A sweep (plan P3) is a script written by hand for an arm the random one
+ * cannot reach. Each row is the four numbers the xorshift would otherwise
+ * draw for a step -- core, kind, slot, arg -- repeated `n` times. A step the
+ * loop turns into a daemon run or a coroutine's continuation hands its row
+ * back, so a row of 600 ticks is 600 ticks whatever else ran.
+ *
+ * SETWAKE is the sweeps' own kind: it sets the current task's
+ * `pxPreviousWakeTime`, which is driver state and not a kernel call.
+ * NOTASET is a call the random script never makes: xQueueAddToSet with a
+ * semaphore where the set belongs. */
+#define SETWAKE    200u
+#define NOTASET    201u
+
+struct row
+{
+    unsigned core;
+    unsigned kind;
+    unsigned slot;
+    uint32_t arg;
+    unsigned n;
+};
+
+/* xTaskDelayUntil across the tick wrap, which the random script can never
+ * reach: it creates every task with a previous wake of 0, so the clock is
+ * never behind it. 600 ticks take the clock from configINITIAL_TICK_COUNT to
+ * 0. A previous wake of 0xFFFFFFF0 then takes the overflow branch's false arm
+ * (the wake time 0xFFFFFFF5 did not wrap, so it has passed); 0xFFFFFFFE its
+ * true arm (the wake time 3 wrapped too and is still ahead: the task
+ * delays). Kind 82 with arg 0x4700 is sched_op's dlyuntil, increment 5. */
+static const struct row sweep_overflow[] =
+{
+    { 0, 91,      0, 0,           600 },
+    { 0, SETWAKE, 0, 0xFFFFFFF0u, 1   },
+    { 0, 82,      0, 0x4700u,     1   },
+    { 0, SETWAKE, 0, 0xFFFFFFFEu, 1   },
+    { 0, 82,      0, 0x4700u,     1   },
+    { 0, 91,      0, 0,           4   },
+    { 0, 82,      0, 0x4700u,     2   },
+};
+
+/* xQueueAddToSet given something that is not a set. V11.3.1 checks the item
+ * size (a set's is a pointer's) and answers pdFAIL; Kairos checks the kind. */
+static const struct row sweep_notaset[] =
+{
+    { 0, NOTASET, 0, 0, 1 },
+};
+
+static const struct row * sweep;
+static unsigned sweep_rows;
+static unsigned sweep_pos;
+
+/* The sweep's next step, or 0 when it is done. */
+static int sweep_next( unsigned * core,
+                       unsigned * kind,
+                       unsigned * slot,
+                       uint32_t * arg )
+{
+    unsigned pos = sweep_pos;
+
+    for( unsigned i = 0; i < sweep_rows; i++ )
+    {
+        if( pos < sweep[ i ].n )
+        {
+            *core = sweep[ i ].core % configNUMBER_OF_CORES;
+            *kind = sweep[ i ].kind;
+            *slot = sweep[ i ].slot;
+            *arg = sweep[ i ].arg;
+            sweep_pos++;
+            return 1;
+        }
+
+        pos -= sweep[ i ].n;
+    }
+
+    return 0;
+}
+
+static unsigned sweep_steps( void )
+{
+    unsigned n = 0;
+
+    for( unsigned i = 0; i < sweep_rows; i++ )
+    {
+        n += sweep[ i ].n;
+    }
+
+    return n;
+}
+
 /* ------------------------------------------------------- the script -- */
 
 int main( int argc,
@@ -1774,6 +1901,27 @@ int main( int argc,
 
     rng = seed;
     fake_yield_hook = on_yield;
+
+    if( argc > 3 )
+    {
+        if( strcmp( argv[ 3 ], "overflow" ) == 0 )
+        {
+            sweep = sweep_overflow;
+            sweep_rows = sizeof sweep_overflow / sizeof sweep_overflow[ 0 ];
+        }
+        else if( strcmp( argv[ 3 ], "notaset" ) == 0 )
+        {
+            sweep = sweep_notaset;
+            sweep_rows = sizeof sweep_notaset / sizeof sweep_notaset[ 0 ];
+        }
+        else
+        {
+            fprintf( stderr, "no sweep named %s\n", argv[ 3 ] );
+            return 2;
+        }
+
+        steps = sweep_steps();
+    }
 
     sem = xSemaphoreCreateBinary();
     mutex = xSemaphoreCreateMutex();
@@ -1805,18 +1953,41 @@ int main( int argc,
 
     /* The setup above is the same on both sides and is not a step; the
      * header says what it chose, and line 0 where it left the kernel. */
-    printf( "seed=0x%08lx cores=%d steps=%u tick0=0x%08lx init=%lu,%lu,%lu,%lu\n",
+    printf( "seed=0x%08lx cores=%d steps=%u tick0=0x%08lx init=%lu,%lu,%lu,%lu%s%s\n",
             ( unsigned long ) seed, configNUMBER_OF_CORES, steps, ( unsigned long ) configINITIAL_TICK_COUNT,
             ( unsigned long ) init[ 0 ], ( unsigned long ) init[ 1 ],
-            ( unsigned long ) init[ 2 ], ( unsigned long ) init[ 3 ] );
+            ( unsigned long ) init[ 2 ], ( unsigned long ) init[ 3 ],
+            sweep ? " sweep=" : "", sweep ? argv[ 3 ] : "" );
     line( 0, 0, "start", 0, 0 );
 
-    for( unsigned step = 1; step <= steps; step++ )
+    for( unsigned step = 1; sweep ? 1 : ( step <= steps ); step++ )
     {
-        int core = ( int ) ( next() % configNUMBER_OF_CORES );
-        unsigned kind = next() % 100;
-        unsigned slot = next() % SLOTS;
-        unsigned arg = next();
+        int core;
+        unsigned kind;
+        unsigned slot;
+        unsigned arg;
+
+        if( sweep )
+        {
+            unsigned c;
+            uint32_t a;
+
+            if( !sweep_next( &c, &kind, &slot, &a ) )
+            {
+                break;
+            }
+
+            core = ( int ) c;
+            arg = a;
+        }
+        else
+        {
+            core = ( int ) ( next() % configNUMBER_OF_CORES );
+            kind = next() % 100;
+            slot = next() % SLOTS;
+            arg = next();
+        }
+
         long r = 0;
         TaskHandle_t t = app[ slot ];
 
@@ -1833,6 +2004,7 @@ int main( int argc,
         {
             r = run_daemon();
             line( step, core, "daemon", r, fake_yields );
+            sweep_pos -= ( sweep != NULL );
             continue;
         }
 
@@ -1840,10 +2012,25 @@ int main( int argc,
         {
             r = run_coro( cur_slot );
             line( step, core, "cont", r, fake_yields );
+            sweep_pos -= ( sweep != NULL );
             continue;
         }
 
-        if( kind < 5 )
+        if( kind == SETWAKE )
+        {
+            if( cur_slot >= 0 )
+            {
+                wake[ cur_slot ] = ( TickType_t ) arg;
+            }
+
+            snprintf( op, sizeof op, "setwake %lu", ( unsigned long ) arg );
+        }
+        else if( kind == NOTASET )
+        {
+            r = xQueueAddToSet( csem, sem );
+            snprintf( op, sizeof op, "saddnotaset" );
+        }
+        else if( kind < 5 )
         {
             if( t == NULL )
             {
@@ -1870,6 +2057,14 @@ int main( int argc,
 
             if( ( t != NULL ) && !holds_a_mutex( t ) && !on_buffer )
             {
+                for( int c = 0; c < configNUMBER_OF_CORES; c++ )
+                {
+                    if( xTaskGetCurrentTaskHandleForCore( c ) == t )
+                    {
+                        dead = t;
+                    }
+                }
+
                 snprintf( op, sizeof op, "delete %u", slot );
                 app[ slot ] = NULL;
                 pending[ slot ] = 0; /* its suspended call is abandoned */

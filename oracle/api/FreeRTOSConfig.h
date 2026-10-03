@@ -34,6 +34,10 @@
 #define configUSE_RECURSIVE_MUTEXES             1
 #define configUSE_COUNTING_SEMAPHORES           1
 #define configUSE_QUEUE_SETS                    1
+/* Tickless compiled in for vTaskStepTick, which the script calls the way a
+ * port's suppressed-tick sleep does: scheduler suspended, one tick. The
+ * idle task never runs its body here, so nothing else changes. */
+#define configUSE_TICKLESS_IDLE                  1
 #define configUSE_TASK_NOTIFICATIONS            1
 #define configTASK_NOTIFICATION_ARRAY_ENTRIES   1
 #define configUSE_TIMERS                        1

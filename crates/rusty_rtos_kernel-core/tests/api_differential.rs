@@ -72,6 +72,8 @@ impl<const CORES: u8, const TICK0: u64> Config for Cfg<CORES, TICK0> {
     const MESSAGE_LENGTH_BYTES: usize = 8;
     const NUMBER_OF_CORES: u8 = CORES;
     const USE_TIME_SLICING: bool = true;
+    /// `configUSE_TICKLESS_IDLE 1`: compiled in for `vTaskStepTick`.
+    const USE_TICKLESS_IDLE: bool = true;
     /// `configINITIAL_TICK_COUNT`.
     const INITIAL_TICK_COUNT: u64 = TICK0;
     /// heap_3: every free is `vTaskSuspendAll` / `xTaskResumeAll`, and that
@@ -340,6 +342,9 @@ macro_rules! replay {
                 qset: QueueHandle,
                 /// Each task's `pxPreviousWakeTime`.
                 wake: [u64; SLOTS],
+                /// The last task deleted while running on a core (`dead` in
+                /// the C): the only kind of deleted handle it may ask about.
+                dead: Option<TaskHandle>,
                 timers: [Option<TimerHandle>; TSLOTS],
                 daemon: TaskHandle,
                 timer_queue: QueueHandle,
@@ -703,6 +708,7 @@ macro_rules! replay {
                 buffers: [None; BSLOTS],
                 qset,
                 wake: [0; SLOTS],
+                dead: None,
                 timers: [None; TSLOTS],
                 daemon: TaskHandle::NULL,
                 timer_queue: QueueHandle::NULL,
@@ -743,6 +749,13 @@ macro_rules! replay {
                     "start" | "noop" => {}
                     "abort" => {
                         r = i64::from(d.k.abort_delay(d.app[num(0) as usize].unwrap()).expect("abort"));
+                    }
+                    // An authored sweep's own step (`oracle/api/driver.c`,
+                    // SETWAKE): driver state only, no kernel call.
+                    "setwake" => {
+                        if let Some(s) = cur_slot {
+                            d.wake[s] = num(0);
+                        }
                     }
                     "dlyuntil" => {
                         let s = cur_slot.expect("delay until from an app task");
@@ -788,8 +801,35 @@ macro_rules! replay {
                     "tickcount" => r = d.k.tick_count() as i64,
                     "tickcount_isr" => r = d.k.tick_count_from_isr() as i64,
                     "semspaces" => r = d.k.queue_spaces_available(d.sem).unwrap() as i64,
+                    // vTaskStepTick under suspension, as a tickless port
+                    // calls it; never from the last tick before the wrap.
+                    "steptick" => {
+                        if d.k.tick_count() != 0xFFFF_FFFF {
+                            d.k.suspend_all();
+                            d.k.step_tick(1);
+                            r = 1 + 2 * i64::from(d.k.resume_all());
+                        }
+                    }
+                    // eTaskGetState on a task deleted while it ran: eDeleted
+                    // is 4 in the C's enum.
+                    "deadstate" => {
+                        let h = d.dead.expect("a task deleted while running");
+                        r = match d.k.task_state_get(h) {
+                            Ok(TaskState::Running) => 0,
+                            Ok(TaskState::Ready) => 1,
+                            Ok(TaskState::Blocked) => 2,
+                            Ok(TaskState::Suspended) => 3,
+                            Ok(TaskState::Deleted) => 4,
+                            Err(_) => 5,
+                        };
+                    }
                     "qspaces" => {
                         r = d.k.queue_spaces_available(d.queues[num(0) as usize].unwrap()).unwrap() as i64;
+                    }
+                    // An authored sweep's (NOTASET): the counting semaphore
+                    // added to the binary one, which is not a set.
+                    "saddnotaset" => {
+                        r = i64::from(d.k.queue_add_to_set(d.csem, d.sem).expect("add to a non-set"));
                     }
                     "sadd" => {
                         let q = d.queues[num(0) as usize].unwrap();
@@ -925,6 +965,9 @@ macro_rules! replay {
                         let slot = num(0) as usize;
                         let h = d.app[slot].take().unwrap();
                         d.pending[slot] = None;
+                        if (0..CORES).any(|c| d.k.current_on(usize::from(c)) == h) {
+                            d.dead = Some(h);
+                        }
                         d.k.task_delete(Some(h)).expect("delete");
                     }
                     "suspend" => d.k.suspend(d.app[num(0) as usize]).expect("suspend"),
@@ -1339,6 +1382,8 @@ fn exercised(trace: &str) {
         ("tickcount", 60),
         ("tickcount_isr", 60),
         ("semspaces", 60),
+        ("steptick", 60),
+        ("deadstate", 50),
         ("qspaces", 60),
         ("sadd", 30),
         ("sremove", 30),
@@ -1383,8 +1428,12 @@ fn two_cores_answer_every_step_as_the_c_kernel_does() {
 /// Seeds that once found a defect (plan decision D2: a failing fresh seed
 /// becomes a pin), cut just past what they found and kept as digests:
 /// `oracle/api/pins/`. Each names its seed, so its C trace can be made again.
+///
+/// `API_PINS=api1-` (or `api2-`) runs one build's pins only: the census
+/// counts each build's toward that build's column.
 #[test]
 fn pinned_seeds_answer_every_step_as_the_c_kernel_does() {
+    let only = std::env::var("API_PINS").unwrap_or_default();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../oracle/api/pins");
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .expect("oracle/api/pins")
@@ -1398,14 +1447,43 @@ fn pinned_seeds_answer_every_step_as_the_c_kernel_does() {
             .unwrap()
             .replace("\r\n", "\n");
         let steps = pin.lines().count();
-        if !(name.starts_with("api1-") || name.starts_with("api2-")) {
+        if !(name.starts_with("api1-") || name.starts_with("api2-")) || !name.starts_with(&only) {
             continue;
         }
         let n = replay(&pin, &name);
         assert_eq!(n + 1, steps, "{name}: every step replayed");
         seen += 1;
     }
-    assert!(seen >= 2, "the pins are missing from {dir}");
+    let want = if only.is_empty() { 2 } else { 1 };
+    assert!(seen >= want, "the pins are missing from {dir}");
+}
+
+/// The authored sweeps (plan P3): `oracle/api/sweeps/`, hand-written scripts
+/// for arms the random one cannot reach, committed whole -- each is a few
+/// hundred lines. `run.sh` writes them with the pinned traces.
+#[test]
+fn authored_sweeps_answer_every_step_as_the_c_kernel_does() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../oracle/api/sweeps");
+    let only = std::env::var("API_PINS").unwrap_or_default();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("oracle/api/sweeps")
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    let mut seen = 0;
+    for path in entries {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.ends_with(".trace") || !name.starts_with(&only) {
+            continue;
+        }
+        let trace = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n");
+        let n = replay(&trace, &name);
+        assert_eq!(n + 1, trace.lines().count(), "{name}: every step replayed");
+        seen += 1;
+    }
+    assert!(seen >= 1, "the sweeps are missing from {dir}");
 }
 
 /// Fresh seeds (plan decision D2): every `api1-<seed>.trace` and
