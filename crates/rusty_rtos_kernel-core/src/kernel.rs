@@ -749,6 +749,14 @@ where
             // than eight cannot hold a length any target can send.
             || C::MESSAGE_LENGTH_BYTES == 0
             || C::MESSAGE_LENGTH_BYTES > 8
+            // Two cores need a port that COMMITS its own switches. The
+            // stackless model -- `switch_context` returning into the
+            // outgoing task's frame, whose tail is tallied as owed -- keeps
+            // ONE abandoned frame (`unwinding`), which is one core's; two
+            // cores switching at once would share it. Every two-core port
+            // there is commits (sim, Cortex-M, RISC-V, Xtensa, host); this
+            // says so instead of leaving it to be discovered.
+            || (C::NUMBER_OF_CORES > 1 && !P::COMMITS_SWITCH)
         {
             return Err(Error::InvalidArgument);
         }
@@ -5142,8 +5150,13 @@ where
             // through a second resolve (`add_task_to_ready_list_at`).
             self.add_task_to_ready_list_at(holder, waiter_priority)?;
             // SMP: "The priority of the task is raised. Yield for this task
-            // if it is not running." (`xTaskPriorityInherit`)
-            if C::NUMBER_OF_CORES > 1 && C::USE_PREEMPTION && self.running_core(holder).is_none() {
+            // if it is not running." (`xTaskPriorityInherit`) -- whether or
+            // not preemption is on: the C calls `prvYieldForTask` here
+            // DIRECTLY (tasks.c:6798), the one call of it not made through
+            // `taskYIELD_ANY_CORE_IF_USING_PREEMPTION` or under
+            // `configUSE_PREEMPTION == 1`. This gated it on preemption too,
+            // and no cooperative two-core run existed to show it.
+            if C::NUMBER_OF_CORES > 1 && self.running_core(holder).is_none() {
                 self.yield_for_task(holder, waiter_priority);
             }
         } else {
@@ -6144,6 +6157,51 @@ mod tests {
         assert_eq!(K3::cores(), super::MAX_CORES);
     }
 
+    /// Two cores on a port that does not commit its own switches are
+    /// refused at construction -- the same geometry on one core is not.
+    #[test]
+    fn two_cores_need_a_port_that_commits_its_switches() {
+        struct TwoCores;
+        impl Config for TwoCores {
+            type Tick = rusty_rtos_core::tick::Bits32;
+            const TICK_RATE_HZ: u32 = 100;
+            const MAX_PRIORITIES: u8 = 4;
+            const MINIMAL_STACK_SIZE: usize = 1;
+            const MAX_TASK_NAME_LEN: usize = 8;
+            const TIMER_TASK_PRIORITY: u8 = 3;
+            const TIMER_TASK_STACK_DEPTH: usize = 1;
+            const TIMER_QUEUE_LENGTH: usize = 1;
+            const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+            const USE_TIME_SLICING: bool = false;
+            const NUMBER_OF_CORES: u8 = 2;
+        }
+        type K2 = crate::Kernel<
+            TwoCores,
+            TestPort,
+            NoTrace,
+            NoTickHook,
+            6,
+            { crate::list_slots_for(6, 1, crate::lists_for(4, 2, 1)) },
+            { crate::lists_for(4, 2, 1) },
+            2,
+            8,
+            1,
+            8,
+            1,
+            1,
+            1,
+        >;
+        const { assert!(!<TestPort as rusty_rtos_core::port::Port>::COMMITS_SWITCH) };
+        assert_eq!(
+            K2::new(TestPort::default(), NoTrace).err(),
+            Some(rusty_rtos_core::error::Error::InvalidArgument)
+        );
+        assert!(
+            KTie::new(TestPort::default(), NoTrace).is_ok(),
+            "one core, same geometry"
+        );
+    }
+
     /// `state_of` answers Running for the running task on one core, called
     /// directly -- `task_state_get` answers it first, so no oracle reached
     /// this spelling's own shortcut.
@@ -6539,5 +6597,155 @@ mod tests {
             KB::FOOTPRINT_PER_TASK_SIDE,
         ];
         assert_eq!(KB::FOOTPRINT_ACCOUNTED, parts.iter().sum::<usize>());
+    }
+
+    use crate::Wait;
+    use rusty_rtos_core::isr::Woken;
+
+    // ------------------------------------------------ a yield already owed --
+    //
+    // Every one-core "did the readied task outrank the running one?" test has
+    // a two-core arm behind `C::NUMBER_OF_CORES > 1`: `yield_for_task`, then
+    // "does THIS core owe a yield?". On one core the two differ in one place
+    // only -- idle is not marked idle there (`F_IDLE` is set by
+    // `start_scheduler_smp`), so there is no idle tie -- and that place is a
+    // yield ALREADY owed: the two-core arm answers yes for any task readied
+    // while one is, the one-core test answers whether THIS task outranks the
+    // running one. Relaxing the gate to `>= 1` changed nothing any oracle
+    // could see, and the mutant survey could list it only as evidence
+    // (`core-gate`).
+    //
+    // A yield is owed and not yet taken when an ISR woke a higher task and
+    // did not ask for the switch (`pxHigherPriorityTaskWoken` ignored, which
+    // the C allows: the switch waits for the next tick). Readying a LOWER
+    // task then must not take it early. `TestPort::yield_from_isr` does
+    // nothing, so the owed yield stays owed for as long as the test needs.
+
+    /// [`TestConfig`] with room for a mutex beside the timer daemon's queue.
+    type KTie = crate::Kernel<
+        TestConfig,
+        TestPort,
+        NoTrace,
+        NoTickHook,
+        6,
+        { crate::list_slots_for(6, 1, crate::lists_for(TestConfig::MAX_PRIORITIES, 2, 1)) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 2, 1) },
+        2,
+        8,
+        1,
+        8,
+        1,
+        1,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    /// `a` (priority 2) running, owing a yield to `h` (3), which an ISR
+    /// notified; `l` (1) blocked in a notify wait of its own.
+    fn a_yield_owed() -> (KTie, [crate::kernel::TaskHandle; 3]) {
+        use crate::kernel::NotifyAction;
+        let mut k = KTie::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let l = k.create_task("l", 1).expect("l");
+        let a = k.create_task("a", 2).expect("a");
+        let h = k.create_task("h", 3).expect("h");
+        let started = k.start_scheduler().expect("start");
+        k.suspend(Some(started.timer)).expect("park the daemon");
+        for task in [h, a, l] {
+            for _ in 0..8_u32 {
+                if k.current() == task {
+                    break;
+                }
+                k.switch_context();
+            }
+            assert_eq!(k.current(), task);
+            if task != a {
+                assert_eq!(k.notify_wait(0, 0, 0, 100), Ok(Wait::Blocked));
+            } else {
+                k.delay(1).expect("a steps aside for l");
+            }
+        }
+        if k.increment_tick() {
+            k.switch_context();
+        }
+        assert_eq!(k.current(), a, "h and l wait; a runs");
+        let (_, woken) = k
+            .notify_from_isr(h, 0, 1, NotifyAction::SetBits)
+            .expect("h notified");
+        assert_eq!(woken, Woken::YES);
+        assert!(
+            k.pending_here(),
+            "the ISR did not take its switch: a yield is owed"
+        );
+        assert_eq!(k.current(), a);
+        (k, [l, a, h])
+    }
+
+    /// `taskYIELD_IF_USING_PREEMPTION` on create: only a task created ABOVE
+    /// the running one yields, whatever was owed before.
+    #[test]
+    fn creating_a_lower_task_does_not_take_a_yield_already_owed() {
+        let (mut k, [_, a, _]) = a_yield_owed();
+        let _u = k.create_task("u", 1).expect("u");
+        assert_eq!(k.current(), a, "xTaskCreate of a lower task: no yield");
+        assert!(k.pending_here(), "the owed yield is still owed");
+    }
+
+    /// `xTaskNotify` and `xTaskNotifyFromISR` readying a task BELOW the
+    /// running one: no yield, and `pxHigherPriorityTaskWoken` stays false --
+    /// it answers for THIS call, not for one an earlier interrupt made.
+    #[test]
+    fn notifying_a_lower_task_does_not_take_or_report_a_yield_already_owed() {
+        use crate::kernel::NotifyAction;
+        let (mut k, [l, a, _]) = a_yield_owed();
+        assert_eq!(k.notify(l, 0, 1, NotifyAction::SetBits), Ok(true));
+        assert_eq!(k.current(), a, "xTaskNotify of a lower task: no yield");
+        assert!(k.pending_here(), "the owed yield is still owed");
+
+        let (mut k, [l, a, _]) = a_yield_owed();
+        let (_, woken) = k
+            .notify_from_isr(l, 0, 1, NotifyAction::SetBits)
+            .expect("l notified");
+        assert_eq!(woken, Woken::NO, "xTaskNotifyFromISR: l does not outrank a");
+        assert_eq!(k.current(), a);
+    }
+
+    /// `xTaskPriorityDisinherit` answering "yield" while the give wakes a
+    /// waiter that no longer outranks the giver: the C consults that answer
+    /// only when there was no waiter (P1.3, step 4105), so it does not
+    /// yield -- and the disinherit itself must not have left a yield owed
+    /// for the next tick or resume to take. On two cores it does: it yields
+    /// the core running the holder, which is the gate's other side.
+    #[test]
+    fn a_give_that_disinherits_and_wakes_a_lower_waiter_owes_no_yield() {
+        let mut k = KTie::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let holder = k.create_task("h", 1).expect("h");
+        let waiter = k.create_task("w", 2).expect("w");
+        let m = k.mutex_create().expect("a mutex");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        for _ in 0..8_u32 {
+            if k.current() == waiter {
+                break;
+            }
+            k.switch_context();
+        }
+        assert_eq!(k.current(), waiter);
+        k.delay(1).expect("w steps aside");
+        assert_eq!(k.current(), holder);
+        assert_eq!(k.semaphore_take(m, 0), Ok(Wait::Ready(())));
+        if k.increment_tick() {
+            k.switch_context();
+        }
+        assert_eq!(k.current(), waiter, "w wakes and preempts");
+        assert_eq!(k.semaphore_take(m, 10), Ok(Wait::Blocked));
+        assert_eq!(k.current(), holder, "h runs, at w's priority");
+        k.set_priority(Some(waiter), 0)
+            .expect("w lowered below h's base");
+        assert!(!k.pending_here());
+        assert_eq!(k.semaphore_give(m), Ok(Wait::Ready(())));
+        assert_eq!(k.current(), holder, "w, woken, does not outrank h");
+        assert!(
+            !k.pending_here(),
+            "the disinherit's yield request is not consulted when the give woke a waiter,              and must not be left owed"
+        );
     }
 }

@@ -54,6 +54,23 @@ impl Config for SlicingConfig {
     const USE_TIME_SLICING: bool = true;
 }
 
+/// The same, cooperative: `configUSE_PREEMPTION 0`.
+struct CooperativeConfig;
+
+impl Config for CooperativeConfig {
+    type Tick = Bits32;
+    const TICK_RATE_HZ: u32 = 100;
+    const MAX_PRIORITIES: u8 = 5;
+    const MINIMAL_STACK_SIZE: usize = 1;
+    const MAX_TASK_NAME_LEN: usize = 8;
+    const TIMER_TASK_PRIORITY: u8 = 1;
+    const TIMER_TASK_STACK_DEPTH: usize = 1;
+    const TIMER_QUEUE_LENGTH: usize = 1;
+    const NOTIFICATION_ARRAY_ENTRIES: usize = 1;
+    const NUMBER_OF_CORES: u8 = 2;
+    const USE_PREEMPTION: bool = false;
+}
+
 /// A port with a settable core id that commits its own switches.
 #[derive(Default)]
 struct SmpPort {
@@ -563,4 +580,45 @@ fn a_notification_wakes_its_waiter_on_another_core() {
     switch(&mut k, 1);
     assert_eq!(k.current_on(1), b);
     assert_eq!(k.current_on(0), a, "the notifier keeps running");
+}
+
+/// `xTaskPriorityInherit` on two cores yields for a raised holder that is
+/// not running -- `prvYieldForTask( pxMutexHolderTCB )`, called DIRECTLY
+/// (tasks.c:6798), not through `taskYIELD_ANY_CORE_IF_USING_PREEMPTION`. It
+/// is the one direct call the C does not gate on `configUSE_PREEMPTION`, so
+/// a cooperative build yields here too. Kairos gated it, and nothing ran two
+/// cores without preemption to notice (found reading the C to prove a
+/// surviving mutant of this gate equivalent: it was the code that differed).
+#[test]
+fn a_raised_holder_is_yielded_for_without_preemption_too() {
+    let mut k = kernel::<CooperativeConfig>();
+    let h = k.create_task("h", 2).expect("h");
+    let x = k.create_task("x", 2).expect("x");
+    let m = k.mutex_create().expect("a mutex");
+    k.start_scheduler().expect("start");
+    switch(&mut k, 0);
+    switch(&mut k, 1);
+    assert_eq!((k.current_on(0), k.current_on(1)), (h, x));
+    k.port().on(0);
+    assert_eq!(k.semaphore_take(m, 0), Ok(crate::Wait::Ready(())));
+    // `w` above both, created by `h` on core 0: cooperative, so `h` keeps
+    // the core until it yields, and then core 0 takes `w`.
+    let w = k.create_task("w", 4).expect("w");
+    k.task_yield();
+    switch(&mut k, 0);
+    assert_eq!(
+        (k.current_on(0), k.current_on(1)),
+        (w, x),
+        "h holds m, ready, not running"
+    );
+    let _ = k.take_core_yields();
+
+    k.port().on(0);
+    assert_eq!(k.semaphore_take(m, 10), Ok(crate::Wait::Blocked));
+    assert_eq!(k.priority_of(Some(h)), Ok(4), "h inherits w's priority");
+    assert_eq!(
+        k.take_core_yields() & 0b10,
+        0b10,
+        "core 1 runs x (2), below the raised h (4): the C asks it to yield, preemption or not"
+    );
 }
