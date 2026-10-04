@@ -1228,14 +1228,31 @@ where
             // `base + index` is below `base + length`, which the geometry
             // put inside `SLOTS`; and the `get_mut` refuses anything it is
             // not, so nothing rests on the arithmetic either way.
+            //
+            // A silent sink writes the queue's fields FIRST: then nothing
+            // stands between the caller's resolve and this one, they fold, and
+            // the handle is not re-checked after the slot store, which LLVM
+            // cannot prove misses the queue. With an emitting sink the trace
+            // call already stands between them, and the reorder only cost
+            // codegen (refuted R2: host +32,092).
+            if !T::EMITS {
+                let q = self.queues.resolve_mut(queue)?;
+                q.read_from = next_read;
+                q.write_to = next_write;
+                if counted {
+                    q.waiting = q.waiting.wrapping_add(1);
+                }
+            }
             if let Some(slot) = self.slots.get_mut(snapshot.base.wrapping_add(index)) {
                 *slot = value;
             }
-            let q = self.queues.resolve_mut(queue)?;
-            q.read_from = next_read;
-            q.write_to = next_write;
-            if counted {
-                q.waiting = q.waiting.wrapping_add(1);
+            if T::EMITS {
+                let q = self.queues.resolve_mut(queue)?;
+                q.read_from = next_read;
+                q.write_to = next_write;
+                if counted {
+                    q.waiting = q.waiting.wrapping_add(1);
+                }
             }
         } else if snapshot.kind.is_mutex() {
             // Giving a mutex back: the holder drops any inherited
