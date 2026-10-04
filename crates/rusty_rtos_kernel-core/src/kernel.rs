@@ -3769,6 +3769,13 @@ where
             let Ok(task) = self.task_of_state_item(item) else {
                 return switch_required;
             };
+            // Beside `handle_at`'s read of the same slot, and carried, as
+            // `remove_from_event_list` does: after the list edits LLVM could
+            // not prove the TCB unchanged and resolved it twice more. A
+            // failure here is the one `add_task_to_ready_list` would have hit.
+            let Ok(woken) = self.tcbs.resolve(task).map(|t| t.priority) else {
+                return switch_required;
+            };
             let _ = self.lists.remove(item);
             if self
                 .lists
@@ -3778,7 +3785,7 @@ where
             {
                 let _ = self.lists.remove(Self::event_item(task));
             }
-            if self.add_task_to_ready_list(task).is_err() {
+            if self.add_task_to_ready_list_at(task, woken).is_err() {
                 return switch_required;
             }
             // `!switch_required` FIRST, and the running priority read once
@@ -3797,11 +3804,9 @@ where
                 // SMP: the tick's yield decision is made per core at the end
                 // of `increment_tick`, from `xYieldPendings`.
                 if C::USE_PREEMPTION {
-                    let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
                     self.yield_for_task(task, woken);
                 }
             } else if C::USE_PREEMPTION && !switch_required {
-                let woken = self.tcbs.resolve(task).map(|t| t.priority).unwrap_or(0);
                 if woken > running {
                     switch_required = true;
                 }
