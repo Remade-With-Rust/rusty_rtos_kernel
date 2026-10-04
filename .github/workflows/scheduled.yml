@@ -68,3 +68,42 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
       - run: cargo +nightly careful test --workspace --lib --tests
+
+  api-fresh:
+    # The API differential on FRESH seeds against the live C kernel (plan
+    # docs/plans/api-differential.md, decision D2). Per commit, ci.yml replays
+    # the committed traces and pins; this builds the C side from the pinned
+    # FreeRTOS-Kernel every night, checks it still writes the committed traces
+    # byte for byte, then draws new seeds. A failing seed is a finding: its
+    # traces are kept as an artifact, and it becomes a pin once understood.
+    name: API differential, fresh seeds vs FreeRTOS (D2)
+    runs-on: ubuntu-latest
+    steps:
+      # The layout oracle/api/run.sh expects: the oracle beside the package.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: rusty_rtos_kernel
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: FreeRTOS/FreeRTOS-Kernel
+          ref: 3a22924e0a9ddbbc8b0758881c33b3422a5cc20d # V11.3.1, ORACLES.md
+          path: oracle/FreeRTOS-Kernel
+      # -m32 for the 32-bit twin the pins also carry.
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-10-01
+        with:
+          toolchain: stable
+      - name: the C side reproduces the committed traces and pins
+        working-directory: rusty_rtos_kernel/oracle/api
+        run: sh run.sh && git diff --exit-code -- .
+      - name: fresh seeds, both builds
+        working-directory: rusty_rtos_kernel/oracle/api
+        run: N=8 sh fresh.sh
+      - name: the Rust kernel answers every fresh step as the C does
+        working-directory: rusty_rtos_kernel
+        run: cargo test --release -p rusty_rtos_kernel-core --test api_differential -- --ignored fresh_seeds
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: api-fresh-seeds
+          path: rusty_rtos_kernel/oracle/api/fresh
