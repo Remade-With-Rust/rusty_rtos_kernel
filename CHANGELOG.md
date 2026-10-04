@@ -5,7 +5,26 @@ H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
 ## Unreleased
 
+### Fixed
+- **Two tasks that delete themselves before idle runs are both reaped.** The
+  kernel kept one deferred-delete slot (two on two cores) on the belief that
+  a second self-delete could not come before the first was reaped. It can:
+  the deleting task yields to the next ready task, not to idle. The second
+  overwrote the first, whose slot was never freed and whose task count was
+  never taken off. Now each TCB carries its place in the
+  `xTasksWaitingTermination` order and one reaper serves both builds, oldest
+  first, as `prvCheckTasksWaitingTermination`. Found proving a mutant
+  equivalent; no oracle reached it. Flash +214 B (`small`), +274 B (speed).
+- **Two cores without preemption: a raised mutex holder is yielded for.**
+  `xTaskPriorityInherit` calls `prvYieldForTask` directly, the one call of it
+  the C does not gate on `configUSE_PREEMPTION`; this kernel gated it. No
+  configuration with preemption on changes.
+
 ### Changed
+- **Two cores need a port that commits its own switches.** `Kernel::new`
+  answers `InvalidArgument` for `NUMBER_OF_CORES > 1` on a port whose
+  `COMMITS_SWITCH` is `false`. The stackless model keeps one abandoned
+  frame, which is one core's; every two-core port there is commits.
 - **One-core and real-port instruction cost.** Fifteen measured wins, none
   changing behaviour (both conformance corpora, the API differential and the
   SMP differential unchanged). On the shipped RISC-V port the seventeen
