@@ -146,11 +146,15 @@ its inter-processor interrupt; the kernel stays `forbid(unsafe)`.
 The default build inlines the hottest kernel paths for speed. The `small`
 feature gives the queue take and send bodies and `xTaskResumeAll` one
 out-of-line body each, for parts where flash is the constraint. On rv32,
-against the C kernel's 13,924 B for the same operations: **17,318 B (1.24x)**
-with `small`, 19,450 B (1.40x) without. Behaviour is identical (every test
-and the conformance corpus pass with it on); the cost is instructions on the
-short queue paths, e.g. `recv_empty` 36 -> 69 and `queue_roundtrip` 113 -> 198
-retired instructions (`docs/LEDGER.md` has every row).
+against the C kernel's 13,924 B for the same operations: **17,860 B (1.28x)**
+with `small`, 22,396 B (1.61x) without -- the speed build also takes the
+RISC-V port's critical-section pair in line, about 2 KB of it (measured
+2026-10-04 against the port's unreleased in-line pair; the umbrella's
+`bench/kernel-flash/run.sh` carries the attribution). Behaviour is identical
+(every test and the conformance corpus pass with it on); the cost is
+instructions on the short queue paths, e.g. `recv_empty` 36 -> 69 and
+`queue_roundtrip` 113 -> 198 retired instructions (`docs/LEDGER.md` has every
+row).
 
 ## Tickless idle
 
