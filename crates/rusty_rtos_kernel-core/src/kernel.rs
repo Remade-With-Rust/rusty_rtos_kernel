@@ -2651,7 +2651,16 @@ where
             // Accumulate: a replay that is itself interrupted leaves the
             // rest of its own loop as a tail, and that tail is more of the
             // same debt.
-            *slot = slot.saturating_add(owed);
+            //
+            // `wrapping_add`, for the reason `SimPort` gives for its `unwound`
+            // tally: the debt is the exits of ONE abandoned frame plus a
+            // replay's tail -- a handful, never four billion -- and the
+            // saturation cost a `mov $-1` and a `cmov` on every switch.
+            debug_assert!(
+                slot.checked_add(owed).is_some(),
+                "an owed-exit debt is a handful of exits"
+            );
+            *slot = slot.wrapping_add(owed);
         }
         if owed > 0 {
             self.owe(task);
