@@ -244,6 +244,10 @@ pub(crate) struct Tcb {
     /// `mul`. It is a deliberate flash-for-RAM trade: 254 bytes of flash
     /// against 36 bytes of RAM per task, so it pays below roughly eight tasks
     /// and is the owner's call above that.
+    /// Its place in `xTasksWaitingTermination`: the deletion number it was
+    /// given when it deleted itself while running, 0 when it is not waiting.
+    /// One of the stride's padding words, so the slot is still 128 bytes.
+    reap_seq: u32,
     _stride_pad: [u32; STRIDE_PAD_WORDS],
 }
 
@@ -255,17 +259,18 @@ pub(crate) struct Tcb {
 /// 64-bit host only) both change size. Nine words gives 128 bytes on a 32-bit
 /// target -- the number `bench/kernel-ram` pins and `bench/kernel-flash`'s
 /// `mul = 0` depends on -- and four gives 128 on the host. Two of each went to
-/// [`Tcb::held`] (2026-10-02), so it is seven and two now.
+/// [`Tcb::held`] (2026-10-02) and one of each to [`Tcb::reap_seq`]
+/// (2026-10-04), so it is six and one now.
 ///
 /// Before this was split, the host slot was 144 bytes and every TCB index cost
 /// a `lea`+`shl` where a power-of-two stride costs one `shl`.
 #[cfg(target_pointer_width = "64")]
-pub(crate) const STRIDE_PAD_WORDS: usize = 2;
+pub(crate) const STRIDE_PAD_WORDS: usize = 1;
 
 /// See the 64-bit case above; seven words is what makes an rv32 `Slot<Tcb>`
 /// 128 bytes, and that number is pinned by two benches.
 #[cfg(not(target_pointer_width = "64"))]
-pub(crate) const STRIDE_PAD_WORDS: usize = 7;
+pub(crate) const STRIDE_PAD_WORDS: usize = 6;
 
 /// How many notification slots a task has room for.
 ///
@@ -424,15 +429,22 @@ pub struct Kernel<
     /// kernel. `NULL` is already the sentinel (`generation == 0`), so the
     /// representation carries the fact the discriminant was carrying.
     unwinding: TaskHandle,
-    /// A task that deleted ITSELF and whose slot the idle task has not
-    /// reclaimed yet — the C's `xTasksWaitingTermination`, which only ever
-    /// holds the running task, because any other task is freed on the spot.
+    /// `uxDeletedTasksWaitingCleanUp`: tasks deleted while running (on any
+    /// core) whose slots the idle task has not reclaimed yet. Which ones, in
+    /// which order, is each TCB's [`Tcb::reap_seq`] -- the C's
+    /// `xTasksWaitingTermination`, a FIFO list.
     ///
-    /// One slot is enough, and that is a property rather than a guess: a
-    /// self-deleting task is off every ready list and yields immediately, so
-    /// a second self-delete cannot happen until a switch has occurred, and
-    /// the switch is where this is reaped.
-    awaiting_reap: TaskHandle,
+    /// It was ONE slot (two on two cores), on the stated property that a
+    /// second self-delete could not happen before the first was reaped. It can:
+    /// the deleting task yields to the next ready task, not to idle, and that
+    /// task may delete itself too. The second overwrote the first, whose slot
+    /// was then never freed and whose count was never taken off -- found while
+    /// proving the two-core gates of the P5 survey (`task_delete`'s
+    /// `NUMBER_OF_CORES > 1` relaxed), 2026-10-04.
+    reap_waiting: u16,
+    /// The deletion number the next deferred delete takes; 0 is "not
+    /// waiting", so it starts at 1 and skips 0 if it ever wraps.
+    reap_next: u32,
     /// `xTimerQueue`.
     pub(crate) timer_queue: QueueHandle,
     /// How many tasks are parked at a queue call's sampling exit.
@@ -597,11 +609,6 @@ pub struct Kernel<
     /// SMP: `xIdleTaskHandles`, so a running idle task can be ranked below
     /// every real task of priority 0 (`prvYieldForTask`).
     idle: [TaskHandle; MAX_CORES],
-    /// SMP: a second task deleted while a core still held it. One core can
-    /// owe at most one deferred reap (its own task); two cores can owe two,
-    /// so SMP needs a second slot -- here at the end for the same layout
-    /// reason as the fields above.
-    awaiting_reap_smp: TaskHandle,
 }
 
 impl<
@@ -780,11 +787,11 @@ where
             yield_requested: [false; MAX_CORES],
             core_yields: 0,
             idle: [TaskHandle::NULL; MAX_CORES],
-            awaiting_reap_smp: TaskHandle::NULL,
             task_count: 0,
             stalls: 0,
             first_stall: Stall::None,
-            awaiting_reap: TaskHandle::NULL,
+            reap_waiting: 0,
+            reap_next: 0,
             delayed_swapped: false,
             overflows: 0,
             flags: [0; TASKS],
@@ -1689,6 +1696,7 @@ where
             stream_waited: false,
             stream_local: 0,
             held: crate::timer::Split64::new(0),
+            reap_seq: 0,
             _stride_pad: [0; STRIDE_PAD_WORDS],
         };
         let handle = match self.tcbs.try_insert(tcb) {
@@ -4319,11 +4327,13 @@ where
             // `vListInsertEnd( &xTasksWaitingTermination, ... )` and
             // `++uxDeletedTasksWaitingCleanUp`. The count is NOT decremented
             // here — the idle task does that when it reaps.
-            if C::NUMBER_OF_CORES > 1 && !self.awaiting_reap.is_null() {
-                self.awaiting_reap_smp = target;
-            } else {
-                self.awaiting_reap = target;
+            // In deletion order, as `vListInsertEnd` puts it at the tail.
+            self.reap_next = self.reap_next.wrapping_add(1).max(1);
+            let seq = self.reap_next;
+            if let Ok(tcb) = self.tcbs.resolve_mut(target) {
+                tcb.reap_seq = seq;
             }
+            self.reap_waiting = self.reap_waiting.wrapping_add(1);
             self.trace_task(target, |task, name| Event::TaskDelete { task, name });
         } else {
             self.task_count = self.task_count.saturating_sub(1);
@@ -4361,33 +4371,6 @@ where
 
     /// `prvDeleteTCB`: two frees, and on the oracle's heap each one suspends
     /// the scheduler, so each is one outermost exit.
-    /// `prvCheckTasksWaitingTermination` on SMP: free a deleted task only
-    /// once NO core holds it -- the other core may not have switched away
-    /// yet.
-    #[cold]
-    #[inline(never)]
-    fn reap_smp(&mut self) {
-        for smp_slot in [false, true] {
-            let task = if smp_slot {
-                self.awaiting_reap_smp
-            } else {
-                self.awaiting_reap
-            };
-            if task.is_null() || self.held_by_any_core(task) {
-                continue;
-            }
-            self.enter_critical();
-            if smp_slot {
-                self.awaiting_reap_smp = TaskHandle::NULL;
-            } else {
-                self.awaiting_reap = TaskHandle::NULL;
-            }
-            self.task_count = self.task_count.saturating_sub(1);
-            self.exit_critical();
-            self.delete_tcb(task);
-        }
-    }
-
     fn delete_tcb(&mut self, task: TaskHandle) {
         // `vPortFreeStack( pxTCB->pxStack )`.
         self.account_for_allocation();
@@ -4439,29 +4422,60 @@ where
     /// disturbing a single scenario in the corpus — and it is the property
     /// the corpus is checking when it stays byte-identical.
     ///
-    /// At most one task can be pending: only the *running* task defers, and
-    /// it yields before it can return, so a second deferred delete cannot
-    /// happen until this has run.
+    /// MORE than one task can be pending, which this used to deny: a task
+    /// that deletes itself yields to the next ready task, not to idle, and
+    /// that task can delete itself too before idle ever runs. Each waits, in
+    /// order, as on the C's list.
     pub fn check_tasks_waiting_termination(&mut self) {
-        if C::NUMBER_OF_CORES > 1 {
-            // Nothing deleted is the answer on almost every idle pass: say so
-            // here rather than in a call to the out-of-line body.
-            if !self.awaiting_reap.is_null() || !self.awaiting_reap_smp.is_null() {
-                self.reap_smp();
-            }
+        // Nothing deleted is the answer on almost every idle pass: say so here
+        // rather than in a call to the out-of-line body.
+        if self.reap_waiting == 0 {
             return;
         }
-        let task = self.awaiting_reap;
-        if task.is_null() {
-            return;
-        };
-        // The C takes the section per reaped task, decrements both counts
-        // inside it, and calls `prvDeleteTCB` outside.
-        self.enter_critical();
-        self.awaiting_reap = TaskHandle::NULL;
-        self.task_count = self.task_count.saturating_sub(1);
-        self.exit_critical();
-        self.delete_tcb(task);
+        self.reap_waiting_tasks();
+    }
+
+    /// `prvCheckTasksWaitingTermination`'s loop, one core and two: one
+    /// critical section per task reclaimed, the oldest first. On two cores a
+    /// head that a core still holds -- running it, or asked to yield it --
+    /// ends the pass after its section, "and try again next time".
+    #[cold]
+    #[inline(never)]
+    fn reap_waiting_tasks(&mut self) {
+        while self.reap_waiting > 0 {
+            self.enter_critical();
+            let Some(task) = self.reap_head() else {
+                // The count says a task waits and no TCB says so: nothing to
+                // free. Unreachable while the two are kept together.
+                self.reap_waiting = 0;
+                self.exit_critical();
+                return;
+            };
+            if C::NUMBER_OF_CORES > 1 && self.held_by_any_core(task) {
+                self.exit_critical();
+                return;
+            }
+            if let Ok(tcb) = self.tcbs.resolve_mut(task) {
+                tcb.reap_seq = 0;
+            }
+            self.task_count = self.task_count.saturating_sub(1);
+            self.reap_waiting = self.reap_waiting.saturating_sub(1);
+            self.exit_critical();
+            self.delete_tcb(task);
+        }
+    }
+
+    /// `listGET_OWNER_OF_HEAD_ENTRY( &xTasksWaitingTermination )`: the task
+    /// that has waited longest. A walk over the arena, on an idle pass that
+    /// found a task waiting -- which is rare, and the arena is small.
+    fn reap_head(&self) -> Option<TaskHandle> {
+        let mut head: Option<(u32, TaskHandle)> = None;
+        for (task, tcb) in self.tcbs.iter() {
+            if tcb.reap_seq != 0 && head.is_none_or(|(seq, _)| tcb.reap_seq < seq) {
+                head = Some((tcb.reap_seq, task));
+            }
+        }
+        head.map(|(_, task)| task)
     }
 
     /// `vTaskPrioritySet`. `None` is the calling task.    /// `vTaskPrioritySet`. `None` is the calling task.
@@ -5467,6 +5481,39 @@ mod tests {
             let _ = k.increment_tick();
         }
         assert_eq!(*k.tick_hook(), Counting(0), "the hook never ran");
+    }
+
+    /// Two tasks delete themselves before the idle task runs; the idle task
+    /// reclaims BOTH, oldest first, as `prvCheckTasksWaitingTermination` walks
+    /// `xTasksWaitingTermination`.
+    ///
+    /// The kernel kept one slot for this and the second delete overwrote the
+    /// first: A's slot was never freed and the task count stayed one high.
+    /// Found 2026-10-04 while proving the two-core gates of the mutant survey.
+    #[test]
+    fn two_self_deletes_before_idle_are_both_reaped() {
+        let mut k = kernel();
+        let a = k.create_task("A", 2).expect("A");
+        let b = k.create_task("B", 2).expect("B");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        let before = k.task_count();
+        while k.current() != a {
+            k.switch_context();
+        }
+        k.task_delete(None).expect("A deletes itself");
+        // A yields to B -- the next ready task, NOT idle.
+        while k.current() != b {
+            k.switch_context();
+        }
+        k.task_delete(None).expect("B deletes itself");
+        assert_eq!(k.task_count(), before, "both still counted until reaped");
+        k.check_tasks_waiting_termination();
+        assert_eq!(k.task_count(), before - 2, "one idle pass reclaims both");
+        assert!(k.name_of(a).is_err(), "A's slot is free");
+        assert!(k.name_of(b).is_err(), "B's slot is free");
+        k.check_tasks_waiting_termination();
+        assert_eq!(k.task_count(), before - 2, "and nothing is reaped twice");
     }
 
     /// `vTaskDelayUntil` with no overflow: a deadline still ahead delays,
