@@ -3,6 +3,24 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
+## Unreleased
+
+### Changed
+- **One-core and real-port instruction cost.** Fifteen measured wins, none
+  changing behaviour (both conformance corpora, the API differential and the
+  SMP differential unchanged). On the shipped RISC-V port the seventeen
+  `bench/tick-work` rows fall from 1,697 to 1,364 retired instructions
+  (`peek_ok` 73 -> 41, `queue_roundtrip` 152 -> 113, `block_cycle` 965 ->
+  847); the one-core kernel rows of `bench/kernel-ir` fall 2.3% and the
+  two-core shape A 8-10%. The largest pieces: `add_task_to_ready_list_at`,
+  so the wake, resume and inheritance paths stop re-resolving a TCB around
+  their list edits; `unlock_queue`'s drain loops out of line on the speed
+  profile; the tick hook not copied when `TickHook::wants_tick` says it has
+  nothing to do (needs `rusty_rtos_core`'s next release); a dead atomic load
+  of the port's exit count on every traced path, gated on `T::EMITS`.
+- Flash, `bench/kernel-flash`: the `small` profile 17,776 -> 17,646 B; the
+  speed profile +294 B from this crate (bodies in line at the paths above).
+
 ## 0.3.2 — 2026-10-02
 
 The two-core kernel, made cheaper: fifteen instruction-count wins on the
