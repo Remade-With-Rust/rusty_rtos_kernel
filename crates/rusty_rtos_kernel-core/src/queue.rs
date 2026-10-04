@@ -1039,6 +1039,23 @@ where
             self.note_exits();
             let tick = self.tick;
             self.trace.event(tick, Event::QueueSend { queue, name: "" });
+            // An emitting sink is a CALL here, and the whole snapshot was held
+            // live across it -- seven fields spilled and reloaded on every
+            // send. Read again after the call instead: nothing in the sink can
+            // reach the arena, so it is the same value, and a re-resolve is
+            // cheaper than the spills. A silent sink has no call, and keeps
+            // the one read.
+            let snapshot = if T::EMITS {
+                match self.queues.resolve(queue) {
+                    Ok(q) => *q,
+                    Err(e) => {
+                        self.exit_critical();
+                        return Err(e);
+                    }
+                }
+            } else {
+                snapshot
+            };
             let previously_waiting = snapshot.waiting;
             let yield_required = self.copy_data_to_queue(queue, &snapshot, value, position)?;
             if C::USE_QUEUE_SETS && !snapshot.set_container.is_null() {
