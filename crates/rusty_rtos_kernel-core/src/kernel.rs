@@ -5424,6 +5424,51 @@ mod tests {
         panic!("the task never reached the CPU");
     }
 
+    /// A tick hook that counts its calls and wants every tick.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct Counting(u32);
+
+    impl<K> rusty_rtos_core::hooks::TickHook<K> for Counting {
+        fn tick(self, _kernel: &mut K) -> Self {
+            Self(self.0.wrapping_add(1))
+        }
+    }
+
+    /// `configUSE_TICK_HOOK 0` means the hook is never called -- even one
+    /// that says it wants the tick. `run_tick_hook`'s `||` as `&&` survived
+    /// every oracle (kernel a87a716 added `wants_tick` beside the config
+    /// test): nothing ran a hook that wants ticks under a config that has
+    /// them off.
+    #[test]
+    fn a_config_without_the_tick_hook_never_calls_one() {
+        type KH = crate::Kernel<
+            TestConfig,
+            TestPort,
+            NoTrace,
+            Counting,
+            4,
+            { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+            { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+        >;
+        // The premise, checked when the test compiles: this config has the hook off.
+        const { assert!(!TestConfig::USE_TICK_HOOK) };
+        let mut k = KH::with_tick_hook(TestPort::default(), NoTrace, Counting(0))
+            .expect("the declared geometry adds up");
+        k.create_task("t", 1).expect("a task");
+        k.start_scheduler().expect("start");
+        for _ in 0..8 {
+            let _ = k.increment_tick();
+        }
+        assert_eq!(*k.tick_hook(), Counting(0), "the hook never ran");
+    }
+
     /// `vTaskDelayUntil` with no overflow: a deadline still ahead delays,
     /// and one already passed does NOT.
     ///

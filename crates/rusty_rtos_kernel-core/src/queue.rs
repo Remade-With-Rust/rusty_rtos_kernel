@@ -2159,6 +2159,45 @@ mod tests {
         assert_eq!(tx_lock(&k, q), UNLOCKED);
     }
 
+    /// `prvUnlockQueue` wakes ONE waiter per send the lock held back, not
+    /// every waiter: one interrupt send, two receivers blocked, one woken.
+    ///
+    /// The drain's `while lock > LOCKED_UNMODIFIED` as `>=` survived every
+    /// oracle once the drain moved out of line (kernel 1ce2ac3): the guard
+    /// before it means the loop is entered only above zero, so the mutant
+    /// differs only at the tail -- one wake too many when a waiter is left.
+    /// No test held back fewer sends than there were waiters.
+    #[test]
+    fn an_unlock_wakes_one_waiter_per_held_back_send() {
+        let mut k = K::new(TestPort::default(), NoTrace).expect("the declared geometry adds up");
+        let q = k.queue_create(16).expect("a queue");
+        let first = k.create_task("rx1", 3).expect("rx1");
+        let second = k.create_task("rx2", 2).expect("rx2");
+        let h = k.start_scheduler().expect("start");
+        k.suspend(Some(h.timer)).expect("park the daemon");
+        assert_eq!(k.current(), first);
+        assert_eq!(k.queue_receive(q, 10), Ok(Wait::Blocked));
+        k.switch_context();
+        assert_eq!(k.current(), second);
+        assert_eq!(k.queue_receive(q, 10), Ok(Wait::Blocked));
+        k.switch_context();
+        k.lock_queue(q);
+        let _ = k.queue_send_from_isr(q, 7).expect("send");
+        assert_eq!(tx_lock(&k, q), 1, "one send held back");
+        k.unlock_queue(q).expect("unlock");
+        assert_eq!(
+            k.task_state_get(first),
+            Ok(TaskState::Ready),
+            "the first waiter woke"
+        );
+        assert_eq!(
+            k.task_state_get(second),
+            Ok(TaskState::Blocked),
+            "and only the first: one send, one wake"
+        );
+        assert_eq!(tx_lock(&k, q), UNLOCKED);
+    }
+
     /// `prvIncrementQueueTxLock` / `RxLock` stop at the task count: there
     /// is no point waking more tasks than exist.
     #[test]
