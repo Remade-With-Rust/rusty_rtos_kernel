@@ -3140,7 +3140,6 @@ where
             self.set_notify_blocked(caller, true);
             return Ok(Wait::Blocked);
         }
-        self.set_notify_blocked(caller, false);
         self.enter_critical();
         self.note_exits();
         self.trace_task(caller, |task, name| Event::TaskNotifyTake {
@@ -3153,8 +3152,14 @@ where
         // to write it back -- the same trade `unlock_queue` makes, and a
         // `&mut self` call sits between this and the read at the top of the
         // function, so the two cannot be folded by the compiler.
+        //
+        // `notify_blocked` is cleared on this resolve too. It was its own
+        // resolve before the section -- `set_notify_blocked` -- and on rv32
+        // the section's entry is a compiler barrier, so the two never folded.
+        // Nothing between the old place and this one reads the flag.
         let mut value = 0;
         if let Ok(tcb) = self.tcbs.resolve_mut(caller) {
+            tcb.notify_blocked = false;
             value = tcb.notified.get(index).copied().unwrap_or(0);
             if value != 0 {
                 if let Some(slot) = tcb.notified.get_mut(index) {
