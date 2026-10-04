@@ -3711,6 +3711,14 @@ where
     /// lets it borrow the kernel mutably while the kernel owns it. A hook
     /// that reads the kernel's own copy of itself therefore sees the value
     /// from before this call.
+    ///
+    /// On two cores the test is in line and the run is not. There the run had
+    /// a symbol of its own with the hook's whole body inlined into it, and the
+    /// test that skips it paid that body's six saved registers and its frame
+    /// on every tick -- 18 instructions to return. One core keeps the run in
+    /// line, inside `increment_tick`: outlined there it cost a scenario with
+    /// an installed hook +11 a tick (TimerDemo +231,916).
+    #[inline(always)]
     fn run_tick_hook(&mut self) {
         // A hook that says it has nothing to do is not copied at all: the
         // copy out and back is the hook's full size every tick, 448 bytes
@@ -3719,6 +3727,17 @@ where
         if !C::USE_TICK_HOOK || !self.tick_hook.wants_tick() {
             return;
         }
+        if C::NUMBER_OF_CORES > 1 {
+            self.run_tick_hook_body();
+            return;
+        }
+        let hook = self.tick_hook;
+        self.tick_hook = hook.tick(self);
+    }
+
+    /// The copy out, the run and the store back of [`Kernel::run_tick_hook`].
+    #[inline(never)]
+    fn run_tick_hook_body(&mut self) {
         let hook = self.tick_hook;
         self.tick_hook = hook.tick(self);
     }
