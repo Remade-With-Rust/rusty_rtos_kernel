@@ -138,6 +138,15 @@ refuted on the way, is in the Kairos umbrella's `bench/smp-ir` and LEDGER.
 **Not covered:** core affinity, `configRUN_MULTIPLE_PRIORITIES = 0` (the C's
 default when SMP is off), and more than two cores.
 
+**Every API against the C (0.3.3).** Every public function with a FreeRTOS
+twin -- 119 of them -- is compared step by step against FreeRTOS V11.3.1 on
+one core and two, by random scripts, pinned seeds, authored sweeps and
+fresh seeds nightly (the Kairos umbrella's `tools/api-census` and
+`docs/API-COVERAGE.md`). That comparison found eleven defects, all fixed in
+this release (CHANGELOG). The two-core demo corpus now holds twenty-three
+scenarios, each identical to FreeRTOS on two cores. Requires
+`rusty_rtos_core` 0.2.5.
+
 A port drains cross-core yields with `Kernel::take_core_yields()` and raises
 its inter-processor interrupt; the kernel stays `forbid(unsafe)`.
 

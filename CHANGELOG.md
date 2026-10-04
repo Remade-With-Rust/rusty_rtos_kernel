@@ -3,9 +3,51 @@
 Security-relevant changes are called out under **Security** (hardening gate
 H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
 
-## Unreleased
+## 0.3.3 — 2026-10-04
+
+Every public API with a FreeRTOS twin compared step by step against FreeRTOS
+V11.3.1, one core and two (the umbrella's API differential), and the defects
+that found fixed; the two-core demo corpus grown from nine scenarios to
+twenty-three; fifteen one-core instruction wins. Requires `rusty_rtos_core`
+0.2.5.
 
 ### Fixed
+- Found by the API differential, each against the C's own answer:
+  - **Two cores, `eTaskGetState`:** a task running on the OTHER core
+    answered Ready; it is Running when current on some core and not asked
+    to yield.
+  - **One core, mutex give:** a give that disinherits AND wakes a
+    lower-priority waiter yielded where the C does not -- the waiter list's
+    emptiness is read once, before the removal, as `xQueueGenericSend` does.
+  - **Priority inheritance:** `xInheritanceOccurred` is assigned on every
+    block, not latched, so a waiter that inherited once and later did not no
+    longer makes its timeout disinherit the holder.
+  - **Event groups:** a waiter's event-item value is marked
+    `taskEVENT_LIST_ITEM_VALUE_IN_USE`, and `vTaskPrioritySet`,
+    `xTaskPriorityInherit` and `vTaskPriorityDisinheritAfterTimeout` leave it
+    alone; a priority change on a waiting task rewrote its wait condition.
+  - **`xStreamBufferSend`** loops `do { sample; block } while( !timed out )`
+    as the C does; a wake that freed too little made a partial write where
+    the C blocks again.
+  - **Two cores, a yield pended by an interrupt** with no woken pointer is
+    taken at the next outermost task-level exit, as SMP `vTaskExitCritical`
+    does.
+  - **Two cores, `xTaskResumeAll`** makes no yield decision of its own while
+    draining the pending-ready list; it yielded a second core.
+  - **`vTaskPriorityDisinheritAfterTimeout`** can raise a holder still at its
+    base priority, to the highest waiter left.
+  - **Two cores, `vTaskResume` of a running task** enters its section, whose
+    exit is a yield point; the one-core early return kept a pending yield
+    waiting.
+  - **A deleted task's delay-aborted flag** no longer passes to the next task
+    on its index.
+  - **Tickless (`USE_TICKLESS_IDLE`):** the next unblock time is reset at the
+    C's sites (event-list and notify wakes), so `step_tick` cannot jump past
+    a wake a notify just moved.
+- Found by the two-core corpus: a trace line the C prints after a switch
+  inside a call is owed on a committing port too; and on two cores a yield
+  inside a kernel critical section pends to the section's exit, while one
+  under a suspended scheduler is counted and not requested.
 - **Two tasks that delete themselves before idle runs are both reaped.** The
   kernel kept one deferred-delete slot (two on two cores) on the belief that
   a second self-delete could not come before the first was reaped. It can:
@@ -19,6 +61,15 @@ H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
   `xTaskPriorityInherit` calls `prvYieldForTask` directly, the one call of it
   the C does not gate on `configUSE_PREEMPTION`; this kernel gated it. No
   configuration with preemption on changes.
+
+### Added
+- `Kernel::timer_receive_command` and `Kernel::timer_execute_command`: the
+  timer daemon's receive and its execution of the command, as two calls
+  (`process_one_timer_command` is now their composition). On two cores the
+  receive ends a turn and the command runs after it; the receive hands back
+  a copy of the message, as the C copies `xMessage`.
+- `Kernel::stream_buffer_send_completed_from_isr`
+  (`xStreamBufferSendCompletedFromISR`).
 
 ### Changed
 - **Two cores need a port that commits its own switches.** `Kernel::new`
@@ -35,7 +86,7 @@ H-38). Versions follow SemVer; in 0.x a minor bump may break the API.
   so the wake, resume and inheritance paths stop re-resolving a TCB around
   their list edits; `unlock_queue`'s drain loops out of line on the speed
   profile; the tick hook not copied when `TickHook::wants_tick` says it has
-  nothing to do (needs `rusty_rtos_core`'s next release); a dead atomic load
+  nothing to do (`rusty_rtos_core` 0.2.5); a dead atomic load
   of the port's exit count on every traced path, gated on `T::EMITS`.
 - Flash, `bench/kernel-flash`: the `small` profile 17,776 -> 17,646 B; the
   speed profile +294 B from this crate (bodies in line at the paths above).
