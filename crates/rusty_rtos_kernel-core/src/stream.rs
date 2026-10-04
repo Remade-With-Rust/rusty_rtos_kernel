@@ -1842,4 +1842,147 @@ mod tests {
         assert_eq!(k.stream_buffer_receive(b, &mut out, 0), Ok(Wait::Ready(5)));
         assert_eq!(out.get(..5), Some(&b"hello"[..]));
     }
+
+    /// A port that raises ONE tick, at a chosen outermost critical-section
+    /// exit -- the sim contract's clock (`ORACLES.md`), aimed. `TestPort`
+    /// never ticks, so nothing in this file could switch a task away inside
+    /// a kernel call, and the stream's resume-after-wait arm had no test.
+    #[derive(Debug, Default)]
+    struct TickAt {
+        nesting: core::cell::Cell<u32>,
+        exits: core::cell::Cell<u64>,
+        at: core::cell::Cell<u64>,
+        pending: core::cell::Cell<bool>,
+        counting: core::cell::Cell<bool>,
+        in_tick: core::cell::Cell<bool>,
+    }
+
+    impl rusty_rtos_core::port::Port for TickAt {
+        fn yield_now(&self) {}
+        fn yield_from_isr(&self, _woken: rusty_rtos_core::isr::Woken) {}
+        fn enter_critical(&self) {
+            self.nesting.set(self.nesting.get().saturating_add(1));
+        }
+        fn exit_critical(&self) {
+            let n = self.nesting.get().saturating_sub(1);
+            self.nesting.set(n);
+            if n == 0 && self.counting.get() && !self.in_tick.get() {
+                let exits = self.exits.get().wrapping_add(1);
+                self.exits.set(exits);
+                if exits == self.at.get() {
+                    self.pending.set(true);
+                }
+            }
+        }
+        fn set_interrupt_mask_from_isr(&self) -> u32 {
+            0
+        }
+        fn clear_interrupt_mask_from_isr(&self, _saved: u32) {}
+        fn in_isr(&self) -> bool {
+            self.in_tick.get()
+        }
+        fn set_in_tick_entry(&self, yes: bool) {
+            self.in_tick.set(yes);
+        }
+        fn take_pending_tick(&self) -> bool {
+            self.pending.replace(false)
+        }
+        fn exits(&self) -> u64 {
+            self.exits.get()
+        }
+        fn scheduler_started(&self) {
+            self.counting.set(true);
+        }
+    }
+
+    type KT = crate::Kernel<
+        TestConfig,
+        TickAt,
+        NoTrace,
+        NoTickHook,
+        4,
+        { crate::list_slots_for(4, 0, crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0)) },
+        { crate::lists_for(TestConfig::MAX_PRIORITIES, 1, 0) },
+        1,
+        1,
+        2,
+        64,
+        0,
+        0,
+        { <TestConfig as ::rusty_rtos_core::config::Config>::TIMER_QUEUE_LENGTH },
+    >;
+
+    /// `xStreamBufferReceive` that timed out, preempted at the exit ending
+    /// its wait, returns 0 when it runs again -- it does not wait a second
+    /// time. The C's thread is stopped INSIDE that exit and goes on to read
+    /// what the buffer holds; the stackless call records that the wait is
+    /// done (`set_stream_waited`) and the resumed call reads it
+    /// (`take_stream_waited`). Neither half had an oracle (HOLES.md H14): the
+    /// differential delivers ticks between calls, and no corpus scenario
+    /// lands a tick on that exit in 100,000 ticks.
+    ///
+    /// R (priority 2) receives on an empty buffer with a one-tick timeout; H
+    /// (priority 3) delays two ticks, so it wakes on the tick AFTER R's
+    /// timeout. That tick is raised at each exit of R's resumed call in turn:
+    /// wherever it lands, H preempts, and R's next call must answer 0.
+    #[test]
+    fn a_receive_preempted_as_its_wait_ends_does_not_wait_again() {
+        let mut preempted_inside = 0;
+        for k in 1..=12_u64 {
+            let mut kx =
+                KT::new(TickAt::default(), NoTrace).expect("the declared geometry adds up");
+            let sb = kx.stream_buffer_create(16, 1).expect("a stream buffer");
+            let r = kx.create_task("R", 2).expect("R");
+            let h = kx.create_task("H", 3).expect("H");
+            let start = kx.start_scheduler().expect("start");
+            kx.suspend(Some(start.timer)).expect("park the daemon");
+            // H runs first and sleeps past R's timeout.
+            while kx.current() != h {
+                kx.switch_context();
+            }
+            kx.delay(2).expect("H delays");
+            while kx.current() != r {
+                kx.switch_context();
+            }
+            let mut out = [0u8; 4];
+            assert_eq!(kx.stream_buffer_receive(sb, &mut out, 1), Ok(Wait::Blocked));
+            // One tick: R times out and is the highest ready task.
+            if kx.increment_tick() {
+                kx.switch_context();
+            }
+            while kx.current() != r {
+                kx.switch_context();
+            }
+            // Now R's call resumes; the next tick -- H's -- lands at the
+            // k-th exit inside it.
+            let base = kx.port().exits.get();
+            kx.port().at.set(base.wrapping_add(k));
+            let first = kx.stream_buffer_receive(sb, &mut out, 1);
+            if first == Ok(Wait::Blocked) {
+                if kx.current() == h {
+                    preempted_inside += 1;
+                }
+                // H runs and sleeps again; R runs again and finishes its call.
+                while kx.current() != h {
+                    kx.switch_context();
+                }
+                kx.delay(50).expect("H delays");
+                while kx.current() != r {
+                    kx.switch_context();
+                }
+                assert_eq!(
+                    kx.stream_buffer_receive(sb, &mut out, 1),
+                    Ok(Wait::Ready(0)),
+                    "tick at exit {k} of the resumed call: the timed-out receive must answer 0, \
+                     not wait again"
+                );
+            } else {
+                assert_eq!(first, Ok(Wait::Ready(0)), "tick at exit {k}");
+            }
+        }
+        assert!(
+            preempted_inside > 0,
+            "no alignment preempted R inside its resumed call: the test reached nothing"
+        );
+    }
 }
