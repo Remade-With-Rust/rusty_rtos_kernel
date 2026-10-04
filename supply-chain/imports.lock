@@ -2,8 +2,8 @@
 # cargo-vet imports lock
 
 [[publisher.rusty_rtos_core]]
-version = "0.2.4"
-when = "2026-10-02"
+version = "0.2.5"
+when = "2026-10-04"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"
