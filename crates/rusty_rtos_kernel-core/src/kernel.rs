@@ -5119,7 +5119,9 @@ where
         if self.lists.container(item)? == Some(Self::ready_list(holder_priority)) {
             let _ = self.lists.remove(item);
             self.set_task_priority(holder, waiter_priority)?;
-            self.add_task_to_ready_list(holder)?;
+            // The priority just set, handed down rather than read back
+            // through a second resolve (`add_task_to_ready_list_at`).
+            self.add_task_to_ready_list_at(holder, waiter_priority)?;
             // SMP: "The priority of the task is raised. Yield for this task
             // if it is not running." (`xTaskPriorityInherit`)
             if C::NUMBER_OF_CORES > 1 && C::USE_PREEMPTION && self.running_core(holder).is_none() {
@@ -5173,7 +5175,8 @@ where
         let event_value = u64::from(C::MAX_PRIORITIES.saturating_sub(base));
         self.lists
             .set_value(Self::event_item(holder), event_value)?;
-        self.add_task_to_ready_list(holder)?;
+        // The priority just set, as in `priority_inherit`.
+        self.add_task_to_ready_list_at(holder, base)?;
         // SMP: "The priority of the task is dropped. Yield the core on which
         // the task is running." (`xTaskPriorityDisinherit`) Found by the
         // two-core corpus: without it a give that disinherits AND wakes a
@@ -5231,7 +5234,8 @@ where
         let item = Self::state_item(holder);
         if self.lists.container(item)? == Some(Self::ready_list(priority)) {
             let _ = self.lists.remove(item);
-            self.add_task_to_ready_list(holder)?;
+            // The priority just set, as in `priority_inherit`.
+            self.add_task_to_ready_list_at(holder, target)?;
             // SMP: as `priority_disinherit` (`vTaskPriorityDisinheritAfterTimeout`).
             if C::NUMBER_OF_CORES > 1 {
                 if let Some(core) = self.running_core(holder) {
