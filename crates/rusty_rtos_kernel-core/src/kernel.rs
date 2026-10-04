@@ -4186,13 +4186,16 @@ where
         self.enter_critical();
         {
             if self.task_is_suspended(task)? {
+                // Read once and handed to `add_task_to_ready_list_at`, as
+                // `remove_from_event_list` does: after the list edits LLVM
+                // cannot prove the TCB unchanged, and resolved it twice more.
+                let resumed = self.tcbs.resolve(task)?.priority;
                 self.trace_task(task, |task, name| Event::TaskResume { task, name });
                 let _ = self.lists.remove(Self::state_item(task));
-                self.add_task_to_ready_list(task)?;
+                self.add_task_to_ready_list_at(task, resumed)?;
                 // taskYIELD_ANY_CORE_IF_USING_PREEMPTION: inside the
                 // section, and only when the resumed task outranks the
                 // running one.
-                let resumed = self.tcbs.resolve(task)?.priority;
                 if C::NUMBER_OF_CORES > 1 {
                     if self.smp_readied(task, resumed) {
                         self.port_yield();
