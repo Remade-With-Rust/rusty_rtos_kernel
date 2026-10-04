@@ -3806,10 +3806,8 @@ where
                 if C::USE_PREEMPTION {
                     self.yield_for_task(task, woken);
                 }
-            } else if C::USE_PREEMPTION && !switch_required {
-                if woken > running {
-                    switch_required = true;
-                }
+            } else if C::USE_PREEMPTION && !switch_required && woken > running {
+                switch_required = true;
             }
         }
     }
