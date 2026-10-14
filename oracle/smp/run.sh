@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the pinned FreeRTOS kernel with TWO cores on the fake port and write
 # the differential trace `tests/smp_differential.rs` replays. Run under WSL:
-#   wsl -e sh -c 'cd /mnt/f/coding/rusty_RTOS/rusty_rtos_kernel/oracle/smp && sh run.sh'
+#   wsl -e sh -c 'cd /mnt/e/coding/rusty_RTOS/rusty_rtos_kernel/oracle/smp && sh run.sh'
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 kernel="$here/../../../oracle/FreeRTOS-Kernel"
