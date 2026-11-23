@@ -15,7 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rusty_rtos_kernel-core = { path = "../crates/rusty_rtos_kernel-core" }
-rusty_rtos_core = { version = "0.2.1", default-features = false }
+rusty_rtos_core = { version = "0.2.8", default-features = false }
 
 [[bin]]
 name = "kernel_api"
