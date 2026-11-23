@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "rusty_rtos_core"
-version = "0.2.5"
+version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fe2eb86628e2a1892b7a95558461319a5804d6a532224020a42f051145e97f7"
+checksum = "10e25b7fc42fe14b8c57b02fbab467875d19d51587dbc3ab7d80fab228abcb28"
 
 [[package]]
 name = "rusty_rtos_kernel"
