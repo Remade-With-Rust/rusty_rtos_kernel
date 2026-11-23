@@ -10,14 +10,14 @@ checksum = "10e25b7fc42fe14b8c57b02fbab467875d19d51587dbc3ab7d80fab228abcb28"
 
 [[package]]
 name = "rusty_rtos_kernel"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "rusty_rtos_kernel-core",
 ]
 
 [[package]]
 name = "rusty_rtos_kernel-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "rusty_rtos_core",
 ]
